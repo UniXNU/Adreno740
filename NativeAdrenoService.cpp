@@ -392,7 +392,10 @@ bool NativeAdrenoGpuService::start(IOService *provider)
                                 } else {
 #ifdef NATIVE_ADRENO_HAVE_GMU_VOTES
                                     inputs.chip_id=SHENG_GMU_VOTES_CHIP_ID;
-                                    inputs.enable_acd=1;inputs.enable_ifpc=1;
+                                    inputs.enable_acd=1;
+                                    /* IFPC stays off: the power-up list carries no IFPC restore registers and
+                                     * WPTR writes are not fenced, so a collapse between frames loses CP state. */
+                                    inputs.enable_ifpc=0;
                                     AdrenoHfiStartupConfig startup{};
                                     ShengGmuConfig config{};
                                     NativeAdrenoGmuTime time{nullptr,
