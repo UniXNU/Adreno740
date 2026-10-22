@@ -59,6 +59,24 @@ int main()
         CHECK(ring.wait(1,&clock_,1000,nullptr)==NativeAdrenoRingFenceComplete);
         CHECK(ring.detach()==kIOReturnSuccess);
     }
+    /* A6XX (a6xx_cp_init): CP_ME_INIT alone, eight words, no CP_THREAD_CONTROL and no power-up list required. */
+    {
+        reset();NativeAdrenoRing ring;CHECK(ring.setGeneration(6)==kIOReturnSuccess);
+        CHECK(ring.attach(&io,&cache,ringmem,sizeof(ringmem),0x100000,fencemem,sizeof(fencemem),0x108000)==kIOReturnSuccess);
+        NativeAdrenoCpInit init;
+        NativeAdrenoCpInitConfig config{0x200000,0,1,6};
+        peer.regs[0x0830]=0x200000;peer.regs[0x0831]=0;
+        uint32_t fence=0;
+        CHECK(init.run(&io,&ring,&config,&fence)==kIOReturnSuccess && fence==1 && init.completed());
+        CHECK((ringmem[0]>>16&0x7fu)==0x48 && (ringmem[0]&0x3fffu)==8);
+        CHECK(ringmem[1]==0x2f && ringmem[2]==3 && ringmem[3]==0x20000000);
+        for(unsigned i=4;i<9;++i)CHECK(ringmem[i]==0);
+        CHECK((ringmem[9]>>8&0x3ffffu)==0x885 && ringmem[10]==1);
+        CHECK((ringmem[11]>>16&0x7fu)==0x46 && ringmem[12]==(0x04u|(1u<<31)));    /* the A6XX CACHE_FLUSH_TS fence */
+        CHECK(peer.regs[0x0807]==9+7);
+        NativeAdrenoCpInit other;NativeAdrenoCpInitConfig bad{0x200000,0,1,5};
+        CHECK(other.run(&io,&ring,&bad,&fence)==kIOReturnBadArgument);
+    }
     /* Refusals precede MMIO and ring writes. */
     {
         reset();NativeAdrenoRing ring;CHECK(ring.attach(&io,&cache,ringmem,sizeof(ringmem),0x100000,fencemem,sizeof(fencemem),0x108000)==kIOReturnSuccess);

@@ -50,6 +50,9 @@ static constexpr uint32_t kKnown = IrqBitIdle | IrqBitAhb | IrqBitAtbAsync | Irq
 static constexpr uint32_t kEnable = IrqBitAhb | IrqBitAtbAsync | IrqBitGpc | IrqBitCpSw |
     IrqBitCpHw | IrqBitCpPm4 | IrqBitCpRbDone | IrqBitCpFence | IrqBitAtbBus |
     IrqBitHang | IrqBitUcheOob | IrqBitUcheTrap | IrqBitTsbWrite | IrqBitFuse;
+/* A6XX_INT_MASK from the pinned a6xx_gpu.c; CP_RB (bit 15, A6XX) is the bit A7XX names CP_PM4. */
+static constexpr uint32_t kEnableA6xx = IrqBitAhb | IrqBitAtbAsync | IrqBitCpHw | IrqBitCpIb2 | IrqBitCpIb1 |
+    IrqBitCpPm4 | IrqBitCpFence | IrqBitAtbBus | IrqBitHang | IrqBitUcheOob | IrqBitUcheTrap;
 /* CP_INTERRUPT_STATUS error bits, including the A7XX LPAC/BV replicas. */
 static constexpr uint32_t kCpErrors = 0x3fff7u;
 IOReturn NativeAdrenoIrq::poison()
@@ -59,6 +62,16 @@ IOReturn NativeAdrenoIrq::poison()
 uint32_t NativeAdrenoIrq::mask()
 {
     return kEnable;
+}
+uint32_t NativeAdrenoIrq::maskA6xx()
+{
+    return kEnableA6xx;
+}
+IOReturn NativeAdrenoIrq::setGeneration(unsigned generation)
+{
+    if(poisoned_ || enabled_)return kIOReturnBusy;
+    if(generation!=6 && generation!=7)return kIOReturnBadArgument;
+    generation_=generation;return kIOReturnSuccess;
 }
 uint32_t NativeAdrenoIrq::cpErrorMask()
 {
@@ -81,9 +94,10 @@ IOReturn NativeAdrenoIrq::programMask(uint32_t *programmed)
     if(!attached_ || poisoned_)return kIOReturnNotReady;
     if(programmed)*programmed=0;
     uint32_t readback=0;
-    if(io_.write32(io_.cookie,IrqRbbmMask,kEnable))return poison();
+    const uint32_t enable=generation_==6?kEnableA6xx:kEnable;
+    if(io_.write32(io_.cookie,IrqRbbmMask,enable))return poison();
     if(io_.read32(io_.cookie,IrqRbbmMask,&readback))return poison();
-    if(readback!=kEnable)return poison();
+    if(readback!=enable)return poison();
     enabled_=readback;
     if(programmed)*programmed=readback;
     return kIOReturnSuccess;

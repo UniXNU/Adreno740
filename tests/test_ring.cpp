@@ -126,6 +126,35 @@ int main()
         CHECK(r.submitFramed(words,1,&end)==kIOReturnSuccess && end==2);
         CHECK(peer.writes.back().second==69+11+1+31 && op(ring[69+2])==0x46 && op(ring[69+7])==0x17 && ring[69+8]==3);
     }
+    /* A6XX (Adreno 610): CP_RB_CNTL NO_UPDATE, CACHE_FLUSH_TS fences, and a UCHE + CCU invalidating prologue without any BR/BV
+     * framing or A7XX context entry, also when a context reset was requested. */
+    {
+        reset();NativeAdrenoRing r;
+        CHECK(r.setGeneration(5)==kIOReturnBadArgument && r.setGeneration(6)==kIOReturnSuccess);
+        CHECK(attach(r)==kIOReturnSuccess);
+        CHECK(r.setGeneration(7)==kIOReturnBusy);
+        CHECK(peer.writes[2].first==0x0802 && peer.writes[2].second==((12u)|(2u<<8)|(1u<<27)));
+        auto op=[](uint32_t header) {return (header>>28)==7u?(header>>16)&0x7fu:0xffu;};
+        const uint32_t boot[1]={0x22222222};
+        uint32_t end=0;
+        CHECK(r.submit(boot,1,&end)==kIOReturnSuccess && end==1);
+        CHECK(peer.writes.back().first==0x0807 && peer.writes.back().second==1+7);
+        CHECK(ring[0]==boot[0] && (ring[1]>>8&0x3ffffu)==0x885 && ring[2]==1);
+        CHECK(op(ring[3])==0x46 && (ring[3]&0x3fffu)==4 && ring[4]==(0x04u|(1u<<31)) && ring[5]==0x108004 && ring[6]==0 && ring[7]==1);
+        fence[1]=1;
+        r.requestContextReset();
+        const uint32_t words[2]={0x33333333,0x44444444};
+        CHECK(r.submitFramed(words,2,&end)==kIOReturnSuccess && end==2);
+        CHECK(peer.writes.back().second==8+6+2+7);
+        CHECK(op(ring[8])==0x46 && ring[9]==0x31 && op(ring[10])==0x46 && ring[11]==0x18 && op(ring[12])==0x46 && ring[13]==0x19);
+        CHECK(ring[14]==words[0] && ring[15]==words[1]);
+        CHECK((ring[16]>>8&0x3ffffu)==0x885 && ring[17]==2);
+        CHECK(op(ring[18])==0x46 && ring[19]==(0x04u|(1u<<31)) && ring[20]==0x108004 && ring[21]==0 && ring[22]==2);
+        fence[1]=2;
+        uint32_t observed=0;
+        CHECK(r.wait(2,&clock_,5000,&observed)==NativeAdrenoRingFenceComplete && observed==2);
+        CHECK(r.detach()==kIOReturnSuccess);
+    }
     /* Wrap-around emission keeps packets contiguous modulo the ring. */
     {
         reset();NativeAdrenoRing r;CHECK(attach(r)==kIOReturnSuccess);

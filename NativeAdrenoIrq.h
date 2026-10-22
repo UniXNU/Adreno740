@@ -29,6 +29,7 @@ struct NativeAdrenoIrqResult {
 class NativeAdrenoIrq final {
     NativeAdrenoRingIo io_{};
     uint32_t enabled_=0;
+    unsigned generation_=7;
     bool attached_=false,poisoned_=false;
     IOReturn poison();
 public:
@@ -38,13 +39,17 @@ public:
     NativeAdrenoIrq &operator=(const NativeAdrenoIrq &)=delete;
     IOReturn attach(const NativeAdrenoRingIo *);
     IOReturn detach();
+    /* 7 (the default): A7XX_INT_MASK. 6: A6XX_INT_MASK of the pinned a6xx_gpu.c (Adreno 610). Before programMask(). */
+    IOReturn setGeneration(unsigned generation);
     /* The exact A7XX enable set: AHB, ATB async, GPC, CP_SW, CP_HW, PM4,
-     * RB_DONE_TS, CACHE_FLUSH_TS, ATB bus, hang, UCHE OOB/trap, TSB, fuse. */
+     * RB_DONE_TS, CACHE_FLUSH_TS, ATB bus, hang, UCHE OOB/trap, TSB, fuse; or for A6XX: AHB, ATB async, CP_HW, IB2, IB1, RB,
+     * CACHE_FLUSH_TS, ATB bus, hang, UCHE OOB/trap. */
     IOReturn programMask(uint32_t *programmed);
     /* Reads, acknowledges, then decodes. Acknowledgement precedes decoding so
      * an error reported here cannot be hidden by a later clear failure. */
     IOReturn handle(NativeAdrenoIrqResult *);
     static uint32_t mask();
+    static uint32_t maskA6xx();
     static uint32_t cpErrorMask();
     bool poisoned() const {return poisoned_;}
     uint32_t enabled() const {return enabled_;}

@@ -8,6 +8,9 @@ struct NativeAdrenoCpInitConfig {
     /* Nonzero when the caller already wrote CP_SQE_INSTR_BASE before CP_SQE_CNTL, as a6xx hw_init does: the base is
      * then read back and compared instead of rewritten after the SQE started. */
     uint32_t sqe_base_programmed;
+    /* 0 or 7: the A7XX sequence below. 6: a6xx_cp_init for an A6XX without APRIV or a second CP thread (Adreno 610):
+     * CP_ME_INIT alone with its eight words 0x2f, 3, 0x20000000 and zeros; no power-up list (pwrup_reglist_iova may be 0). */
+    uint32_t generation=0;
 };
 /* One-shot A7XX command-processor start sequence, not a GPU power or reset
  * driver. The caller must have completed GMU boot, powered GX/core clocks,

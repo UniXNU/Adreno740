@@ -50,7 +50,9 @@ class NativeAdrenoRing final {
     size_t ring_bytes_=0,fence_bytes_=0;
     uint64_t ring_iova_=0,fence_iova_=0;
     uint32_t next_=0,rptr_shadow_=0,seqno_=0,completed_=0,submissions_=0;
+    unsigned generation_=7;
     bool attached_=false,poisoned_=false,reset_pending_=false;
+    uint32_t prologueWords(bool reset) const;
     IOReturn poison();
     IOReturn readRptr(uint32_t *);
     IOReturn emitPrologue(uint32_t at,bool reset,uint32_t *end);
@@ -62,6 +64,11 @@ public:
     ~NativeAdrenoRing()=default;
     NativeAdrenoRing(const NativeAdrenoRing &)=delete;
     NativeAdrenoRing &operator=(const NativeAdrenoRing &)=delete;
+    /* 7 (the default) emits the A7XX forms. 6 emits the A6XX ones of the pinned a6xx_gpu.c for a CP without APRIV or a
+     * second thread (Adreno 610): CP_RB_CNTL with NO_UPDATE, the fence as CP_EVENT_WRITE CACHE_FLUSH_TS with IRQ, and
+     * user submissions preceded by CACHE_INVALIDATE and the CCU depth/colour invalidates (a6xx_submit,
+     * a6xx_set_pagetable) instead of the BR/BV framing. Only before attach. */
+    IOReturn setGeneration(unsigned generation);
     /* ring_bytes is a power of two in [8KiB,1MiB]; ring_iova must be aligned
      * to ring_bytes. fence_bytes >=64 and fence_iova 8-aligned. The fence page
      * layout is: +0 CP read-pointer shadow, +4 completed timestamp, +8 spare.

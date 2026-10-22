@@ -44,6 +44,19 @@ int main()
         CHECK(peer.regs[0x0038]==programmed && irq.enabled()==programmed);
         CHECK(irq.detach()==kIOReturnSuccess && irq.detach()==kIOReturnNotReady);
     }
+    /* A6XX (Adreno 610): A6XX_INT_MASK 0x03d0e242, and a CACHE_FLUSH_TS status still decodes as a fence. */
+    {
+        reset();NativeAdrenoIrq irq;CHECK(irq.attach(&io)==kIOReturnSuccess);
+        CHECK(irq.setGeneration(8)==kIOReturnBadArgument && irq.setGeneration(6)==kIOReturnSuccess);
+        uint32_t programmed=0;
+        CHECK(irq.programMask(&programmed)==kIOReturnSuccess && programmed==NativeAdrenoIrq::maskA6xx());
+        CHECK(programmed==0x03d0e242u && peer.regs[0x0038]==programmed);
+        CHECK(irq.setGeneration(7)==kIOReturnBusy);
+        peer.regs[0x0201]=1u<<20;
+        NativeAdrenoIrqResult result;
+        CHECK(irq.handle(&result)==kIOReturnSuccess && result.flags==NativeAdrenoIrqFence);
+        CHECK(irq.detach()==kIOReturnSuccess);
+    }
     /* Each class is decoded, acknowledged and classified. */
     {
         reset();NativeAdrenoIrq irq;CHECK(irq.attach(&io)==kIOReturnSuccess);
