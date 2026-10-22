@@ -159,6 +159,20 @@ failed:
      * as success. No object has been exposed to a GPU or userspace yet. */
     (void)release();return status;
 }
+/* An import holds the pages through a memory entry of its own (kIOMemoryPersistent), which references the VM object: the owner may unmap
+ * its range while the GPU still uses it (Core Animation frees an image's Shmem once its no-copy buffer is released, before the runtime frees
+ * the import), and the object then lives on until the import completes instead of being torn down under a wired UPL (int-233..235: the render
+ * thread stuck in vm_deallocate). A range no memory entry can be made of is imported as before; [0] counts the persistent imports, [1] those. */
+extern "C" {volatile uint32_t native_adreno_import_persistent[2];}
+static IOMemoryDescriptor *importRange(uint64_t address,size_t bytes,IODirection direction,void *task)
+{
+    const IOOptionBits options=static_cast<IOOptionBits>(direction)|static_cast<IOOptionBits>(kIOMemoryMapperNone);
+    IOMemoryDescriptor *range=IOMemoryDescriptor::withAddressRange(address,bytes,options|kIOMemoryPersistent,static_cast<task_t>(task));
+    if(range) {native_adreno_import_persistent[0]=native_adreno_import_persistent[0]+1;return range;}
+    range=IOMemoryDescriptor::withAddressRange(address,bytes,options,static_cast<task_t>(task));
+    if(range)native_adreno_import_persistent[1]=native_adreno_import_persistent[1]+1;
+    return range;
+}
 IOReturn NativeAdrenoMemory::importTask(void *task,uint64_t address,size_t bytes,unsigned bits,size_t budget)
 {
     native_adreno_import_stage=10;
@@ -172,8 +186,7 @@ IOReturn NativeAdrenoMemory::importTask(void *task,uint64_t address,size_t bytes
     native_adreno_import_stage=13;
     IOReturn status=NativeAdrenoQueryCpu4K(&cpu);if(status!=kIOReturnSuccess)return status;
     const uint64_t limit=UINT64_C(1)<<bits;
-    imported_=IOMemoryDescriptor::withAddressRange(address,bytes,
-        static_cast<IOOptionBits>(kIODirectionInOut)|static_cast<IOOptionBits>(kIOMemoryMapperNone),static_cast<task_t>(task));
+    imported_=importRange(address,bytes,kIODirectionInOut,task);
     native_adreno_import_stage=14;
     if(!imported_)return kIOReturnNoMemory;
     native_adreno_import_stage=15;
@@ -182,8 +195,7 @@ IOReturn NativeAdrenoMemory::importTask(void *task,uint64_t address,size_t bytes
         /* Read-only memory of the owner (a mapped file, constant data): cannot be pinned for writing. Pin it for reading only; the GPU then maps it
          * read-only. Metal's no-copy buffers over such memory are only ever read by shaders. */
         imported_->release();imported_=nullptr;
-        imported_=IOMemoryDescriptor::withAddressRange(address,bytes,
-            static_cast<IOOptionBits>(kIODirectionOut)|static_cast<IOOptionBits>(kIOMemoryMapperNone),static_cast<task_t>(task));
+        imported_=importRange(address,bytes,kIODirectionOut,task);
         if(!imported_)return kIOReturnNoMemory;
         status=imported_->prepare();
         if(status==kIOReturnSuccess)read_only_=true;
