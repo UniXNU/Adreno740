@@ -1,6 +1,10 @@
 /* SPDX-License-Identifier: MIT */
 #include "NativeAdrenoSmmuContext.h"
 #include <IOKit/IOLib.h>
+/* 1: table walks are inner write-back (the dma-coherent SM8550 adreno SMMU). A board whose GPU SMMU walks are not coherent (the
+ * SM6225's, no dma-coherent in its node) sets 0 before bring-up; publishForDevice cleans every table page to the point of coherency
+ * either way, so outer non-cacheable walks see each update. */
+extern "C" {volatile uint32_t native_adreno_smmu_coherent_walk=1;}
 IOReturn NativeAdrenoSmmuContext::prepare(NativeAdrenoMemory *tables,unsigned upper,uint64_t iova,
     size_t bytes,size_t leaf_budget,unsigned bank,unsigned asid,unsigned poll_budget,unsigned output_bits)
 {
@@ -11,10 +15,9 @@ IOReturn NativeAdrenoSmmuContext::prepare(NativeAdrenoMemory *tables,unsigned up
     const IOReturn prepared=NativeAdrenoPrepareSmmuMemory(tables,32,output_bits,iova,bytes,upper,leaf_budget,
         &arena_,&state_,&visibility_);
     if(prepared!=kIOReturnSuccess)return prepared==kIOReturnNoResources?prepared:kIOReturnBadArgument;
-    /* The adreno SMMU node is dma-coherent at the pinned tree, so table walks are inner write-back. */
     config_=(ArmSmmu4KContextConfig){.lower=upper?nullptr:&arena_.config,.upper=upper?&arena_.config:nullptr,
         .lower_tables=upper?nullptr:&state_.tables,.upper_tables=upper?&state_.tables:nullptr,.id0=0,.id2=0,
-        .asid=asid,.coherent_walk=1,.stall_on_fault=0,.continue_after_fault=1};
+        .asid=asid,.coherent_walk=native_adreno_smmu_coherent_walk?1u:0u,.stall_on_fault=0,.continue_after_fault=1};
     tables_=tables;bank_=bank;poll_budget_=poll_budget;prepared_=true;
     return kIOReturnSuccess;
 }
