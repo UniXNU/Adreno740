@@ -326,7 +326,7 @@ IOReturn NativeAdrenoUserClient::submit(const NativeAdrenoAbiSubmit *request,
         const IOReturn waited=submit_->observeFence((uint32_t)request->wait_fence,clock,wait_us);
         if(waited)return waited;
     }
-    NativeAdrenoSubmitBuffer buffers[NativeAdrenoAbiMaxBuffers];
+    NativeAdrenoSubmitBuffer *buffers=submit_buffers_;
     for(uint32_t i=0;i<request->buffer_count;++i) {
         const NativeAdrenoAbiSubmitBuffer &wire=request->buffers[i];
         if(!wire.bytes || (wire.bytes&3))return kIOReturnBadArgument;

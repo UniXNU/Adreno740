@@ -11,8 +11,8 @@
  * disagrees with the storage. Unknown versions, methods and flags are refused
  * rather than ignored. */
 enum {
-    NativeAdrenoAbiVersion = 1,
-    NativeAdrenoAbiMaxBuffers = 16,
+    NativeAdrenoAbiVersion = 2,
+    NativeAdrenoAbiMaxBuffers = 128,   /* a frame's IBs in one submission (Turnip splits a larger one) */
     NativeAdrenoAbiMaxBoBytesShift = 28, /* 256MiB per object */
     NativeAdrenoMethodQuery = 1,
     NativeAdrenoMethodBoAlloc = 2,
@@ -151,7 +151,7 @@ static_assert(sizeof(NativeAdrenoAbiBoAlloc) == 16, "ABI alloc layout");
 static_assert(sizeof(NativeAdrenoAbiBoMap) == 32, "ABI map layout");
 static_assert(sizeof(NativeAdrenoAbiBoImport) == 16, "ABI import layout");
 static_assert(sizeof(NativeAdrenoAbiSubmitBuffer) == 24, "ABI buffer layout");
-static_assert(sizeof(NativeAdrenoAbiSubmit) == 416, "ABI submit layout");
+static_assert(sizeof(NativeAdrenoAbiSubmit) == 32 + 24 * NativeAdrenoAbiMaxBuffers, "ABI submit layout");
 static_assert(sizeof(NativeAdrenoAbiBoCpuMap) == 8, "ABI cpu map layout");
 static_assert(sizeof(NativeAdrenoAbiBoCpuMapReply) == 16, "ABI cpu map reply layout");
 static_assert(sizeof(NativeAdrenoAbiBoCpuUnmap) == 16, "ABI cpu unmap layout");

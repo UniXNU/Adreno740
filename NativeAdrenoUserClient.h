@@ -48,6 +48,7 @@ class NativeAdrenoUserClient final {
      * range 0). Before either, queue_base_ is only the default 0, which a scoped client may own, so a check of "this client's own range" would
      * test someone else's jobs. */
     bool scoped_=false,used_=false;
+    NativeAdrenoSubmitBuffer submit_buffers_[NativeAdrenoAbiMaxBuffers]{};   /* submit()'s list: too large for the kernel stack */
     uint64_t window_start_=0,window_bytes_=0,window_peak_=0;
     uint64_t next_handle_=1;
     bool open_=false;
