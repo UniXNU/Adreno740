@@ -48,6 +48,9 @@ static void peekFetch(const NativeAdrenoVm *vm,uint64_t fetch,volatile uint32_t 
     for(unsigned i=0;i<16;++i)slot[1+i]=words[i];
 }
 static uint32_t stall_fence,stall_timeouts,stall_stage;   /* stage: 0 none yet, 1 write pointer given again, 2 translations dropped, 3 bus drained */
+static uint64_t stall_began_us,stall_last_us;   /* the fence's first and latest timed-out wait */
+/* How long fences stayed pending from their first timed-out wait to their last: [i] under 1 << i ms for i < 7, [7] 64 ms or more. */
+extern "C" {volatile uint32_t native_adreno_fence_pending[8];}
 /* What the stall handler tried: [0] attempts, [1] the fence of the last attempt, [2] attempts after which that fence completed, [3] the
  * timed-out waits that fence had seen when it did. */
 /* [4] bus drains, [5] client halt acknowledge, [6] arbiter halt acknowledge, [7] the fence of the last drain, [8] drains after which that fence completed */
@@ -245,10 +248,30 @@ IOReturn NativeAdrenoSubmit::observeFence(uint32_t fence,const NativeAdrenoRingC
     if(result==NativeAdrenoRingFenceTimeout)return kIOReturnTimeout;
     return kIOReturnSuccess;
 }
-void NativeAdrenoSubmit::noteStall(uint32_t observed)
+/* A stage runs once per stalled fence: when the stage before it has run and the fence has been pending long enough. */
+static bool stage_due(uint32_t stage,uint32_t before,uint64_t pending,uint64_t after_us)
+{
+    return stage==before && pending>=after_us;
+}
+/* The CP snapshot is taken at 50 ms and at 1 s of one stall. */
+static uint32_t stall_snapshots;
+static bool snapshot_due(uint32_t *taken,uint64_t pending)
+{
+    const uint32_t want=pending>=1000000?2:pending>=50000?1:0;
+    if(want<=*taken)return false;
+    *taken=want;return true;
+}
+void NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingClock *clock)
 {
     const uint32_t next=observed+1;   /* the fence the CP is working on */
+    const uint64_t now=clock && clock->now_us?clock->now_us(clock->cookie):0;
     if(next!=stall_fence) {
+        if(stall_timeouts && now) {
+            const uint64_t ms=(stall_last_us-stall_began_us)/1000;
+            uint32_t bucket=0;while(bucket<7 && ms>=(1ull<<bucket))++bucket;
+            native_adreno_fence_pending[bucket]=native_adreno_fence_pending[bucket]+1;
+        }
+        stall_began_us=now;stall_snapshots=0;
         /* The CP moved on: what the stall that just ended took to clear. [9] first-stage recoveries, [10] second, [11] third, [12] timeouts of the longest. */
         if(stall_stage && stall_timeouts) {
             native_adreno_unstick[8+stall_stage]=native_adreno_unstick[8+stall_stage]+1;
@@ -256,25 +279,29 @@ void NativeAdrenoSubmit::noteStall(uint32_t observed)
         }
         stall_fence=next;stall_timeouts=0;stall_stage=0;
     }
+    stall_last_us=now;
+    const uint64_t pending=now-stall_began_us;
     /* A fence that stops while the CP sits idle with work in the ring (int-317 hung with RBBM idle, RPTR short of WPTR, both threads at the same
      * cache clean) is nearly always a write pointer the CP never took: giving it again after a few waits ends it in a couple of milliseconds
      * (i343: 206 of 213 stalls ended at the second stage, 60 to 85 ms each, most of it the 100 waits before the write). After 10 waits now:
      * i469 stalled 143 times in about 200 s, each a visible hitch. The same value written again changes nothing when the CP is busy. */
     /* After 10 waits the translations are dropped and the write pointer is given again. i494/i495 measured what ends these: a job lasts about
      * 5 ms against 1 ms waits, so most "stalls" are ordinary jobs still running; the write pointer is never dropped (fenced writes saw no
-     * drop) and invalidating at map time changed nothing. */
-    if(stall_timeouts+1==10) {
+     * drop) and invalidating at map time changed nothing. i553: the handler ran on 6712 of 6911 jobs. It now waits for 50 ms without
+     * progress, measured in time (a timed-out wait is one poll, 100 us or less), and so does the snapshot below. */
+    if(now && stage_due(stall_stage,0,pending,50000)) {
         native_adreno_unstick[0]=native_adreno_unstick[0]+1;native_adreno_unstick[1]=stall_fence;stall_stage=1;
         (void)vm_->invalidateTlb();(void)ring_->kick();
     }
     /* Still stopped well after that: the way a6xx drains the bus before a reset, which lets a write that was never acknowledged end. */
-    if(stall_timeouts+1==400) {
+    if(now && stage_due(stall_stage,1,pending,200000)) {
         uint32_t ack[2]={};
         native_adreno_unstick[4]=native_adreno_unstick[4]+1;native_adreno_unstick[7]=stall_fence;stall_stage=3;
         (void)ring_->drainBus(ack);
         native_adreno_unstick[5]=ack[0];native_adreno_unstick[6]=ack[1];
     }
-    if(++stall_timeouts!=10 && stall_timeouts!=1000)return;
+    ++stall_timeouts;
+    if(!now || !snapshot_due(&stall_snapshots,pending))return;
     uint32_t words[NativeAdrenoRingStallWords]={},fault[4]={};
     if(ring_->stallState(words))return;
     (void)vm_->faultState(fault);
@@ -315,7 +342,7 @@ IOReturn NativeAdrenoSubmit::wait(uint32_t fence,const NativeAdrenoRingClock *cl
             ++stats_.timeouts;
             native_adreno_fence_wait[1]=native_adreno_fence_wait[1]+1;native_adreno_fence_wait[2]=fence;native_adreno_fence_wait[3]=observed;
             native_adreno_fence_wait[4]=ring_->lastSubmitted();native_adreno_fence_wait[5]=ring_->completedFence();
-            noteStall(observed);
+            noteStall(observed,clock);
             return kIOReturnTimeout;
         }
         return kIOReturnSuccess;
@@ -327,7 +354,7 @@ IOReturn NativeAdrenoSubmit::wait(uint32_t fence,const NativeAdrenoRingClock *cl
         ++stats_.timeouts;
         native_adreno_fence_wait[1]=native_adreno_fence_wait[1]+1;native_adreno_fence_wait[2]=fence;native_adreno_fence_wait[3]=observed;
         native_adreno_fence_wait[4]=ring_->lastSubmitted();native_adreno_fence_wait[5]=ring_->completedFence();
-        noteStall(observed);
+        noteStall(observed,clock);
         return kIOReturnTimeout;
     }
     IOReturn status=release(*job);
