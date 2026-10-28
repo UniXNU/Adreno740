@@ -72,6 +72,9 @@ public:
      * allocate(..., pooled=true) uses the pool when one is reserved and has room, else the scattered path. Only the board calls this. */
     static IOReturn reservePool(unsigned output_bits,size_t bytes);
     static size_t poolBytes();
+    /* Pressure on the pool every client allocates from: more than seven eighths in use, or an allocation it could not serve in the last
+     * two seconds (that one fell back to scattered pages). Clients poll it (Query) and empty their BO caches. */
+    static bool poolPressure();
     /* The pool's first physical byte (0 without a pool): its pages belong to pooled BOs alone. */
     static uint64_t poolPhysical();
     /* The whole pool write-combined once, for good: a pooled BO then takes no page-attribute change on allocation or release.

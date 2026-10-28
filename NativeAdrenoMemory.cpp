@@ -5,6 +5,7 @@ extern "C" {volatile uint32_t native_adreno_trace_stage;}
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
 #include <kern/task.h>
+#include <kern/clock.h>
 
 static bool outputWidth(unsigned bits)
 {return bits==32 || bits==36 || bits==40 || bits==42 || bits==44 || bits==48;}
@@ -53,6 +54,16 @@ void poolGive(size_t offset,size_t bytes) {
 }
 }
 size_t NativeAdrenoMemory::poolBytes() {return pool.bytes;}
+static uint64_t gPoolMissAt;   /* mach_absolute_time of the last allocation the pool could not serve, 0 none */
+bool NativeAdrenoMemory::poolPressure()
+{
+    if(!pool.descriptor || !pool.bytes)return false;
+    if(pool.used>pool.bytes-pool.bytes/8)return true;
+    const uint64_t miss=gPoolMissAt;
+    if(!miss)return false;
+    uint64_t window=0;nanoseconds_to_absolutetime(2000000000ull,&window);
+    return mach_absolute_time()-miss<window;
+}
 uint64_t NativeAdrenoMemory::poolPhysical() {return pool.descriptor?pool.physical:0;}
 /* int-152: a user BO's pages changed attribute one pmap_set_cache_attributes call at a time (each walks the page's mappings, flushes the
  * TLB and cleans the page), on allocation and again on release, under the connection lock: 3 ms a BO on average and 90-130 ms for a
@@ -125,6 +136,7 @@ IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous
             }
         }
         native_adreno_pool_stats[2]=native_adreno_pool_stats[2]+1;
+        gPoolMissAt=mach_absolute_time();
     }
     IOOptionBits options=static_cast<IOOptionBits>(kIODirectionInOut)|static_cast<IOOptionBits>(kIOMemoryMapperNone);
     if(contiguous)options|=kIOMemoryPhysicallyContiguous;
