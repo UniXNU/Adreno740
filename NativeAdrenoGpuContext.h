@@ -78,6 +78,10 @@ public:
     IOReturn observeContext(uint32_t *kit_status,uint32_t out[8]) const;
     /* Writes a latched fault status back (FSR is write-one-to-clear); *far gets FAR and FSYNR0 first (lo, hi, fsynr0). */
     IOReturn clearFault(uint32_t fsr,uint32_t far[3]);
+    /* msm's handling of a GPU context fault before a restart (arm_smmu_context_fault, then msm_iommu_resume_translation with terminate):
+     * a stalled transaction (FSR.SS) is terminated through CB_RESUME and the latched FSR written back. out[] = FSR, FAR lo, FAR hi,
+     * FSYNR0 as found; FSR 0 when no fault was latched. */
+    IOReturn endFault(uint32_t out[4]);
     /* The bank's TTBR0 as the SMMU holds it now. */
     IOReturn readTtbr0(uint64_t *out) const;
     /* A one-dword indirect buffer (CP_NOP) in the scratch page of p's address space, for the CP table-switch check. */

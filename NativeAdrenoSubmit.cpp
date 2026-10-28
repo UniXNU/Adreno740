@@ -377,20 +377,22 @@ void NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingClock
     (void)vm_->faultState(fault);
     for(uint32_t i=0;i<4;++i)native_adreno_stall_mem[i]=fault[i];
     uint64_t ib=0;uint32_t size=0;
-    if(!ring_->ibBefore(words[8],&ib,&size))peekIb(vm_,ib,size,words[12],&native_adreno_stall_mem[4]);
-    else peekFetch(vm_,(uint64_t)words[11]<<32|words[10],&native_adreno_stall_mem[4]);
-    if(!ring_->ibBefore(words[16],&ib,&size))peekIb(vm_,ib,size,words[18],&native_adreno_stall_mem[4+17]);
-    else peekFetch(vm_,(uint64_t)words[11]<<32|words[17],&native_adreno_stall_mem[4+17]);   /* BV IB1 base: the low word only */
-    peekFetch(vm_,(uint64_t)words[21]<<32|words[20],&native_adreno_stall_mem[4+34]);
+    /* The IBs are the stalled job's: read them through its address space (the kernel's maps none of a client's BOs). */
+    const Job *job=find(next);
+    const NativeAdrenoVm *space=job && job->vm?job->vm:vm_;
+    if(!ring_->ibBefore(words[8],&ib,&size))peekIb(space,ib,size,words[12],&native_adreno_stall_mem[4]);
+    else peekFetch(space,(uint64_t)words[11]<<32|words[10],&native_adreno_stall_mem[4]);
+    if(!ring_->ibBefore(words[16],&ib,&size))peekIb(space,ib,size,words[18],&native_adreno_stall_mem[4+17]);
+    else peekFetch(space,(uint64_t)words[11]<<32|words[17],&native_adreno_stall_mem[4+17]);   /* BV IB1 base: the low word only */
+    peekFetch(space,(uint64_t)words[21]<<32|words[20],&native_adreno_stall_mem[4+34]);
     {
-        const Job *job=find(next);
         uint64_t brIb=(uint64_t)words[11]<<32|words[10],bvIb=(uint64_t)words[11]<<32|words[17];
         if(!ring_->ibBefore(words[8],&ib,&size))brIb=ib;
         if(!ring_->ibBefore(words[16],&ib,&size))bvIb=ib;
         native_adreno_stall_mem[55]=job?(uint32_t)job->vm_next:0;
-        native_adreno_stall_mem[56]=(uint32_t)(table_vm_?table_vm_:vm_)->handleAt(brIb);
-        native_adreno_stall_mem[57]=(uint32_t)(table_vm_?table_vm_:vm_)->handleAt(bvIb);
-        native_adreno_stall_mem[58]=(uint32_t)(table_vm_?table_vm_:vm_)->handleAt((uint64_t)words[21]<<32|words[20]);
+        native_adreno_stall_mem[56]=(uint32_t)space->handleAt(brIb);
+        native_adreno_stall_mem[57]=(uint32_t)space->handleAt(bvIb);
+        native_adreno_stall_mem[58]=(uint32_t)space->handleAt((uint64_t)words[21]<<32|words[20]);
     }
     for(uint32_t i=0;i<NativeAdrenoRingStallWords;++i)native_adreno_stall[2+i]=words[i];
     native_adreno_stall[1]=stall_timeouts;

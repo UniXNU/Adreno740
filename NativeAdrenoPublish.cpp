@@ -157,6 +157,9 @@ struct Published {
 /* GPU hangs (msm hangcheck, NativeAdrenoSubmit::hangCheck) and restarts: [0] hangs, [1] restarts, [2] failed restarts, [3] the last hung
  * fence, [4] the last restart's IOReturn, [5] submissions replayed so far, [6] hangs with a guilty job, [7] hangs of the kernel's own VM. */
 extern "C" {volatile uint32_t native_adreno_recovery[8];}
+/* SMMU context faults ended before a restart (NativeAdrenoGpuContext::endFault): [0] how many, then the last one's FSR, FAR lo, FAR hi,
+ * FSYNR0. A latched FSR fails every later table operation's proof of the bank, so a restart that left it would poison the tables. */
+extern "C" {volatile uint32_t native_adreno_recovery_fault[5];}
 /* The board's GPU restart (a6xx_recover's reset and hw_init), installed before or after publication. */
 extern "C" void native_adreno_set_restart(NativeAdrenoRestart restart,void *cookie)
 {
@@ -175,6 +178,11 @@ static void nativeAdrenoHangcheck(void *,wait_result_t)
         if(g.submit && !g.submit->hangCheck(&hung) && hung) {
             native_adreno_recovery[0]=native_adreno_recovery[0]+1;
             if(g.restart) {
+                uint32_t fault[4]={};
+                if(g.context && !g.context->endFault(fault) && fault[0]) {
+                    native_adreno_recovery_fault[0]=native_adreno_recovery_fault[0]+1;
+                    for(unsigned i=0;i<4;++i)native_adreno_recovery_fault[1+i]=fault[i];
+                }
                 NativeAdrenoRecovery result{};
                 const IOReturn status=g.submit->recover(g.restart,g.restart_cookie,&g.clock,&result);
                 native_adreno_recovery[3]=result.fence;native_adreno_recovery[4]=uint32_t(status?status:result.status);

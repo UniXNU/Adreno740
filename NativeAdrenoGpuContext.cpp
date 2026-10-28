@@ -199,6 +199,22 @@ IOReturn NativeAdrenoGpuContext::clearFault(uint32_t fsr,uint32_t far[3])
     if(io->write32(io->cookie,(size_t)offset+0x58,fsr) || io->barrier(io->cookie))return kIOReturnIOError;
     return kIOReturnSuccess;
 }
+IOReturn NativeAdrenoGpuContext::endFault(uint32_t out[4])
+{
+    if(!out || !ready_)return kIOReturnBadArgument;
+    out[0]=out[1]=out[2]=out[3]=0;
+    const ArmSmmu4KIo *io=smmu_.ioHandle();
+    const uint64_t offset=smmu_.stateHandle()->context_offset;
+    if(!offset)return kIOReturnNotReady;
+    if(io->read32(io->cookie,(size_t)offset+0x58,&out[0]))return kIOReturnIOError;
+    if(!out[0])return kIOReturnSuccess;
+    if(io->read32(io->cookie,(size_t)offset+0x60,&out[1]) || io->read32(io->cookie,(size_t)offset+0x64,&out[2]) ||
+        io->read32(io->cookie,(size_t)offset+0x68,&out[3]))return kIOReturnIOError;
+    /* CB_RESUME (0x08) bit 0 TnR: terminate the stalled transaction; the GPU sees an error response instead of waiting forever. */
+    if((out[0]&(1u<<30)) && io->write32(io->cookie,(size_t)offset+0x08,1))return kIOReturnIOError;
+    if(io->write32(io->cookie,(size_t)offset+0x58,out[0]) || io->barrier(io->cookie))return kIOReturnIOError;
+    return kIOReturnSuccess;
+}
 IOReturn NativeAdrenoGpuContext::readTtbr0(uint64_t *out) const
 {
     if(!out)return kIOReturnBadArgument;*out=0;
