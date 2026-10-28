@@ -274,9 +274,8 @@ bool NativeAdrenoVm::exclusivePages(const NativeAdrenoMemory *memory,unsigned cl
     if(!memory || !memory->imported())return true;   /* preflight refuses a null one */
     size_t imports=0;for(size_t k=0;k<16;++k)imports+=import_spans_[k];
     if(imports!=import_spans_[cls&15])return false;
-    const uint64_t pool=NativeAdrenoMemory::poolPhysical();const size_t poolBytes=NativeAdrenoMemory::poolBytes();
     const auto *spans=memory->spans();const size_t n=memory->spanCount();
-    if(pool)for(size_t j=0;j<n;++j)if(overlap(spans[j].physical,spans[j].bytes,pool,poolBytes))return false;
+    for(size_t j=0;j<n;++j)if(NativeAdrenoMemory::poolContains(spans[j].physical,spans[j].bytes))return false;
     size_t pairs=0;
     for(size_t i=0;i<high_;++i) {
         const Mapping &m=mappings_[i];

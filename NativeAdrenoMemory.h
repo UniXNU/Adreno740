@@ -49,6 +49,7 @@ class NativeAdrenoMemory final {
     size_t bytes_=0,span_count_=0,span_capacity_=0;
     uint32_t device_references_=0;
     bool prepared_=false,quarantined_=false,write_combined_=false,pooled_=false,borrowed_=false;
+    unsigned pool_chunk_=0;
     size_t pool_offset_=0;
     IOReturn maintainImported(size_t offset,size_t bytes,NativeAdrenoCacheOperation);
 public:
@@ -62,23 +63,24 @@ public:
      * CPU native4K state and kernel page ABI are checked before allocation.
      * prepare(), raw unmapped physical segments, span/PA bounds and optional
      * physical contiguity are verified before zeroing/PoC publication. */
-    /* `pooled`: take the bytes from the BO pool when one is reserved and has room. Only user BOs do: the pool is write-combined for
+    /* `pooled`: take the bytes from the BO pool (a chunk with room, or a new chunk). Only user BOs do: the pool is write-combined for
      * the CPU (writeCombinePool), and the kernel's own objects (SMMU tables, ring, fence and firmware pages) are walked or read by the
      * CPU through their cacheable mapping (int-153: page tables from the write-combined pool made each map's table update 2.6x slower). */
     IOReturn allocate(size_t bytes,unsigned output_bits,bool contiguous,size_t byte_budget,bool pooled=false);
-    /* One physically contiguous block taken from the VM early (while memory is not yet fragmented) and cut into BOs afterwards: a BO from it is
-     * one span of the GPU's table instead of one per scattered page (int-137: 59474 spans for 332 MiB, the 65536 span capacity ran out,
-     * BoMap failed, the translator answered out of device memory and the compositor fell back to the CPU; each map also walked every span, 167 ms).
-     * allocate(..., pooled=true) uses the pool when one is reserved and has room, else the scattered path. Only the board calls this. */
+    /* The BO pool: physically contiguous chunks cut into BOs, so a BO is one span of the GPU's table instead of one per scattered page
+     * (int-137: 59474 spans for 332 MiB, the span capacity ran out, BoMap failed and the compositor fell back to the CPU). Enables the
+     * pool for pages below 2^output_bits and takes `bytes` (0: none) as a first chunk while memory is not yet fragmented; that chunk stays.
+     * Every other chunk is taken from the system when no chunk has room (2 MiB, halved down to 64 KiB, or a large BO's own size) and given
+     * back when it empties. allocate(..., pooled=true) falls back to scattered pages only when the system has no such chunk. Board only. */
     static IOReturn reservePool(unsigned output_bits,size_t bytes);
     static size_t poolBytes();
-    /* Pressure on the pool every client allocates from: more than seven eighths in use, or an allocation it could not serve in the last
-     * two seconds (that one fell back to scattered pages). Clients poll it (Query) and empty their BO caches. */
+    /* Memory pressure: the system could not give the pool a chunk (the last BO fell back to scattered pages); cleared once the pool serves
+     * an allocation again. Clients read it in Query and give their cached BOs back. */
     static bool poolPressure();
-    /* The pool's first physical byte (0 without a pool): its pages belong to pooled BOs alone. */
-    static uint64_t poolPhysical();
-    /* The whole pool write-combined once, for good: a pooled BO then takes no page-attribute change on allocation or release.
-     * Board only, after reservePool, when user BOs are write-combined. */
+    /* Whether [physical, physical+bytes) touches a pool chunk: its pages belong to pooled BOs alone. */
+    static bool poolContains(uint64_t physical,size_t bytes);
+    /* Every chunk write-combined once, for good, and every later chunk when it is made: a pooled BO then takes no page-attribute change
+     * on allocation or release. Board only, after reservePool, when user BOs are write-combined. */
     static IOReturn writeCombinePool();
     /* Pins bytes at address in task (a user task's own pages) instead of allocating; prepare() wires them until release().
      * There is no kernel mapping: the owner keeps its CPU mapping and does its own cache maintenance around GPU use, so
