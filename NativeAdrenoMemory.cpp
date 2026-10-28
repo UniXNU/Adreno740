@@ -15,7 +15,7 @@ extern "C" {volatile uint32_t native_adreno_pool_mib=0,native_adreno_pool_status
 extern "C" {volatile uint32_t native_adreno_pool_stats[8];}
 /* The pool's write-combine (writeCombinePool): bit 31 once tried, the low bits its status. */
 extern "C" {volatile uint32_t native_adreno_pool_wc;}   /* [0] pool MiB, [1] BOs from the pool, [2] fell back, [3] MiB in use, [4] peak MiB, [5] scattered BOs, [6] their spans, [7] import spans */
-/* Pool chunks: [0] live, [1] made on demand, [2] freed when empty, [3] chunks the system could not give (memory pressure). */
+/* Pool chunks: [0] live, [1] made on demand, [2] freed when empty, [3] times the pool ran out of room (memory pressure). */
 extern "C" {volatile uint32_t native_adreno_pool_chunks[4];}
 namespace {
 struct PoolExtent {size_t offset,bytes;};
@@ -31,10 +31,6 @@ struct Pool {
     size_t bytes=0,used=0,peak=0;unsigned bits=0;
     bool enabled=false,write_combined=false,pressure=false;
 } pool;
-/* The chunk size: 2 MiB, the 4 KiB granule's level-2 block (ARM LPAE, io-pgtable-arm's SZ_2M page size), halved down to 64 KiB when the
- * system has no such contiguous run, and never below what one BO needs. A BO larger than 2 MiB gets a chunk of its own size. */
-enum : size_t {ChunkBytes=size_t(2)<<20,ChunkFloor=size_t(64)<<10};
-static size_t roundChunk(size_t bytes) {return (bytes+ChunkFloor-1)&~(ChunkFloor-1);}
 static bool extentGrow(Chunk &c)
 {
     const unsigned size=c.capacity?c.capacity*2:16;
@@ -138,8 +134,11 @@ static bool chunkTake(unsigned slot,size_t bytes,size_t *offset)
     c.used+=bytes;pool.used+=bytes;noteUse();
     return true;
 }
-/* Best fit over every chunk; with no room, a new chunk from the system (2 MiB halved down to the floor, or the BO's own size). With none to
- * be had the pool reports memory pressure until it serves an allocation again. */
+/* Best fit over every chunk the pool holds. With no room the BO takes pages from the VM like msm's shmem-backed GEM objects (the caller's
+ * scattered path), and the pool reports memory pressure until it serves an allocation again, so the clients give back what they cache.
+ * A physically contiguous chunk is never searched for here: XNU finds one by scanning physical memory, and BoAlloc runs under the
+ * publication lock, so every client's submission and wait stood behind the scan (untagged-15146dbdcf: 60 chunks made and 13 searches
+ * refused once the reservation filled, BoAlloc 120 s of 420 s, render server commits taking seconds). */
 bool poolTake(size_t bytes,unsigned *slot,size_t *offset)
 {
     int best=-1;size_t fit=0;
@@ -149,20 +148,8 @@ bool poolTake(size_t bytes,unsigned *slot,size_t *offset)
         for(unsigned i=0;i<c.count;++i)if(c.free[i].bytes>=bytes && (best<0 || c.free[i].bytes<fit)) {best=(int)pool.order[k];fit=c.free[i].bytes;}
     }
     if(best>=0 && chunkTake((unsigned)best,bytes,offset)) {*slot=(unsigned)best;pool.pressure=false;return true;}
-    const size_t need=roundChunk(bytes);
-    int made=-1;
-    if(need>=ChunkBytes)made=chunkMake(need,false);
-    else {
-        for(size_t size=ChunkBytes;made<0 && size>=need;size>>=1)made=chunkMake(size,false);
-        if(made<0 && (need&(need-1)))made=chunkMake(need,false);
-    }
-    if(made<0) {
-        if(!pool.pressure)native_adreno_pool_chunks[3]=native_adreno_pool_chunks[3]+1;
-        pool.pressure=true;return false;
-    }
-    pool.pressure=false;native_adreno_pool_chunks[1]=native_adreno_pool_chunks[1]+1;
-    if(!chunkTake((unsigned)made,bytes,offset))return false;
-    *slot=(unsigned)made;return true;
+    if(!pool.pressure)native_adreno_pool_chunks[3]=native_adreno_pool_chunks[3]+1;
+    pool.pressure=true;return false;
 }
 void poolGive(unsigned slot,size_t offset,size_t bytes) {
     Chunk &c=pool.chunks[slot];
