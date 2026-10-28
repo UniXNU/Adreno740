@@ -33,7 +33,8 @@ static int mread64(void *c,size_t at,uint64_t *v)
 {CHECK(c==&mf && at%8==0 && at<=SMMU_BYTES-8);if(mevent())return 1;std::memcpy(v,mmio+at/4,8);return 0;}
 static int mwrite32(void *c,size_t at,uint32_t v)
 {CHECK(c==&mf && at%4==0 && at<=SMMU_BYTES-4);int f=mevent();if(f && !mf.after)return 1;mmio[at/4]=v;return f;}
-static int mwrite64(void *c,size_t at,uint64_t v){(void)c;(void)at;(void)v;CHECK(0);return 1;}
+static int mwrite64(void *c,size_t at,uint64_t v)
+{CHECK(c==&mf && at%8==0 && at<=SMMU_BYTES-8);int f=mevent();if(f && !mf.after)return 1;std::memcpy(mmio+at/4,&v,8);return f;}
 static int mbarrier(void *c){CHECK(c==&mf);return mevent();}
 /* CP register peer. */
 struct CpPeer {
@@ -50,13 +51,14 @@ static int cread(void *c,uint32_t reg,uint32_t *v)
 {CHECK(c==&cp && v && reg<cp.regs.size());*v=cp.regs[reg];return 0;}
 static int cbarrier(void *c){CHECK(c==&cp);++cp.barriers;return cp.barriers==cp.fail_barrier;}
 static int cpublish(void *c,const volatile uint32_t *w,size_t bytes)
-{CHECK(c==&cp && w && bytes==32768);++cp.publish;return cp.publish==cp.fail_publish;}
+{CHECK(c==&cp && w && (bytes==32768 || bytes==4096));++cp.publish;return cp.publish==cp.fail_publish;}
 static int cacquire(void *c,volatile uint32_t *w,size_t bytes)
 {CHECK(c==&cp && w && bytes==4096);++cp.acquire;return cp.acquire==cp.fail_acquire;}
 static uint64_t cnow(void *c){CHECK(c==&cp);return clock_us;}
 static int cidle(void *c){CHECK(c==&cp);clock_us+=1000;return 0;}
 struct Path {
-    NativeAdrenoMemory tables,object;
+    NativeAdrenoTablePages tables;
+    NativeAdrenoMemory object;
     ArmSmmu4KLiveArena arena;
     ArmSmmu4KLiveState state{};
     ArmSmmu4KLiveVisibility visibility;
@@ -83,7 +85,6 @@ static int exposed(Path &p,bool write_combined=false)
 {
     smmuReset();cp=CpPeer{};clock_us=0;
     std::memset(ringmem,0xef,sizeof(ringmem));std::memset(fencemem,0,sizeof(fencemem));
-    if(p.tables.allocate(32*4096,40,true,32*4096))return kIOReturnNoMemory;
     if(NativeAdrenoPrepareSmmuMemory(&p.tables,32,40,0x800000,65536,0,16,&p.arena,&p.state,&p.visibility))
         return kIOReturnBadArgument;
     context=(ArmSmmu4KContextConfig){.lower=&p.arena.config,.lower_tables=&p.state.tables,
@@ -106,6 +107,7 @@ static int exposed(Path &p,bool write_combined=false)
         return kIOReturnBadArgument;
     return p.submit.attach(&p.vm,&p.ring);
 }
+void NativeAdrenoNotePhase(unsigned,size_t) {}
 int main()
 {
     /* One validated indirect-buffer submission with exact ring bytes. */
@@ -113,12 +115,13 @@ int main()
         Path p;CHECK(exposed(p)==kIOReturnSuccess);
         NativeAdrenoSubmitBuffer buffer{p.handle,0x800000,4096};
         uint32_t fence=0;
-        /* Before the ring: clean+invalidate of the one mapped BO, a coherence sample of the IB's first word and TLBIALL. */
+        /* Before the ring: clean+invalidate of the one mapped BO and a coherence sample of the IB's first word; no TLBIALL (a map fills only
+         * invalid leaves and an unmap drops its own pages). */
         static_cast<volatile uint32_t *>(p.object.mapping())[0]=0x70970001u;
         const unsigned cache_calls=fixture.cache_calls;
         mmio[(CB+0x618)/4]=0xffffffffu;
         CHECK(p.submit.submit(&buffer,1,0,&fence)==kIOReturnSuccess && fence==1);
-        CHECK(fixture.cache_calls==cache_calls+1 && mmio[(CB+0x618)/4]==0);
+        CHECK(fixture.cache_calls==cache_calls+1 && mmio[(CB+0x618)/4]==0xffffffffu);
         CHECK(native_adreno_coherence[0]==1 && native_adreno_coherence[1]==0x70970001u &&
             native_adreno_coherence[2]==~0u && native_adreno_coherence[3]==~0u);   /* no board DRAM reader installed */
         CHECK(cp.writes.back()==0x0807 && cp.regs[0x0807]==11+4+31);
@@ -136,14 +139,8 @@ int main()
         CHECK(p.object.deviceReferences()==1 && p.submit.stats().references_retired==1);
         CHECK(p.submit.wait(1,&ringclock,1000)==kIOReturnSuccess); /* retired job: the ring says the CP passed it */
         CHECK(p.submit.wait(2,&ringclock,1000)==kIOReturnBadArgument); /* never submitted */
-        /* With a board DRAM reader, the sample reads the IB's physical page (before and after the maintenance). */
-        native_adreno_dram_read32=[](uint64_t physical,uint32_t *value) {
-            dram_reads.push_back(physical);*value=0xd00d0000u|uint32_t(dram_reads.size());return 0;};
-        CHECK(p.submit.submit(&buffer,1,0,&fence)==kIOReturnSuccess && fence==2);
-        CHECK(dram_reads.size()==2 && dram_reads[0]==p.object.spans()[0].physical && dram_reads[1]==dram_reads[0]);
-        CHECK(native_adreno_coherence[0]==2 && native_adreno_coherence[2]==0xd00d0001u && native_adreno_coherence[3]==0xd00d0002u);
-        CHECK(native_adreno_coherence[4]==2 && native_adreno_coherence[5]==0x70970001u && native_adreno_coherence[6]==~0u);   /* first differing sample kept */
-        native_adreno_dram_read32=nullptr;
+        /* The coherence sample runs on every 64th submission only (the first was sampled above). */
+        CHECK(p.submit.submit(&buffer,1,0,&fence)==kIOReturnSuccess && fence==2 && native_adreno_coherence[0]==1);
         fencemem[1]=2;
         CHECK(p.submit.wait(2,&ringclock,1000)==kIOReturnSuccess);
         CHECK(p.submit.detach()==kIOReturnSuccess);
@@ -169,7 +166,7 @@ int main()
         fencemem[1]=1;CHECK(p.submit.wait(1,&ringclock,1000)==kIOReturnSuccess);
         dirty_lines=2;
         CHECK(p.submit.submit(&buffer,1,0,&fence)==kIOReturnSuccess && fence==2);
-        CHECK(!p.vm.writeCombinedTrusted() && native_adreno_wc_distrusted==native_adreno_coherence[0]);
+        CHECK(!p.vm.writeCombinedTrusted() && native_adreno_wc_distrusted);
         CHECK(fixture.physical_calls>physical);   /* this submission maintained the write-combined BO */
         const size_t calls=audited.size();
         fencemem[1]=2;CHECK(p.submit.wait(2,&ringclock,1000)==kIOReturnSuccess);
@@ -177,7 +174,7 @@ int main()
         fencemem[1]=3;CHECK(p.submit.wait(3,&ringclock,1000)==kIOReturnSuccess);
         CHECK(p.submit.detach()==kIOReturnSuccess);
     }
-    /* The audit compares the first 16 submissions after attach, then every eighth (17, 25, ...); the re-assertion runs at each. */
+    /* The audit compares only the first 16 submissions after attach; the re-assertion runs at each. */
     {
         Path p;CHECK(exposed(p,true)==kIOReturnSuccess);
         NativeAdrenoSubmitBuffer buffer{p.handle,0x800000,4096};
@@ -189,7 +186,7 @@ int main()
             CHECK(p.submit.submit(&buffer,1,0,&fence)==kIOReturnSuccess && fence==n);
             fencemem[1]=n;CHECK(p.submit.wait(n,&ringclock,1000)==kIOReturnSuccess);
         }
-        CHECK(calls==17 && native_adreno_wc_audit[0]==submissions+17 && p.vm.writeCombinedTrusted());
+        CHECK(calls==16 && native_adreno_wc_audit[0]==submissions+16 && p.vm.writeCombinedTrusted());
         native_adreno_line_audit=nullptr;
         CHECK(p.submit.detach()==kIOReturnSuccess);
     }
@@ -220,9 +217,9 @@ int main()
         CHECK(p.submit.submit(overrun,1,0,&fence)==kIOReturnBadArgument);
         NativeAdrenoSubmitBuffer unknown[1]={{p.handle+7,0x800000,4096}};
         CHECK(p.submit.submit(unknown,1,0,&fence)==kIOReturnBadArgument);
-        NativeAdrenoSubmitBuffer many[17];
+        NativeAdrenoSubmitBuffer many[NativeAdrenoSubmitMaxBuffers+1];
         for(auto &b:many)b={p.handle,0x800000,4096};
-        CHECK(p.submit.submit(many,17,0,&fence)==kIOReturnBadArgument);
+        CHECK(p.submit.submit(many,NativeAdrenoSubmitMaxBuffers+1,0,&fence)==kIOReturnBadArgument);
         CHECK(p.object.deviceReferences()==1 && cp.regs[0x0807]==wptr && p.submit.outstanding()==0);
         /* Duplicate buffers share one device reference. */
         NativeAdrenoSubmitBuffer twice[2]={{p.handle,0x800000,4096},{p.handle,0x800000,4096}};
@@ -254,7 +251,40 @@ int main()
         CHECK(submit.detach()==kIOReturnNotReady);
         CHECK(submit.submit(nullptr,1,0,nullptr)==kIOReturnBadArgument);
     }
-    std::printf("PASS: 1 execbuf submission with exact IB packet and fence, 8 pre-reference refusals, 1 duplicate-buffer reference case and 1 poisoned-commit retention case over software SMMU/CP peers; 2 write-combine audit cases (trusted, dirty and failed)\n");
+    /* msm hangcheck: no fence progress with work pending is a hang once the CP state stops moving or after three progress retries; recovery
+     * marks the guilty job's VM, moves the fence past it, restarts the ring and replays the later jobs with their own fences. */
+    {
+        Path p;CHECK(exposed(p)==kIOReturnSuccess);
+        NativeAdrenoSubmitBuffer buffer{p.handle,0x800000,4096};
+        uint32_t fence=0;
+        for(uint32_t n=1;n<=3;++n)CHECK(p.submit.submit(&buffer,1,0,&fence)==kIOReturnSuccess && fence==n);
+        bool hung=true;
+        for(uint32_t tick=1;tick<=3;++tick) {
+            cp.regs[0x0928]=0x1000*tick;   /* CP_IB1_BASE moves: progress */
+            CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && !hung);
+        }
+        cp.regs[0x0928]=0x9000;
+        CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && hung);   /* three retries spent */
+        CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && !hung);   /* progress retries start again: one retry for the changed state */
+        static uint32_t restarted;restarted=~0u;
+        auto restart=[](void *,NativeAdrenoRing *ring,uint32_t completed)->IOReturn {restarted=completed;return ring->restart(completed);};
+        NativeAdrenoRecovery result{};
+        const uint32_t refs=p.object.deviceReferences();
+        CHECK(p.submit.recover(restart,nullptr,&ringclock,&result)==kIOReturnSuccess);
+        CHECK(restarted==1 && result.fence==1 && result.replayed==2 && result.guilty==&p.vm && p.vm.faults()==1 && !p.vm.unusable());
+        CHECK(fencemem[1]==1 && p.ring.lastSubmitted()==3 && p.submit.outstanding()==2 && p.object.deviceReferences()==refs-1);
+        CHECK(p.submit.stats().restarts==1);
+        fencemem[1]=3;
+        CHECK(p.submit.wait(3,&ringclock,1000)==kIOReturnSuccess && p.submit.wait(2,&ringclock,1000)==kIOReturnSuccess);
+        CHECK(p.submit.outstanding()==0);
+        /* A VM a hang made unusable submits nothing more. */
+        p.vm.noteHang(true);
+        CHECK(p.submit.submit(&buffer,1,0,&fence)==kIOReturnNotPermitted);
+        /* A restart that fails leaves the submit object poisoned. */
+        CHECK(p.submit.recover([](void *,NativeAdrenoRing *,uint32_t)->IOReturn {return kIOReturnIOError;},nullptr,&ringclock,&result)==kIOReturnIOError);
+        CHECK(p.submit.poisoned());
+    }
+    std::printf("PASS: 1 execbuf submission with exact IB packet and fence, 8 pre-reference refusals, 1 duplicate-buffer reference case and 1 poisoned-commit retention case over software SMMU/CP peers; 2 write-combine audit cases (trusted, dirty and failed); 1 hangcheck and 1 recovery with replay, 1 unusable-VM refusal and 1 failed restart\n");
 }
 /* Physical-page maintenance (imported BOs): record it; no host page is touched. */
 /* Host double: the page attribute change of user BOs has no host equivalent (no host page is touched). */

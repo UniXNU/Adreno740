@@ -417,8 +417,9 @@ IOReturn NativeAdrenoUserClient::status(NativeAdrenoAbiStatus *reply)
     if(!reply)return kIOReturnBadArgument;*reply={};
     if(!open_)return kIOReturnNotReady;
     if(!status_)return kIOReturnUnsupported;
+    /* msm MSM_PARAM_FAULTS: the global count plus this client's own VM's (a hang its submission caused). */
     const NativeAdrenoStatusCounts counts=status_->counts();
-    reply->faults=counts.faults;reply->suspends=counts.suspends;
+    reply->faults=counts.faults+(vm_?vm_->faults():0);reply->suspends=counts.suspends;
     return kIOReturnSuccess;
 }
 size_t NativeAdrenoUserClient::inputSize(uint32_t method)

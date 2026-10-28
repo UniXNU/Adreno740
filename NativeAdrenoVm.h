@@ -70,7 +70,8 @@ class NativeAdrenoVm final {
     bool growMappings();
     unsigned budget_=0;
     uint64_t next_handle_=1;
-    bool attached_=false,poisoned_=false,distrust_write_combined_=false;
+    bool attached_=false,poisoned_=false,distrust_write_combined_=false,unusable_=false;
+    uint64_t faults_=0;
     bool fault_streams_=true;   /* a failure faults the bank's streams; off for a process table, whose streams are the kernel table's too */
     NativeAdrenoVmResult result_{};
     ArmSmmu4KLiveRegion region(unsigned) const;
@@ -149,6 +150,12 @@ public:
      * A timeout, interrupt bit alone or CPU-written timestamp is insufficient. */
     IOReturn retireJobAfterCompletion(uint64_t handle);
     bool poisoned() const {return poisoned_;}
+    /* A GPU hang this VM's submission caused (msm recover_worker: vm->faults++, and a VM that is not the kernel's becomes unusable: its
+     * queued submissions are replayed without their buffers and new ones are refused). The client reads faults in its status and
+     * reports its device lost; other clients go on. */
+    void noteHang(bool unusable) {++faults_;if(unusable)unusable_=true;}
+    uint64_t faults() const {return faults_;}
+    bool unusable() const {return unusable_;}
     /* A process address space: its failure poisons only itself (its tables and BOs), never the streams the kernel table shares. */
     void keepStreamsOnFailure() {fault_streams_=false;}
     /* The lower region's table root with this VM's ASID in bits 63:48: what the bank's TTBR0 holds while the GPU runs this VM. */

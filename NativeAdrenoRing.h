@@ -67,6 +67,7 @@ class NativeAdrenoRing final {
     IOReturn emitFence(uint32_t at,uint32_t seqno,uint32_t *end);
     IOReturn emitFramedFence(uint32_t at,uint32_t seqno,uint32_t *end);
     IOReturn submitWords(const uint32_t *words,size_t word_count,uint32_t *fence,bool framed);
+    IOReturn program();
 public:
     NativeAdrenoRing()=default;
     ~NativeAdrenoRing()=default;
@@ -103,6 +104,25 @@ public:
     void useTable(uint64_t ttbr0) {if(ttbr0 && ttbr0!=table_) {table_=ttbr0;table_pending_=true;reset_pending_=true;}}
     /* What the bank holds now, set by the CPU (bring-up, or a table written while the GPU was idle): no packet is due for it. */
     void tableInstalled(uint64_t ttbr0) {table_=ttbr0;table_pending_=false;}
+    uint32_t context() const {return context_;}
+    /* After a GPU reset (the board's restart, NativeAdrenoSubmit::recover): programs the ring registers again as attach() does, empties
+     * the ring and sets the memptrs fences to `completed`, as msm's recover_worker advances memptrs->fence past the hung submission. The
+     * next submission gets fence completed + 1 and starts with a context entry; no table switch is pending (the caller installs one).
+     * Clears poison. The CP must be halted or reset. */
+    IOReturn restart(uint32_t completed);
+    /* The fence value the CP last wrote, read even when the ring is poisoned (the recovery's starting point). */
+    IOReturn fenceValue(uint32_t *value);
+    /* Words without a timestamp fence, for the restart's CP init and secure-mode packets (a7xx_cp_init and a6xx_hw_init send theirs
+     * outside any submission and wait with a6xx_idle); no fence number is used, so the replayed submissions keep theirs. */
+    IOReturn submitUnfenced(const uint32_t *words,size_t word_count);
+    /* a6xx_idle: the CP read every ring word (RPTR == WPTR), then RBBM_STATUS GPU_BUSY_IGN_AHB clear. */
+    IOReturn idle(const NativeAdrenoRingClock *,uint32_t timeout_us);
+    /* a6xx_progress's CP state: IB1 base (lo, hi), IB2 base (lo, hi), IB1 remaining and IB2 remaining dwords, each remaining count plus
+     * what the ROQ fetched but the SQE has not consumed (CP_ROQ_AVAIL_IB1/IB2 bits 31:16). */
+    IOReturn progressState(uint32_t out[6]);
+    /* a6xx_bus_clear_pending_transactions(gx_off): with gx_off the GX side of GBIF first (RBBM_GBIF_HALT), then new client requests and
+     * all AXI requests, each until acknowledged (spin_until: bounded here by `spins` reads), then the halt cleared. */
+    IOReturn busHalt(bool gx_off,unsigned spins);
     uint64_t table() const {return table_;}
     bool tablePending() const {return table_pending_;}
     /* Polls the CP-written timestamp after invalidating the fence page. Never

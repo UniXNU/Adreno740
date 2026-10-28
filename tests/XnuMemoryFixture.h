@@ -14,7 +14,7 @@ using IOByteCount=size_t;
 using addr64_t=uint64_t;
 constexpr IOReturn kIOReturnSuccess=0,kIOReturnBadArgument=1,kIOReturnBusy=2,
  kIOReturnNoResources=3,kIOReturnNoMemory=4,kIOReturnUnsupported=5,
- kIOReturnNotReady=6,kIOReturnIOError=7,kIOReturnTimeout=8;
+ kIOReturnNotReady=6,kIOReturnIOError=7,kIOReturnTimeout=8,kIOReturnNotPermitted=9;
 using IODirection=unsigned;
 constexpr unsigned kIODirectionOut=2,kIODirectionInOut=3,kIOMemoryMapperNone=0x800,kIOMemoryPhysicallyContiguous=0x10,kIOMemoryPersistent=0x10000;
 inline void *kernel_task=reinterpret_cast<void *>(1);
@@ -117,4 +117,5 @@ public:
 using ppnum_t=uint32_t;
 inline uint64_t mach_absolute_time() {static uint64_t now;return ++now;}
 inline void nanoseconds_to_absolutetime(uint64_t ns,uint64_t *out) {*out=ns;}
+inline void IODelay(unsigned) {}
 #endif

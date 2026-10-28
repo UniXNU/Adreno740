@@ -159,6 +159,8 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
     if(!vm)vm=vm_;
     NativeAdrenoVm *const vm_=vm;   /* this submission's VM: every vm_ below is the job's own */
     if(!attached_ || poisoned_)return kIOReturnNotReady;
+    /* msm_ioctl_gem_submit refuses a VM a hang made unusable. */
+    if(vm->unusable())return kIOReturnNotPermitted;
     if(!buffers || !count || count>SubmitMaxBuffers)return kIOReturnBadArgument;
     native_adreno_submit_ibs[0]=native_adreno_submit_ibs[0]+1;native_adreno_submit_ibs[1]=native_adreno_submit_ibs[1]+(uint32_t)count;
     if(count>native_adreno_submit_ibs[2])native_adreno_submit_ibs[2]=(uint32_t)count;
@@ -290,6 +292,8 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
     }
     for(size_t i=0;i<handle_count;++i)job->handles[i]=handles[i];
     job->count=handle_count;job->fence=value;job->queue=queue;job->active=true;job->vm_next=vm_->nextHandle();job->vm=vm;
+    job->context=ring_->context();job->word_count=word_count;
+    for(size_t i=0;i<word_count;++i)job->words[i]=words[i];
     ++stats_.submissions;
     if(outstanding()>stats_.peak_jobs)stats_.peak_jobs=outstanding();
     *fence=value;
@@ -454,5 +458,79 @@ IOReturn NativeAdrenoSubmit::retireCompleted()
         if(status)return status;
         ++stats_.completed;
     }
+    return kIOReturnSuccess;
+}
+bool NativeAdrenoSubmit::madeProgress()
+{
+    if(progress_retries_>=3)return false;
+    uint32_t state[6]={};
+    if(ring_->progressState(state))return false;
+    bool progress=false;
+    for(unsigned i=0;i<6;++i)if(state[i]!=last_cp_[i])progress=true;
+    for(unsigned i=0;i<6;++i)last_cp_[i]=state[i];
+    if(!progress)return false;
+    ++progress_retries_;
+    return true;
+}
+IOReturn NativeAdrenoSubmit::hangCheck(bool *hung)
+{
+    if(!hung)return kIOReturnBadArgument;*hung=false;
+    if(!attached_ || poisoned_)return kIOReturnNotReady;
+    const uint32_t last=ring_->lastSubmitted();
+    if(!last)return kIOReturnSuccess;
+    uint32_t fence=0;
+    if(ring_->observeFence(last,nullptr,0,&fence)==NativeAdrenoRingFencePoisoned)return poison();
+    if(fence!=hang_fence_) {hang_fence_=fence;progress_retries_=0;return kIOReturnSuccess;}
+    if(fence>=last || madeProgress())return kIOReturnSuccess;
+    progress_retries_=0;++stats_.hangs;*hung=true;
+    return kIOReturnSuccess;
+}
+IOReturn NativeAdrenoSubmit::recover(NativeAdrenoRestart restart,void *cookie,const NativeAdrenoRingClock *clock,
+    NativeAdrenoRecovery *out)
+{
+    if(!out)return kIOReturnBadArgument;*out={};
+    if(!attached_)return kIOReturnNotReady;
+    if(!restart)return kIOReturnUnsupported;
+    const uint32_t last=ring_->lastSubmitted();
+    uint32_t fence=0;
+    if(ring_->fenceValue(&fence) || fence>last)return poison();
+    /* What already completed retires as usual. */
+    for(auto &job:jobs_)if(job.active && job.fence<=fence) {
+        IOReturn status=release(job);if(status)return status;
+        ++stats_.completed;
+    }
+    const uint32_t hung=fence<last?fence+1:fence;
+    Job *guilty=fence<last?find(hung):nullptr;
+    out->fence=hung;
+    if(guilty) {
+        NativeAdrenoVm *vm=guilty->vm?guilty->vm:vm_;
+        vm->noteHang(vm!=vm_);out->guilty=vm;
+    }
+    IOReturn status=restart(cookie,ring_,hung);
+    out->status=status;
+    if(status)return poison();
+    poisoned_=false;hang_fence_=hung;progress_retries_=0;
+    if(guilty) {status=release(*guilty);if(status)return status;}
+    /* The GPU is idle after the restart's CP init: the CPU installs the kernel table, and each replayed job switches to its own. */
+    if(table_mode_) {
+        if(!write_table_ || write_table_(table_cookie_,vm_->ttbr0()))return poison();
+        if(table_mode_==2)ring_->tableInstalled(vm_->ttbr0());
+        table_vm_=vm_;
+    }
+    uint32_t nop=0;
+    if(AdrenoPM4Type7(0x10,0,&nop)!=AdrenoPM4Success)return poison();   /* CP_NOP */
+    for(uint32_t next=hung+1;next && next<=last;++next) {
+        Job *job=find(next);
+        NativeAdrenoVm *vm=job && job->vm?job->vm:vm_;
+        const bool run=job && !vm->unusable() && job->word_count;
+        status=useVm(vm,clock);
+        if(status)return poison();
+        ring_->useContext(job?job->context:0);
+        uint32_t value=0;
+        status=ring_->submitFramed(run?job->words:&nop,run?job->word_count:1,&value);
+        if(status || value!=next)return poison();
+        ++out->replayed;
+    }
+    ++stats_.restarts;
     return kIOReturnSuccess;
 }

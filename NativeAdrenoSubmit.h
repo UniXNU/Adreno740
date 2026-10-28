@@ -18,8 +18,17 @@ extern "C" volatile uint32_t native_adreno_coherence[8];
 /* The write-combine audit (int-100), see NativeAdrenoSubmit.cpp, and the submission (1-based) that ended the trust; 0 = never. */
 extern "C" volatile uint32_t native_adreno_wc_audit[6];
 extern "C" volatile uint32_t native_adreno_wc_distrusted;
+/* A GPU restart after a hang (NativeAdrenoSubmit::recover): the board resets the GPU and brings the CP up again on the same ring (a6xx_recover
+ * and hw_init), calling NativeAdrenoRing::restart(completed) between the reset and its CP init. Nonzero: the GPU could not be restarted. */
+typedef IOReturn (*NativeAdrenoRestart)(void *cookie,NativeAdrenoRing *ring,uint32_t completed);
+struct NativeAdrenoRecovery {
+    uint32_t fence;            /* the fence the GPU hung on */
+    uint32_t replayed;         /* submissions given to the ring again after the restart */
+    NativeAdrenoVm *guilty;    /* the VM of the hung submission, null when no job held that fence */
+    IOReturn status;
+};
 struct NativeAdrenoSubmitStats {
-    uint32_t submissions,completed,timeouts,poisoned_jobs;
+    uint32_t submissions,completed,timeouts,poisoned_jobs,hangs,restarts;
     size_t references_held,references_retired,peak_jobs;
 };
 /* Kernel-side execbuf: turns validated indirect buffers into one ring
@@ -40,7 +49,13 @@ class NativeAdrenoSubmit final {
         bool active=false;
         uint64_t vm_next=0;   /* NativeAdrenoVm::nextHandle() at submission: a mapping with a handle from it on came later */
         NativeAdrenoVm *vm=nullptr;   /* the GPU address space (process page table) the job's buffers belong to */
+        uint32_t context=0;           /* the ring context it ran in (NativeAdrenoRing::useContext) */
+        size_t word_count=0;          /* its ring words (the IB packets), kept to replay it after a GPU restart */
+        uint32_t words[NativeAdrenoSubmitMaxBuffers*4]{};
     } jobs_[8];
+    /* msm hangcheck state: the fence seen at the last check, the progress retries spent on it and the CP state then (a6xx_progress). */
+    uint32_t hang_fence_=0,progress_retries_=0,last_cp_[6]{};
+    bool madeProgress();
     NativeAdrenoVm *vm_=nullptr;   /* the default VM: the kernel's table, installed at bring-up */
     /* Page table switching between processes: mode 0 none (one table for everything), 1 the CPU writes TTBR0 while the GPU is idle,
      * 2 the CP switches in the ring (CP_SMMU_TABLE_UPDATE). table_vm_ is the VM whose table the GPU runs after the queued work. */
@@ -101,6 +116,14 @@ public:
     /* Wait for an earlier fence without touching job references; a timeout
      * leaves every job and reference exactly as they were. */
     IOReturn observeFence(uint32_t fence,const NativeAdrenoRingClock *,uint32_t timeout_us);
+    /* msm's hangcheck_handler, for the caller to run every DRM_MSM_HANGCHECK_DEFAULT_PERIOD (500 ms): *hung when the ring fence did not move
+     * since the last check while work is pending and the CP made no progress either (a6xx_progress: IB1/IB2 base and remaining words, at
+     * most DRM_MSM_HANGCHECK_PROGRESS_RETRIES (3) checks in a row on one fence). */
+    IOReturn hangCheck(bool *hung);
+    /* msm's recover_worker: the job on the hung fence is the guilty one (its VM is marked, NativeAdrenoVm::noteHang), the ring fence
+     * moves past it, restart resets the GPU, the guilty job is retired, then every later job is submitted again with its own fence
+     * (a job of an unusable VM without its buffers). Callers serialize this with every other method. A failed restart poisons. */
+    IOReturn recover(NativeAdrenoRestart restart,void *cookie,const NativeAdrenoRingClock *,NativeAdrenoRecovery *);
     bool poisoned() const {return poisoned_;}
     size_t outstanding() const;
     NativeAdrenoSubmitStats stats() const {return stats_;}

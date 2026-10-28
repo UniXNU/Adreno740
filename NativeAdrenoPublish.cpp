@@ -4,8 +4,9 @@
  * connection that mounts its own NativeAdrenoUserClient core. Every connection of a user process gets its own GPU address space
  * (NativeAdrenoProcessVm: its own page table and ASID, switched into the GPU's context bank for its submissions) and its own queue
  * range on the one ring; there is no fixed number of connections. Closing a connection waits for its own jobs, unmaps and frees
- * everything it created and frees its address space. The board's kernel connection uses the kernel table. Not yet done: a reset
- * path. This is not the Metal or Turnip ABI; it carries NativeAdrenoABI.h unchanged.
+ * everything it created and frees its address space. The board's kernel connection uses the kernel table. A GPU hang is found by msm's
+ * hangcheck and restarted through the board's hook; only the client whose submission hung sees its device lost. This is not the Metal
+ * or Turnip ABI; it carries NativeAdrenoABI.h unchanged.
  * BO CPU mappings are handed out as uncached physical-range mappings to match the GPU's non-cacheable PTEs.
  * The connection class is named AGXDeviceUserClient on purpose: the original sandbox profiles of the processes that use Metal
  * allow IOServiceOpen for that user-client class name, and nothing else in this system can create one (the Apple AGX kext is
@@ -147,7 +148,48 @@ struct Published {
     bool kernel_client=false;
     uint32_t input_bits=0,output_bits=0;
     uint32_t opened=0,closed=0;
+    /* Global fault and restart counts every connection reports (NativeAdrenoUserClient::status adds its own VM's faults). */
+    NativeAdrenoStatus status;
+    NativeAdrenoRestart restart=nullptr;
+    void *restart_cookie=nullptr;
 } g;
+}
+/* GPU hangs (msm hangcheck, NativeAdrenoSubmit::hangCheck) and restarts: [0] hangs, [1] restarts, [2] failed restarts, [3] the last hung
+ * fence, [4] the last restart's IOReturn, [5] submissions replayed so far, [6] hangs with a guilty job, [7] hangs of the kernel's own VM. */
+extern "C" {volatile uint32_t native_adreno_recovery[8];}
+/* The board's GPU restart (a6xx_recover's reset and hw_init), installed before or after publication. */
+extern "C" void native_adreno_set_restart(NativeAdrenoRestart restart,void *cookie)
+{
+    if(g.lock)IOLockLock(g.lock);
+    g.restart=restart;g.restart_cookie=cookie;
+    if(g.lock)IOLockUnlock(g.lock);
+}
+/* msm's hangcheck timer: every DRM_MSM_HANGCHECK_DEFAULT_PERIOD (500 ms, msm_gpu.h) the ring is checked for progress; a hang restarts the
+ * GPU through the board's hook and replays the other submissions (recover_worker). Without a hook a hang is only counted. */
+static void nativeAdrenoHangcheck(void *,wait_result_t)
+{
+    for(;;) {
+        IOSleep(500);
+        IOLockLock(g.lock);
+        bool hung=false;
+        if(g.submit && !g.submit->hangCheck(&hung) && hung) {
+            native_adreno_recovery[0]=native_adreno_recovery[0]+1;
+            if(g.restart) {
+                NativeAdrenoRecovery result{};
+                const IOReturn status=g.submit->recover(g.restart,g.restart_cookie,&g.clock,&result);
+                native_adreno_recovery[3]=result.fence;native_adreno_recovery[4]=uint32_t(status?status:result.status);
+                native_adreno_recovery[5]=native_adreno_recovery[5]+result.replayed;
+                if(result.guilty)native_adreno_recovery[6]=native_adreno_recovery[6]+1;
+                if(result.guilty==g.vm)native_adreno_recovery[7]=native_adreno_recovery[7]+1;
+                if(status)native_adreno_recovery[2]=native_adreno_recovery[2]+1;
+                else native_adreno_recovery[1]=native_adreno_recovery[1]+1;
+                /* msm: a hang no submission owns, or a GPU that did not come back, is everyone's fault. */
+                if(status || !result.guilty || result.guilty==g.vm)g.status.noteFault();
+                if(!status)g.status.noteSuspend();
+            }
+        }
+        IOLockUnlock(g.lock);
+    }
 }
 
 class NativeAdrenoGpuPublished : public IOService {
@@ -254,6 +296,7 @@ bool AGXDeviceUserClient::mount(bool kernel)
     if(opened==kIOReturnSuccess) {
         if(g.timer)core->attachTimer(g.timer);
         if(g.info)core->attachDeviceInfo(g.info);
+        core->attachStatus(&g.status);
         /* Queue ranges: the kernel connection keeps range 0; each user connection a range of its own, never reused while the system runs. */
         uint32_t base=0;
         IOReturn scoped=kIOReturnSuccess;
@@ -831,6 +874,10 @@ extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit 
     }
     native_adreno_cp_aperture[3]=submit->tableMode();
     g.service=service;g.published=true;
+    {
+        thread_t thread=nullptr;
+        if(kernel_thread_start(nativeAdrenoHangcheck,nullptr,&thread)==KERN_SUCCESS)thread_deallocate(thread);
+    }
     service->setName("NativeAdrenoGpu");
     service->registerService();
     return kIOReturnSuccess;

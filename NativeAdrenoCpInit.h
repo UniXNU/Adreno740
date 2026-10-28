@@ -27,8 +27,10 @@ public:
     ~NativeAdrenoCpInit()=default;
     NativeAdrenoCpInit(const NativeAdrenoCpInit &)=delete;
     NativeAdrenoCpInit &operator=(const NativeAdrenoCpInit &)=delete;
+    /* fenced false: the words go without a timestamp fence (*fence 0) and the caller waits with NativeAdrenoRing::idle, as a7xx_cp_init
+     * does with a6xx_idle; the restart after a hang uses it so the replayed submissions keep their fence numbers. */
     IOReturn run(const NativeAdrenoRingIo *,NativeAdrenoRing *,
-        const NativeAdrenoCpInitConfig *,uint32_t *fence);
+        const NativeAdrenoCpInitConfig *,uint32_t *fence,bool fenced=true);
     bool completed() const {return done_;}
     bool poisoned() const {return poisoned_;}
     static uint32_t meInitMask();

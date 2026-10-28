@@ -258,7 +258,15 @@ IOReturn NativeAdrenoRing::attach(const NativeAdrenoRingIo *io,const NativeAdren
     ring_bytes_=ring_bytes;ring_iova_=ring_iova;
     fence_=static_cast<volatile uint32_t *>(fence);fence_bytes_=fence_bytes;fence_iova_=fence_iova;
     for(size_t i=0;i<fence_bytes_/4;++i)fence_[i]=0;
-    const uint32_t control=(uint32_t)(ilog2(ring_bytes/8)&0x3f)|(ilog2(RingBlockBytes/8)<<8);
+    IOReturn status=program();
+    if(status)return status;
+    seqno_=0;completed_=0;submissions_=0;
+    attached_=true;return kIOReturnSuccess;
+}
+/* CP_RB_BASE, CP_RB_CNTL, CP_RB_RPTR_ADDR, WPTR 0 and CP_SCRATCH(2), then the read pointer the CP reports. */
+IOReturn NativeAdrenoRing::program()
+{
+    const uint32_t control=(uint32_t)(ilog2(ring_bytes_/8)&0x3f)|(ilog2(RingBlockBytes/8)<<8);
     const uint32_t base_lo=(uint32_t)ring_iova_,base_hi=(uint32_t)(ring_iova_>>32);
     const uint32_t rptr_lo=(uint32_t)fence_iova_,rptr_hi=(uint32_t)(fence_iova_>>32);
     const uint32_t writes[]={RingBase,base_lo,RingBase+1,base_hi,RingControl,control,
@@ -267,8 +275,96 @@ IOReturn NativeAdrenoRing::attach(const NativeAdrenoRingIo *io,const NativeAdren
         if(io_.write32(io_.cookie,writes[i],writes[i+1]))return poison();
     uint32_t rptr=0;IOReturn status=readRptr(&rptr);
     if(status)return status;
-    next_=rptr;seqno_=0;completed_=0;submissions_=0;
-    attached_=true;return kIOReturnSuccess;
+    next_=rptr;return kIOReturnSuccess;
+}
+IOReturn NativeAdrenoRing::restart(uint32_t completed)
+{
+    if(!attached_)return kIOReturnNotReady;
+    if(completed>seqno_)return kIOReturnBadArgument;
+    poisoned_=false;
+    /* msm_rbmemptrs: +0 rptr, +4 fence, +8 bv_rptr, +12 bv_fence. */
+    for(size_t i=0;i<fence_bytes_/4;++i)fence_[i]=0;
+    fence_[1]=completed;fence_[RingBvFenceOffset/4]=completed;
+    for(size_t i=0;i<ring_bytes_/4;++i)ring_[i]=0;
+    if(cache_.publish(cache_.cookie,fence_,fence_bytes_) || cache_.publish(cache_.cookie,ring_,ring_bytes_))return poison();
+    IOReturn status=program();
+    if(status)return status;
+    seqno_=completed;completed_=completed;
+    context_=0;reset_pending_=true;table_=0;table_pending_=false;
+    return kIOReturnSuccess;
+}
+IOReturn NativeAdrenoRing::fenceValue(uint32_t *value)
+{
+    if(!value)return kIOReturnBadArgument;*value=0;
+    if(!attached_)return kIOReturnNotReady;
+    if(cache_.acquire(cache_.cookie,fence_,fence_bytes_))return kIOReturnIOError;
+    *value=fence_[1];
+    return kIOReturnSuccess;
+}
+IOReturn NativeAdrenoRing::submitUnfenced(const uint32_t *words,size_t word_count)
+{
+    if(!attached_ || poisoned_)return kIOReturnNotReady;
+    if(!words || !word_count)return kIOReturnBadArgument;
+    const uint32_t size_words=(uint32_t)(ring_bytes_/4),mask=size_words-1;
+    if(word_count>size_words-8)return kIOReturnNoResources;
+    uint32_t rptr=0;IOReturn status=readRptr(&rptr);
+    if(status)return status;
+    if(word_count+8>size_words-((next_-rptr)&mask))return kIOReturnNoResources;
+    for(size_t i=0;i<word_count;++i)ring_[(next_+i)&mask]=words[i];
+    const uint32_t end=(next_+(uint32_t)word_count)&mask;
+    if(cache_.publish(cache_.cookie,ring_,ring_bytes_) || io_.barrier(io_.cookie))return poison();
+    if(writeWptr(end))return kIOReturnIOError;
+    next_=end;
+    return kIOReturnSuccess;
+}
+IOReturn NativeAdrenoRing::idle(const NativeAdrenoRingClock *clock,uint32_t timeout_us)
+{
+    enum : uint32_t {RbbmStatus=0x0210,GpuBusyIgnAhb=1u<<23};
+    if(!attached_ || poisoned_)return kIOReturnNotReady;
+    if(!clock || !clock->now_us)return kIOReturnBadArgument;
+    const uint64_t start=clock->now_us(clock->cookie);
+    for(;;) {
+        uint32_t rptr=0,status=0;
+        IOReturn read=readRptr(&rptr);
+        if(read)return read;
+        if(rptr==next_) {
+            if(io_.read32(io_.cookie,RbbmStatus,&status))return poison();
+            if(!(status&GpuBusyIgnAhb))return kIOReturnSuccess;
+        }
+        if(clock->now_us(clock->cookie)-start>=timeout_us)return kIOReturnTimeout;
+        IODelay(10);
+    }
+}
+IOReturn NativeAdrenoRing::progressState(uint32_t out[6])
+{
+    enum : uint32_t {Ib1Base=0x0928,Ib1Rem=0x092a,Ib2Base=0x092b,Ib2Rem=0x092d,RoqAvailIb1=0x0949,RoqAvailIb2=0x094a};
+    if(!out)return kIOReturnBadArgument;
+    if(!attached_)return kIOReturnNotReady;
+    uint32_t roq1=0,roq2=0;
+    if(io_.read32(io_.cookie,Ib1Base,&out[0]) || io_.read32(io_.cookie,Ib1Base+1,&out[1]) ||
+        io_.read32(io_.cookie,Ib2Base,&out[2]) || io_.read32(io_.cookie,Ib2Base+1,&out[3]) ||
+        io_.read32(io_.cookie,Ib1Rem,&out[4]) || io_.read32(io_.cookie,Ib2Rem,&out[5]) ||
+        io_.read32(io_.cookie,RoqAvailIb1,&roq1) || io_.read32(io_.cookie,RoqAvailIb2,&roq2))return kIOReturnIOError;
+    out[4]+=roq1>>16;out[5]+=roq2>>16;
+    return kIOReturnSuccess;
+}
+IOReturn NativeAdrenoRing::busHalt(bool gx_off,unsigned spins)
+{
+    enum : uint32_t {RbbmGbifHalt=0x0016,RbbmGbifHaltAck=0x0017,GbifHalt=0x3c45,GbifHaltAck=0x3c46,ClientHalt=1u,ArbHalt=2u};
+    if(!attached_)return kIOReturnNotReady;
+    uint32_t ack=0;unsigned i=0;
+    if(gx_off) {
+        if(io_.write32(io_.cookie,RbbmGbifHalt,1))return kIOReturnIOError;
+        for(i=0;i<spins;++i) {if(io_.read32(io_.cookie,RbbmGbifHaltAck,&ack))return kIOReturnIOError;if(ack&1)break;}
+        if(i==spins)return kIOReturnTimeout;
+    }
+    if(io_.write32(io_.cookie,GbifHalt,ClientHalt))return kIOReturnIOError;
+    for(i=0;i<spins;++i) {if(io_.read32(io_.cookie,GbifHaltAck,&ack))return kIOReturnIOError;if((ack&ClientHalt)==ClientHalt)break;}
+    if(i==spins)return kIOReturnTimeout;
+    if(io_.write32(io_.cookie,GbifHalt,ArbHalt))return kIOReturnIOError;
+    for(i=0;i<spins;++i) {if(io_.read32(io_.cookie,GbifHaltAck,&ack))return kIOReturnIOError;if((ack&ArbHalt)==ArbHalt)break;}
+    if(i==spins)return kIOReturnTimeout;
+    return io_.write32(io_.cookie,GbifHalt,0)?kIOReturnIOError:kIOReturnSuccess;
 }
 IOReturn NativeAdrenoRing::detach()
 {

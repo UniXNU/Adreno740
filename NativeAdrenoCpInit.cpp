@@ -27,7 +27,7 @@ uint32_t NativeAdrenoCpInit::meInitMask()
     return (1u<<0)|(1u<<1)|(1u<<3)|(1u<<6)|(1u<<8);
 }
 IOReturn NativeAdrenoCpInit::run(const NativeAdrenoRingIo *io,NativeAdrenoRing *ring,
-    const NativeAdrenoCpInitConfig *config,uint32_t *fence)
+    const NativeAdrenoCpInitConfig *config,uint32_t *fence,bool fenced)
 {
     if(!fence)return kIOReturnBadArgument;*fence=0;
     if(done_ || poisoned_)return kIOReturnNotReady;
@@ -55,7 +55,7 @@ IOReturn NativeAdrenoCpInit::run(const NativeAdrenoRingIo *io,NativeAdrenoRing *
     words[8]=(uint32_t)(config->pwrup_reglist_iova>>32);
     words[9]=1u<<31;          /* read registers from the list */
     uint32_t value=0;
-    const IOReturn status=ring->submit(words,CpInitWords,&value);
+    const IOReturn status=fenced?ring->submit(words,CpInitWords,&value):ring->submitUnfenced(words,CpInitWords);
     if(status)return poison();
     done_=true;*fence=value;
     return kIOReturnSuccess;
