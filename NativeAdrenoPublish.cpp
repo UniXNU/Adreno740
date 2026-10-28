@@ -144,7 +144,7 @@ struct Published {
     IOService *service=nullptr;
     NativeAdrenoGpuContext *context=nullptr;
     bool rows[4]{};   /* the board log's client rows (NativeAdrenoUserClient::setStatsSlot): 0 the render server, 1..3 the next processes */
-    uint32_t next_queue_base=NativeAdrenoAbiMaxQueues;   /* range 0 is the kernel connection's */
+    uint32_t next_client=1;   /* queue range n (NativeAdrenoQueueRange) per user connection; range 0 is the kernel connection's */
     bool kernel_client=false;
     uint32_t input_bits=0,output_bits=0;
     uint32_t opened=0,closed=0;
@@ -214,13 +214,14 @@ class AGXDeviceUserClient : public IOUserClient {
      * unmap a silent no-op, the user PTEs outlived BoCpuUnmap, and BoFree handed pages with a live user mapping to the VM:
      * pmap_assert_free panicked the freeing core and the panic screen parked it (the "BoFree hang", dead touch). */
     struct View {uint32_t token;IOMemoryDescriptor *descriptor;};
-    /* One view per live BO token. The cache must hold every BO the client can have (NativeAdrenoClientMaxObjects): a BO whose view is not
-     * cached makes IOConnectUnmapMemory64 (which asks clientMemoryForType again) a no-op, the user mapping outlives BoFree and the freed pages panic
+    /* One view per live BO token. The cache holds every BO the client has (it grows with the tokens): a BO whose view is not cached makes
+     * IOConnectUnmapMemory64 (which asks clientMemoryForType again) a no-op, the user mapping outlives BoFree and the freed pages panic
      * pmap_assert_free. A cache of 64 held until the render server's hundreds of mapped BOs (int-087). */
-    enum {MaxViews=NativeAdrenoClientMaxObjects};
     /* A token is its BO's entry index plus one, so it names its own slot (a walk over every slot ran on each CPU map and unmap). */
-    View *viewSlot(uint32_t token) {return views_ && token && token<=MaxViews?&views_[token-1]:nullptr;}
-    View *views_=nullptr;   /* on the heap: 1024 entries would make the client object too big for the kernel allocator's fixed-size classes */
+    View *viewSlot(uint32_t token) {return views_ && token && token<=view_capacity_?&views_[token-1]:nullptr;}
+    View *views_=nullptr;   /* on the heap, grown to the highest token (growViews) */
+    size_t view_capacity_=0;
+    bool growViews(uint32_t token);
     void dropViews(uint32_t token);
     static IOReturn action(OSObject *target,void *reference,IOExternalMethodArguments *arguments);
     IOReturn run(uint32_t method,const void *input,size_t input_size,void *output,size_t output_size);
@@ -298,15 +299,15 @@ bool AGXDeviceUserClient::mount(bool kernel)
         if(g.info)core->attachDeviceInfo(g.info);
         core->attachStatus(&g.status);
         /* Queue ranges: the kernel connection keeps range 0; each user connection a range of its own, never reused while the system runs. */
-        uint32_t base=0;
+        uint64_t base=0;
         IOReturn scoped=kIOReturnSuccess;
         if(!kernel) {
-            base=g.next_queue_base;
+            base=(uint64_t)g.next_client*NativeAdrenoQueueRange;
             const uint64_t window=clientWindowBytes(g.input_bits);
-            scoped=base>UINT32_MAX-NativeAdrenoAbiMaxQueues || !window?kIOReturnNoResources:core->setScope(base,GpuClientVaStart,window);
+            scoped=!g.next_client || !window?kIOReturnNoResources:core->setScope(base,GpuClientVaStart,window);
         } else scoped=core->setScope(0,0,0);
         if(scoped==kIOReturnSuccess) {
-            if(!kernel)g.next_queue_base=base+NativeAdrenoAbiMaxQueues;
+            if(!kernel)++g.next_client;
             unsigned row=4;
             if(server && !g.rows[0])row=0;
             for(unsigned i=1;!server && row==4 && i<4;++i)if(!g.rows[i])row=i;
@@ -317,7 +318,7 @@ bool AGXDeviceUserClient::mount(bool kernel)
             ++g.opened;
             if(NativeAdrenoClientRecord *record=clientRecord(name_))record->slot=row;
         } else {
-            native_adreno_mount_fail[0]=3;native_adreno_mount_fail[1]=uint32_t(scoped);native_adreno_mount_fail[2]=base;native_adreno_mount_fail[3]=native_adreno_mount_fail[3]+1;
+            native_adreno_mount_fail[0]=3;native_adreno_mount_fail[1]=uint32_t(scoped);native_adreno_mount_fail[2]=uint32_t(base>>32);native_adreno_mount_fail[3]=native_adreno_mount_fail[3]+1;
             core->releaseAll(&g.clock,0);
         }
     }
@@ -352,13 +353,27 @@ void AGXDeviceUserClient::dropViews(uint32_t token)
         IOMemoryDescriptor *view=nullptr;
         IOLockLock(g.lock);
         if(token) {View *v=viewSlot(token);if(v && v->descriptor && v->token==token) {view=v->descriptor;v->descriptor=nullptr;v->token=0;}}
-        else if(views_)for(size_t i=0;i<MaxViews;++i) {View &v=views_[i];if(v.descriptor) {view=v.descriptor;v.descriptor=nullptr;v.token=0;break;}}
+        else if(views_)for(size_t i=0;i<view_capacity_;++i) {View &v=views_[i];if(v.descriptor) {view=v.descriptor;v.descriptor=nullptr;v.token=0;break;}}
         IOLockUnlock(g.lock);
         if(!view)return;
         /* The returned reference is the last one outside the descriptor's own list: dropping it frees the map, which unmaps the user range. */
         while(removeMappingForDescriptor(view))native_adreno_metal_diag.forced_unmaps=native_adreno_metal_diag.forced_unmaps+1;
         view->release();
     }
+}
+/* Room for token's view slot (tokens are entry indices plus one, so they stay below the client's object count). */
+bool AGXDeviceUserClient::growViews(uint32_t token)
+{
+    if(!token)return true;
+    if(token<=view_capacity_)return true;
+    size_t size=view_capacity_?view_capacity_:64;
+    while(size<token)size*=2;
+    View *made=IONewZero(View,size);
+    if(!made)return false;
+    for(size_t i=0;i<view_capacity_;++i)made[i]=views_[i];
+    if(views_)IODelete(views_,View,view_capacity_);
+    views_=made;view_capacity_=size;
+    return true;
 }
 IOReturn AGXDeviceUserClient::clientClose()
 {
@@ -394,7 +409,7 @@ IOReturn AGXDeviceUserClient::clientClose()
 void AGXDeviceUserClient::free()
 {
     dropViews(0);
-    if(views_) {IODelete(views_,View,MaxViews);views_=nullptr;}
+    if(views_) {IODelete(views_,View,view_capacity_);views_=nullptr;view_capacity_=0;}
     /* Still live only when a teardown failed: its objects stay referenced by the VM and the ring, so the core is kept, not freed. */
     if(core_ && !live_) {delete core_;core_=nullptr;}
     IOUserClient::free();
@@ -426,8 +441,7 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
     /* [5]: threads inside this function right now (a thread stuck here, on the gate or in a mapping, shows as a non-zero count that stays). */
     struct Inside {Inside() {__atomic_fetch_add(&native_adreno_view_diag[5],1,__ATOMIC_RELAXED);} ~Inside() {__atomic_fetch_sub(&native_adreno_view_diag[5],1,__ATOMIC_RELAXED);}} inside;
     IOLockLock(g.lock);
-    if(!views_)views_=IONewZero(View,MaxViews);
-    if(!views_) {IOLockUnlock(g.lock);return kIOReturnNoMemory;}
+    if(!growViews(type)) {IOLockUnlock(g.lock);return kIOReturnNoMemory;}
     View *v=viewSlot(type);
     if(v && v->descriptor && v->token==type) {
         v->descriptor->retain();*memory=v->descriptor;*options=kIOMapAnywhere|kIOMapInhibitCache;

@@ -103,7 +103,7 @@ IOReturn NativeAdrenoVm::attach(const ArmSmmu4KIo *io,ArmSmmu4KContextConfig *co
     size_t capacity,unsigned budget)
 {
     if(attached_ || ranges_ || poisoned_)return kIOReturnBusy;
-    if(!io || !context || !streams || (!lower && !upper) || !capacity || capacity>1048576 ||
+    if(!io || !context || !streams || (!lower && !upper) || !capacity ||
         !budget || budget>1048576 || (lower && !validBinding(*lower,0)) || (upper && !validBinding(*upper,1)))
         return kIOReturnBadArgument;
     const size_t first=capacity<1024?capacity:1024;
@@ -112,7 +112,7 @@ IOReturn NativeAdrenoVm::attach(const ArmSmmu4KIo *io,ArmSmmu4KContextConfig *co
     if(!ranges_ || !alias_scratch_ || !mappings_ || !index_.allocate()) {freeTables();return kIOReturnNoMemory;}
     memset(mappings_,0,sizeof(Mapping)*64);
     free_hint_=0;high_=0;memset(class_spans_,0,sizeof(class_spans_));
-    max_capacity_=capacity;io_=*io;context_=context;streams_=streams;budget_=budget;
+    io_=*io;context_=context;streams_=streams;budget_=budget;
     if(lower)regions_[0]=*lower;if(upper)regions_[1]=*upper;
     for(unsigned i=0;i<2;++i)if(regions_[i].arena) {
         if(NativeAdrenoBindSmmuVisibility(regions_[i].tables,&visibility_[i])!=kIOReturnSuccess) {
@@ -130,7 +130,7 @@ IOReturn NativeAdrenoVm::detach()
     if(!attached_)return kIOReturnNotReady;
     for(auto &r:regions_)if(r.arena) {r.arena->alias_scratch=nullptr;r.arena->alias_scratch_entries=0;}
     freeTables();
-    attached_=false;regions_[0]={};regions_[1]={};context_=nullptr;streams_=nullptr;capacity_=max_capacity_=mapping_capacity_=0;
+    attached_=false;regions_[0]={};regions_[1]={};context_=nullptr;streams_=nullptr;capacity_=mapping_capacity_=0;
     return kIOReturnSuccess;
 }
 void NativeAdrenoVm::freeTables()
@@ -144,8 +144,8 @@ void NativeAdrenoVm::freeTables()
 bool NativeAdrenoVm::growRanges(size_t needed)
 {
     if(needed<=capacity_)return true;
-    if(needed>max_capacity_)return false;
-    size_t size=capacity_*2;if(size<needed)size=needed;if(size>max_capacity_)size=max_capacity_;
+    if(needed>SIZE_MAX/2/sizeof(ArmSmmu4KRange))return false;
+    size_t size=capacity_*2;if(size<needed)size=needed;
     ArmSmmu4KRange *made=IONewData(ArmSmmu4KRange,size);
     if(!made)return false;
     uint32_t *scratch=IONewData(uint32_t,size);
@@ -158,7 +158,7 @@ bool NativeAdrenoVm::growRanges(size_t needed)
 }
 bool NativeAdrenoVm::growMappings()
 {
-    if(mapping_capacity_>=NativeAdrenoVmMaxObjects)return false;
+    if(mapping_capacity_>SIZE_MAX/2/sizeof(Mapping))return false;
     const size_t size=mapping_capacity_*2;
     Mapping *made=IONewData(Mapping,size);
     if(!made)return false;
@@ -206,7 +206,7 @@ IOReturn NativeAdrenoVm::preflight(const NativeAdrenoMemory *memory,unsigned upp
     const ArmSmmu4KLiveArena *a=regions_[upper].arena;
     if((iova&4095) || iova<a->iova || iova-a->iova>=a->bytes || memory->bytes()>a->bytes-(iova-a->iova))
         return kIOReturnBadArgument;
-    if(objects_>=NativeAdrenoVmMaxObjects || memory->spanCount()>capacity_-spanCount())return kIOReturnNoResources;
+    if(memory->spanCount()>capacity_-spanCount())return kIOReturnNoResources;
     {
         /* ranges_ is sorted by address: only the first range not wholly below iova can overlap (native addresses may end at 2^64,
          * so ends are compared as last bytes). A walk over every range cost each map a pass over 52609 of them (i567). */
@@ -345,6 +345,7 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t 
     clock.lap(0,5); /* Previously omitted preflight; map slot 5 was unused. */
     ArmSmmu4KStatus status=observeCheap();if(status)return fail(status);
     clock.lap(0,1);
+    if(!index_.reserve(objects_+1))return kIOReturnNoMemory;   /* the handle's index cell is had before anything changes */
     checked=memory->holdForDevice();if(checked)return checked;
     Mapping *record=nullptr;
     for(;;) {

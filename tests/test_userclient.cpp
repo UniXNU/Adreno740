@@ -34,7 +34,8 @@ static int mread64(void *c,size_t at,uint64_t *v)
 {CHECK(c==&mf && at%8==0 && at<=SMMU_BYTES-8);if(mevent())return 1;std::memcpy(v,mmio+at/4,8);return 0;}
 static int mwrite32(void *c,size_t at,uint32_t v)
 {CHECK(c==&mf && at%4==0 && at<=SMMU_BYTES-4);int f=mevent();if(f && !mf.after)return 1;mmio[at/4]=v;return f;}
-static int mwrite64(void *c,size_t at,uint64_t v){(void)c;(void)at;(void)v;CHECK(0);return 1;}
+static int mwrite64(void *c,size_t at,uint64_t v)
+{CHECK(c==&mf && at%8==0 && at<=SMMU_BYTES-8);int f=mevent();if(f && !mf.after)return 1;std::memcpy(mmio+at/4,&v,8);return f;}
 static int mbarrier(void *c){CHECK(c==&mf);return mevent();}
 struct CpPeer {
     std::vector<uint32_t> regs,writes;
@@ -55,7 +56,7 @@ static int cacquire(void *c,volatile uint32_t *w,size_t bytes)
 static uint64_t cnow(void *c){CHECK(c==&cp);return clock_us;}
 static int cidle(void *c){CHECK(c==&cp);clock_us+=1000;return 0;}
 struct Path {
-    NativeAdrenoMemory tables;
+    NativeAdrenoTablePages tables;
     ArmSmmu4KLiveArena arena;
     ArmSmmu4KLiveState state{};
     ArmSmmu4KLiveVisibility visibility;
@@ -84,7 +85,6 @@ static int exposed(Path &p)
 {
     smmuReset();cp=CpPeer{};clock_us=0;
     std::memset(ringmem,0xef,sizeof(ringmem));std::memset(fencemem,0,sizeof(fencemem));
-    if(p.tables.allocate(32*4096,40,true,32*4096))return kIOReturnNoMemory;
     if(NativeAdrenoPrepareSmmuMemory(&p.tables,32,40,0x800000,65536,0,16,&p.arena,&p.state,&p.visibility))
         return kIOReturnBadArgument;
     context=(ArmSmmu4KContextConfig){.lower=&p.arena.config,.lower_tables=&p.state.tables,
@@ -113,7 +113,7 @@ int main()
         NativeAdrenoAbiParams params{};
         CHECK(p.client.query(&params)==kIOReturnSuccess && params.abi_version==NativeAdrenoAbiVersion);
         CHECK(params.input_bits==32 && params.output_bits==40);
-        CHECK(params.max_bo_bytes==(UINT64_C(1)<<NativeAdrenoAbiMaxBoBytesShift));
+        CHECK(params.max_bo_bytes==(UINT64_C(1)<<32));   /* the GPU address window: the whole 32-bit input range here */
         NativeAdrenoAbiTimestamp no_timer{};
         CHECK(p.client.timestamp(&no_timer)==kIOReturnUnsupported);
         NativeAdrenoAbiStatus no_status{};
@@ -259,8 +259,9 @@ int main()
         CHECK(fixture.imports_live==before && p.client.liveObjects()==0);
         CHECK(p.client.close()==kIOReturnSuccess);
     }
-    /* With IO coherence proved, an import maps write-back inner-shareable whatever the client asked, and neither its map, its
-     * submission, its completion nor its free maintains its pages; the GPU's own BOs keep the attributes asked for. */
+    /* With IO coherence proved, an import the GPU only reads maps write-back inner-shareable whatever the client asked (a GPU-written one
+     * stays non-coherent: int-288..291), and neither its map, its submission, its completion nor its free maintains its pages; the GPU's
+     * own BOs keep the attributes asked for. */
     {
         Path p;CHECK(exposed(p)==kIOReturnSuccess);
         native_adreno_io_coherent=1;
@@ -270,7 +271,7 @@ int main()
         NativeAdrenoAbiBoImport request{0x10000000,4*4096};NativeAdrenoAbiBoAllocReply imported{};
         CHECK(p.client.importBo(&request,task,&imported)==kIOReturnSuccess && imported.handle);
         const unsigned physical=fixture.physical_calls;const size_t bytes=fixture.physical_bytes;
-        NativeAdrenoAbiBoMap map{imported.handle,0x808000,3,0,2,0};NativeAdrenoAbiBoMapReply mapped{};
+        NativeAdrenoAbiBoMap map{imported.handle,0x808000,1,0,2,0};NativeAdrenoAbiBoMapReply mapped{};
         CHECK(p.client.mapBo(&map,&mapped)==kIOReturnSuccess && mapped.iova==0x808000);
         CHECK(fixture.physical_calls==physical && native_adreno_coherent_skips[0]==skips[0]+1);
         NativeAdrenoAbiBoAlloc ib_alloc{4096,12,1};NativeAdrenoAbiBoAllocReply ib{};
@@ -285,7 +286,7 @@ int main()
         fencemem[1]=reply.fence;
         NativeAdrenoAbiWaitFence wait{reply.fence,UINT64_C(1000000)};
         CHECK(p.client.waitFence(&wait,&ringclock)==kIOReturnSuccess);
-        CHECK(fixture.physical_bytes==bytes && native_adreno_coherent_skips[3]>skips[3]);
+        CHECK(fixture.physical_bytes==bytes);   /* completion maintains only GPU-written imports */
         NativeAdrenoAbiBoFree ib_free{ib.handle};CHECK(p.client.freeBo(&ib_free)==kIOReturnSuccess);
         NativeAdrenoAbiBoFree released{imported.handle};CHECK(p.client.freeBo(&released)==kIOReturnSuccess);
         CHECK(fixture.physical_bytes==bytes && native_adreno_coherent_skips[1]==skips[1]+1 && p.client.liveObjects()==0);
@@ -448,14 +449,14 @@ int main()
         static const NativeAdrenoAbiDeviceInfo info={0x43050a01u,3u<<20,0x1000000ull,0x1fffffffff000ull,0x20000000ull,
             0x60000000ull,16,6,1,4,NativeAdrenoDeviceClientIova,0};
         NativeAdrenoUserClient other;
-        CHECK(other.setScope(NativeAdrenoAbiMaxQueues,0x808000,0x8000)==kIOReturnNotReady);
+        CHECK(other.setScope(NativeAdrenoQueueRange,0x808000,0x8000)==kIOReturnNotReady);
         CHECK(other.open(NativeAdrenoAbiVersion,&p.vm,&p.execbuf,&p.ring,32,40)==kIOReturnSuccess);
         CHECK(p.client.attachDeviceInfo(&info)==kIOReturnSuccess && other.attachDeviceInfo(&info)==kIOReturnSuccess);
         CHECK(p.client.setScope(0,0x800000,0x8000)==kIOReturnSuccess);
         CHECK(other.setScope(3,0x808000,0x8000)==kIOReturnBadArgument);
-        CHECK(other.setScope(NativeAdrenoAbiMaxQueues,0x808001,0x8000)==kIOReturnBadArgument);
-        CHECK(other.setScope(NativeAdrenoAbiMaxQueues,0xfffff000,0x2000)==kIOReturnBadArgument);   /* past the 32-bit input range */
-        CHECK(other.setScope(NativeAdrenoAbiMaxQueues,0x808000,0x8000)==kIOReturnSuccess);
+        CHECK(other.setScope(NativeAdrenoQueueRange,0x808001,0x8000)==kIOReturnBadArgument);
+        CHECK(other.setScope(NativeAdrenoQueueRange,0xfffff000,0x2000)==kIOReturnBadArgument);   /* past the 32-bit input range */
+        CHECK(other.setScope(NativeAdrenoQueueRange,0x808000,0x8000)==kIOReturnSuccess);
         NativeAdrenoAbiDeviceInfo got{};
         CHECK(other.deviceInfo(&got)==kIOReturnSuccess && got.va_start==0x808000 && got.va_size==0x8000 && got.chip_id==0x43050a01u);
         CHECK(p.client.deviceInfo(&got)==kIOReturnSuccess && got.va_start==0x800000 && got.va_size==0x8000);
@@ -476,7 +477,7 @@ int main()
         CHECK(p.client.submit(&submit,&reply,&ringclock)==kIOReturnSuccess && reply.fence==1);
         submit.buffers[0]={theirs.handle,0x80e000,1024};
         CHECK(other.submit(&submit,&reply,&ringclock)==kIOReturnSuccess && reply.fence==2);
-        CHECK(p.execbuf.queueOutstanding(0) && p.execbuf.queueOutstanding(NativeAdrenoAbiMaxQueues));
+        CHECK(p.execbuf.queueOutstanding(0) && p.execbuf.queueOutstanding(NativeAdrenoQueueRange));
         fencemem[1]=1;
         CHECK(p.client.releaseAll(&ringclock,1000)==kIOReturnSuccess && p.client.liveObjects()==0);
         CHECK(p.execbuf.outstanding()==1 && other.liveObjects()==1);
@@ -506,7 +507,7 @@ int main()
         CHECK(p.client.submit(&submit,&reply,&ringclock)==kIOReturnSuccess && p.execbuf.queueOutstanding(0));
         NativeAdrenoUserClient late,never;
         CHECK(late.open(NativeAdrenoAbiVersion,&p.vm,&p.execbuf,&p.ring,32,40)==kIOReturnSuccess);
-        CHECK(late.setScope(NativeAdrenoAbiMaxQueues,0x808000,0x8000)==kIOReturnSuccess);
+        CHECK(late.setScope(NativeAdrenoQueueRange,0x808000,0x8000)==kIOReturnSuccess);
         CHECK(late.ownRangeOutstanding()==false && late.close()==kIOReturnSuccess);
         CHECK(never.open(NativeAdrenoAbiVersion,&p.vm,&p.execbuf,&p.ring,32,40)==kIOReturnSuccess);
         CHECK(never.ownRangeOutstanding()==false);
@@ -607,12 +608,12 @@ int main()
     /* Queue objects bind submissions and must be drained before close. */
     {
         Path p;CHECK(exposed(p)==kIOReturnSuccess);
-        for(unsigned i=1;i<NativeAdrenoAbiMaxQueues;++i) {
+        for(unsigned i=1;i<8;++i) {
             NativeAdrenoAbiQueueReply reply{};
             CHECK(p.client.createQueue(&reply)==kIOReturnSuccess && reply.queue==i);
         }
         NativeAdrenoAbiQueueReply extra{};
-        CHECK(p.client.createQueue(&extra)==kIOReturnNoResources);
+        CHECK(p.client.createQueue(&extra)==kIOReturnSuccess && extra.queue==8);   /* queues grow as msm's submitqueues do */
         NativeAdrenoAbiBoAlloc alloc{4096,12,0};
         NativeAdrenoAbiBoAllocReply allocated{};
         CHECK(p.client.allocBo(&alloc,&allocated)==kIOReturnSuccess);
@@ -641,7 +642,7 @@ int main()
         NativeAdrenoAbiQueue two{2};
         CHECK(p.client.close()==kIOReturnBusy); /* queue 2 still open */
         CHECK(p.client.closeQueue(&two)==kIOReturnSuccess);
-        for(uint64_t id=3;id<NativeAdrenoAbiMaxQueues;++id) {
+        for(uint64_t id=3;id<=8;++id) {
             NativeAdrenoAbiQueue rest{id};
             CHECK(p.client.closeQueue(&rest)==kIOReturnSuccess);
         }

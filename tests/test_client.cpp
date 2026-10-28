@@ -33,7 +33,8 @@ static int mread64(void *c,size_t at,uint64_t *v)
 {CHECK(c==&mf && at%8==0 && at<=SMMU_BYTES-8);if(mevent())return 1;std::memcpy(v,mmio+at/4,8);return 0;}
 static int mwrite32(void *c,size_t at,uint32_t v)
 {CHECK(c==&mf && at%4==0 && at<=SMMU_BYTES-4);int f=mevent();if(f && !mf.after)return 1;mmio[at/4]=v;return f;}
-static int mwrite64(void *c,size_t at,uint64_t v){(void)c;(void)at;(void)v;CHECK(0);return 1;}
+static int mwrite64(void *c,size_t at,uint64_t v)
+{CHECK(c==&mf && at%8==0 && at<=SMMU_BYTES-8);int f=mevent();if(f && !mf.after)return 1;std::memcpy(mmio+at/4,&v,8);return f;}
 static int mbarrier(void *c){CHECK(c==&mf);return mevent();}
 struct CpPeer {
     std::vector<uint32_t> regs,writes;
@@ -54,7 +55,7 @@ static int cacquire(void *c,volatile uint32_t *w,size_t bytes)
 static uint64_t cnow(void *c){CHECK(c==&cp);return clock_us;}
 static int cidle(void *c){CHECK(c==&cp);clock_us+=1000;return 0;}
 struct Path {
-    NativeAdrenoMemory tables;
+    NativeAdrenoTablePages tables;
     ArmSmmu4KLiveArena arena;
     ArmSmmu4KLiveState state{};
     ArmSmmu4KLiveVisibility visibility;
@@ -83,7 +84,6 @@ static int exposed(Path &p)
 {
     smmuReset();cp=CpPeer{};clock_us=0;
     std::memset(ringmem,0xef,sizeof(ringmem));std::memset(fencemem,0,sizeof(fencemem));
-    if(p.tables.allocate(32*4096,40,true,32*4096))return kIOReturnNoMemory;
     if(NativeAdrenoPrepareSmmuMemory(&p.tables,32,40,0x800000,65536,0,16,&p.arena,&p.state,&p.visibility))
         return kIOReturnBadArgument;
     context=(ArmSmmu4KContextConfig){.lower=&p.arena.config,.lower_tables=&p.state.tables,
@@ -236,7 +236,7 @@ int main()
         /* Argument refusals are decided here and never reach the kernel. */
         CHECK(client.allocBo(4096,12,false,nullptr)==kIOReturnBadArgument);
         CHECK(client.allocBo(4096,11,false,&handle)==kIOReturnBadArgument);
-        CHECK(client.allocBo((UINT64_C(1)<<28)+4096,12,false,&handle)==kIOReturnBadArgument);
+        CHECK(client.allocBo((UINT64_C(1)<<32)+4096,12,false,&handle)==kIOReturnBadArgument);   /* past the GPU address window */
         CHECK(client.freeBo(0)==kIOReturnBadArgument);
         CHECK(client.setMetadata(1,nullptr,65)==kIOReturnBadArgument);
         uint32_t length=0;

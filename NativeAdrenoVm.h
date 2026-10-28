@@ -27,10 +27,6 @@ struct NativeAdrenoVmResult {
  * only the owned streams. Uncertain resources require independent real reset.
  * No VM may be advertised to apps until per-client isolation, submission
  * validation/protection, genuine IRQ fences and reset are implemented. */
-/* One table for every client's mappings: 1024 filled up once the render server primed its shaders (int-237: BoMap refused with
- * kIOReturnNoResources at objects=1024, Turnip wrote through a NULL command stream and backboardd crashed), and 4096 after a few app
- * switches (i567: both backboardd crashes came at objects=4096, after it held about 4000 for minutes). */
-enum : size_t {NativeAdrenoVmMaxObjects=16384};
 /* Board hook for sampleWord(): reads one aligned word of physical memory through a fresh uncached mapping; 0 on success. */
 extern "C" int (*native_adreno_dram_read32)(uint64_t physical,uint32_t *value);
 /* The board's reader through the kernel's cacheable physical aperture (null on the host: the BO's own mapping is read). */
@@ -47,7 +43,7 @@ class NativeAdrenoVm final {
         unsigned permissions=0,writeback=0,shareability=0,jobs=0;
     };
     Mapping *mappings_=nullptr;
-    NativeAdrenoHandleIndex<NativeAdrenoVmMaxObjects> index_;   /* live handle -> its mappings_ slot */
+    NativeAdrenoHandleIndex index_;   /* live handle -> its mappings_ slot */
     size_t free_hint_=0;   /* no free mappings_ slot below it */
     size_t high_=0;   /* no live mappings_ slot at or above it: the walks over every mapping stop there */
     size_t class_spans_[16]{};   /* ranges_ per alias class, so a map counts the other classes without a walk */
@@ -62,9 +58,9 @@ class NativeAdrenoVm final {
      * ranges_, as the smaller compared side never holds more ranges than the table. */
     uint32_t *alias_scratch_=nullptr;
     size_t capacity_=0,lower_count_=0,upper_count_=0,objects_=0;
-    /* Both tables grow on demand (a VM per GPU process: most use a few hundred objects): ranges_ up to max_capacity_ (attach's capacity),
-     * mappings_ up to NativeAdrenoVmMaxObjects. */
-    size_t max_capacity_=0,mapping_capacity_=0;
+    /* Both tables grow on demand with no limit but memory (a VM per GPU process: most use a few hundred objects; a fixed table filled up
+     * at 1024, then 4096 mappings: int-237, i567). */
+    size_t mapping_capacity_=0;
     bool growRanges(size_t needed);
     void freeTables();
     bool growMappings();
@@ -96,7 +92,7 @@ public:
     NativeAdrenoVm &operator=(const NativeAdrenoVm &)=delete;
     IOReturn attach(const ArmSmmu4KIo *,ArmSmmu4KContextConfig *,ArmSmmu4KStreamState *,
         const NativeAdrenoVmRegion *lower,const NativeAdrenoVmRegion *upper,
-        size_t max_spans,unsigned poll_budget);
+        size_t first_spans,unsigned poll_budget);
     /* Frees CPU metadata only, with no BOs remaining. Never releases roots,
      * disables a bank or returns the platform lease; board lifecycle owns it. */
     IOReturn detach();

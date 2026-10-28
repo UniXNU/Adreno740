@@ -140,7 +140,7 @@ int main()
         CHECK(fixture.live.empty() && fixture.metadata.empty());
     }
     /* Scattered BOs, one span per page, mapped in one transaction each into the middle, the end and the start of the table
-     * (each map and unmap audits the whole table against the sorted spans), and a span-capacity refusal before ownership. */
+     * (each map and unmap audits the whole table against the sorted spans); the range table grows past its first capacity. */
     {
         Fixture s;
         CHECK(exposed(s,8)==kIOReturnSuccess);   /* aperture 0x800000..0x810000, 8 spans */
@@ -157,10 +157,9 @@ int main()
         CHECK(!s.vm.unmap(a) && s.vm.spanCount()==5);
         CHECK(!s.vm.map(&first,0,0x800000,3,0,2,&a) && s.vm.spanCount()==6);
         CHECK(!huge.allocate(3*4096,40,false,3*4096) && huge.spanCount()==3);
-        uint64_t refused=0;const unsigned calls=f.calls;
-        CHECK(s.vm.map(&huge,0,0x802000,3,0,2,&refused)==kIOReturnNoResources && !refused);
-        CHECK(!huge.deviceReferences() && f.calls==calls && s.vm.spanCount()==6 && !s.vm.poisoned());
-        CHECK(!s.vm.unmap(a) && !s.vm.unmap(b) && !s.vm.unmap(c) && s.vm.spanCount()==0);
+        uint64_t grown=0;
+        CHECK(!s.vm.map(&huge,0,0x802000,3,0,2,&grown) && grown && s.vm.spanCount()==9 && !s.vm.poisoned());
+        CHECK(!s.vm.unmap(grown) && !s.vm.unmap(a) && !s.vm.unmap(b) && !s.vm.unmap(c) && s.vm.spanCount()==0);
         fixture.mode=Contiguous;
         CHECK(!first.release() && !middle.release() && !last.release() && !huge.release());
         CHECK(s.vm.detach()==kIOReturnSuccess);
@@ -274,7 +273,7 @@ int main()
         CHECK(s.object.release()==kIOReturnBusy && s.tables.release()==kIOReturnBusy);
         CHECK(!fixture.live.empty());
     }
-    std::printf("PASS: 1 native map/hold/unmap transaction, 13 pre-ownership refusals, 1 scattered-span ordering and capacity case and 1 post-hold poison/retention case over a software SMMU register peer\n");
+    std::printf("PASS: 1 native map/hold/unmap transaction, 13 pre-ownership refusals, 1 scattered-span ordering and growth case and 1 post-hold poison/retention case over a software SMMU register peer\n");
 }
 /* Physical-page maintenance (imported BOs): record it; no host page is touched. */
 /* Host double: the page attribute change of user BOs has no host equivalent (no host page is touched). */

@@ -13,7 +13,6 @@
 enum {
     NativeAdrenoAbiVersion = 2,
     NativeAdrenoAbiMaxBuffers = 128,   /* a frame's IBs in one submission (Turnip splits a larger one) */
-    NativeAdrenoAbiMaxBoBytesShift = 28, /* 256MiB per object */
     NativeAdrenoMethodQuery = 1,
     NativeAdrenoMethodBoAlloc = 2,
     NativeAdrenoMethodBoMap = 3,
@@ -30,8 +29,7 @@ enum {
     NativeAdrenoMethodBoCpuUnmap = 14,
     NativeAdrenoMethodGetDeviceInfo = 15,
     NativeAdrenoMethodBoImport = 16,
-    NativeAdrenoAbiMetadataBytes = 64,
-    NativeAdrenoAbiMaxQueues = 8
+    NativeAdrenoAbiMetadataBytes = 64
 };
 struct NativeAdrenoAbiParams {
     uint32_t abi_version;

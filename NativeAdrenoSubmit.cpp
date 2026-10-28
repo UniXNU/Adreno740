@@ -6,7 +6,7 @@
 /* CP_INDIRECT_BUFFER is opcode 0x3f with a 3-word payload: 64-bit GPU address
  * and IB_SIZE in dwords (bits 0..19), exactly as the pinned adreno_pm4.xml
  * domain states and Linux msm_gem_submit.c converts the userspace byte size. */
-enum : uint32_t {SubmitIndirectBuffer=0x3f,SubmitIbWords=3,SubmitMaxJobs=8,
+enum : uint32_t {SubmitIndirectBuffer=0x3f,SubmitIbWords=3,
     SubmitMaxBuffers=(uint32_t)NativeAdrenoSubmitMaxBuffers,SubmitMaxIbBytes=0xfffffu*4u,
     SubmitAuditBytes=256u*1024u};   /* IB bytes the write-combine audit compares per submission */
 extern "C" {volatile uint32_t native_adreno_coherence[8];}
@@ -70,7 +70,14 @@ NativeAdrenoSubmit::Job *NativeAdrenoSubmit::find(uint32_t fence)
 NativeAdrenoSubmit::Job *NativeAdrenoSubmit::free()
 {
     for(auto &job:jobs_)if(!job.active)return &job;
-    return nullptr;
+    Job **items=IONewData(Job *,jobs_.count+1);
+    Job *job=items?new Job:nullptr;
+    if(!job) {if(items)IODeleteData(items,Job *,jobs_.count+1);return nullptr;}
+    for(size_t i=0;i<jobs_.count;++i)items[i]=jobs_.items[i];
+    items[jobs_.count]=job;
+    if(jobs_.items)IODeleteData(jobs_.items,Job *,jobs_.count);
+    jobs_.items=items;++jobs_.count;
+    return job;
 }
 IOReturn NativeAdrenoSubmit::attach(NativeAdrenoVm *vm,NativeAdrenoRing *ring)
 {
@@ -134,11 +141,11 @@ IOReturn NativeAdrenoSubmit::detach()
     if(!attached_)return kIOReturnNotReady;
     attached_=false;vm_=nullptr;ring_=nullptr;return kIOReturnSuccess;
 }
-bool NativeAdrenoSubmit::queueOutstanding(uint32_t queue) const
+bool NativeAdrenoSubmit::queueOutstanding(uint64_t queue) const
 {
     return rangeOutstanding(queue,1);
 }
-bool NativeAdrenoSubmit::rangeOutstanding(uint32_t first,uint32_t count) const
+bool NativeAdrenoSubmit::rangeOutstanding(uint64_t first,uint64_t count) const
 {
     for(const auto &job:jobs_)if(job.active && job.queue-first<count)return true;
     return false;
@@ -148,12 +155,12 @@ size_t NativeAdrenoSubmit::outstanding() const
     size_t count=0;for(const auto &job:jobs_)if(job.active)++count;return count;
 }
 IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size_t count,
-    uint32_t queue,uint32_t *fence)
+    uint64_t queue,uint32_t *fence)
 {
     return submit(nullptr,buffers,count,queue,fence,nullptr);
 }
 IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitBuffer *buffers,size_t count,
-    uint32_t queue,uint32_t *fence,const NativeAdrenoRingClock *clock)
+    uint64_t queue,uint32_t *fence,const NativeAdrenoRingClock *clock)
 {
     if(!fence)return kIOReturnBadArgument;*fence=0;
     if(!vm)vm=vm_;
@@ -192,7 +199,7 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
     IOReturn swept=retireCompleted();
     if(swept)return swept;
     Job *job=free();
-    if(!job)return kIOReturnBusy;
+    if(!job)return kIOReturnNoMemory;
     for(size_t i=0;i<handle_count;++i) {
         IOReturn status=vm_->holdJob(handles[i]);
         if(status) {
@@ -288,7 +295,8 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
             return poison();
         }
         while(handle_count) {vm_->retireJobAfterCompletion(handles[--handle_count]);++stats_.references_retired;}
-        return status;
+        /* No room in the ring yet: the caller waits for an earlier job and submits again. */
+        return status==kIOReturnNoResources?kIOReturnBusy:status;
     }
     for(size_t i=0;i<handle_count;++i)job->handles[i]=handles[i];
     job->count=handle_count;job->fence=value;job->queue=queue;job->active=true;job->vm_next=vm_->nextHandle();job->vm=vm;
@@ -435,7 +443,7 @@ IOReturn NativeAdrenoSubmit::waitAll(const NativeAdrenoRingClock *clock,uint32_t
     }
     return kIOReturnSuccess;
 }
-IOReturn NativeAdrenoSubmit::waitRange(uint32_t first,uint32_t count,const NativeAdrenoRingClock *clock,uint32_t timeout_us)
+IOReturn NativeAdrenoSubmit::waitRange(uint64_t first,uint64_t count,const NativeAdrenoRingClock *clock,uint32_t timeout_us)
 {
     if(!attached_ || poisoned_)return kIOReturnNotReady;
     while(rangeOutstanding(first,count)) {

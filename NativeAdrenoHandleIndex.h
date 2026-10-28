@@ -5,14 +5,13 @@
 #include <stdint.h>
 #include <string.h>
 #include <IOKit/IOLib.h>
-/* Handle -> slot of a fixed table whose handles are never 0: open addressing over twice the slots with linear probing, deletion by
- * backward shift (no tombstones), so a lookup is a few probes instead of a walk over every slot. i567: the submit path looked each IB's
- * handle up three times by walking a 4096-entry table, and the table had to grow to 16384 entries. */
-/* The cells grow with the keys (from 64, doubling at half load, up to twice Slots), so an index over a few objects costs a few cells: every
- * process that uses the GPU has two of them. */
-template<size_t Slots> class NativeAdrenoHandleIndex {
-    enum : size_t {MaxSize=Slots*2,FirstSize=64};
-    static_assert(Slots && !(MaxSize&(MaxSize-1)) && FirstSize<=MaxSize,"power of two");
+/* Handle -> slot of a table whose handles are never 0: open addressing with linear probing, deletion by backward shift (no tombstones), so
+ * a lookup is a few probes instead of a walk over every slot. i567: the submit path looked each IB's handle up three times by walking a
+ * 4096-entry table. */
+/* The cells grow with the keys (from 64, doubling at half load) with no limit but memory, so an index over a few objects costs a few cells:
+ * every process that uses the GPU has two of them. reserve() makes room before a key must go in; insert() never drops one after it. */
+class NativeAdrenoHandleIndex {
+    enum : size_t {FirstSize=64};
     struct Cell {uint64_t key;uint32_t value;};
     Cell *cells_=nullptr;
     size_t size_=0,count_=0;
@@ -24,10 +23,10 @@ template<size_t Slots> class NativeAdrenoHandleIndex {
         if(!cells_[i].key)++count_;
         cells_[i]={key,value};
     }
-    /* Twice the cells, every key placed again; false (nothing changed) without memory or at the largest size. */
+    /* Twice the cells, every key placed again; false (nothing changed) without memory. */
     bool grow()
     {
-        if(size_>=MaxSize)return false;
+        if(size_>SIZE_MAX/(2*sizeof(Cell)))return false;
         Cell *old=cells_;const size_t oldSize=size_;
         Cell *made=IONewData(Cell,oldSize*2);
         if(!made)return false;
@@ -57,13 +56,19 @@ public:
         }
         return UINT32_MAX;
     }
-    /* At most Slots keys are ever present, so at the largest size a free cell always exists. Below it the cells double once half are
-     * used; a failed doubling keeps the current cells, which still have a free one (the load stays at most Slots of 2*Slots). */
-    void insert(uint64_t key,uint32_t value)
+    /* Room for `keys` keys at most half the cells: false (nothing changed) without memory. */
+    bool reserve(size_t keys)
     {
-        if(!cells_ || !key)return;
-        if((count_+1)*2>size_ && !grow() && count_+1>=size_)return;
-        place(key,value);
+        if(!cells_)return false;
+        while(keys*2>size_)if(!grow())return false;
+        return true;
+    }
+    /* After reserve(count+1); without it a key goes in while one free cell is left. */
+    bool insert(uint64_t key,uint32_t value)
+    {
+        if(!cells_ || !key)return false;
+        if((count_+1)*2>size_ && !grow() && count_+1>=size_)return false;
+        place(key,value);return true;
     }
     void erase(uint64_t key)
     {

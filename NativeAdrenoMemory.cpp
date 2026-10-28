@@ -224,7 +224,7 @@ IOReturn NativeAdrenoMemory::reservePool(unsigned bits,size_t bytes)
 IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous,size_t budget,bool pooled)
 {
     if(descriptor_ || spans_ || quarantined_)return kIOReturnBusy;
-    if(!bytes || (bytes&4095) || !outputWidth(bits) || !budget || budget>256u*1024u*1024u)
+    if(!bytes || (bytes&4095) || !outputWidth(bits) || !budget)
         return kIOReturnBadArgument;
     if(bytes>budget)return kIOReturnNoResources;
     NativeAdrenoCpuState cpu{};
@@ -306,7 +306,7 @@ IOReturn NativeAdrenoMemory::importTask(void *task,uint64_t address,size_t bytes
     if(descriptor_ || imported_ || spans_ || quarantined_)return kIOReturnBusy;
     native_adreno_import_stage=11;
     if(!task || !address || (address&4095) || !bytes || (bytes&4095) || address>UINT64_MAX-bytes || !outputWidth(bits) ||
-        !budget || budget>256u*1024u*1024u)return kIOReturnBadArgument;
+        !budget)return kIOReturnBadArgument;
     native_adreno_import_stage=12;
     if(bytes>budget)return kIOReturnNoResources;
     NativeAdrenoCpuState cpu{};

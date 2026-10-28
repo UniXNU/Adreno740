@@ -57,7 +57,7 @@ public:
     ~NativeAdrenoMemory()=default;
     NativeAdrenoMemory(const NativeAdrenoMemory &)=delete;
     NativeAdrenoMemory &operator=(const NativeAdrenoMemory &)=delete;
-    /* Explicit driver budget; bounded to 256MiB per backing object for now.
+    /* Explicit driver budget (the caller's limit: a client's GPU address window).
      * Error may retain quarantined allocation state if complete() fails.
      * Caller always keeps this object and checks quarantined(), even on error.
      * CPU native4K state and kernel page ABI are checked before allocation.

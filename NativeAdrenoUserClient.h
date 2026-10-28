@@ -13,9 +13,8 @@
  * add policy. Handles are this object's own identities, never VM, IOVA or
  * pointer values. A mapping is retirable only through freeBo, which unmaps
  * first and then releases the backing object; both steps must succeed.
- * Up to NativeAdrenoClientMaxObjects live objects and the execbuf's own eight-job limit apply. */
-/* As many objects as the shared VM table can hold (NativeAdrenoVmMaxObjects; i567: backboardd crashed twice at 4096). */
-enum : size_t {NativeAdrenoClientMaxObjects=16384,NativeAdrenoClientContiguousFirstBytes=65536};
+ * Objects, queues and jobs are limited by memory and ring space only (msm's are: a fixed 4096-entry table crashed backboardd, i567). */
+enum : size_t {NativeAdrenoClientContiguousFirstBytes=65536};
 class NativeAdrenoUserClient final {
     struct Queue {uint32_t id=0;bool active=false;};
     struct Entry {
@@ -34,17 +33,24 @@ class NativeAdrenoUserClient final {
         char metadata[NativeAdrenoAbiMetadataBytes]{};
     };
     /* Entries in chunks of EntryChunk, allocated as the client's objects grow (a whole table per client was about 4 MiB, and every process
-     * may now open the GPU); a chunk never moves, so the VM's pointers into an entry's memory stay valid. All-zero is the free state. */
-    enum : size_t {EntryChunk=64,EntryChunks=NativeAdrenoClientMaxObjects/EntryChunk};
-    Entry *chunks_[EntryChunks]{};
+     * may now open the GPU); a chunk never moves, so the VM's pointers into an entry's memory stay valid, and only the directory of chunks
+     * grows. All-zero is the free state. */
+    enum : size_t {EntryChunk=64};
+    Entry **chunks_=nullptr;
+    size_t chunk_slots_=0;   /* directory size */
     size_t entry_count_=0;   /* entries in the allocated chunks */
     Entry &at(size_t index) const {return chunks_[index/EntryChunk][index%EntryChunk];}
     bool grow();
     void releaseEntries();
     uint32_t stats_slot_=4;   /* the board log's client row (4: the shared overflow row) */
-    NativeAdrenoHandleIndex<NativeAdrenoClientMaxObjects> index_;   /* live handle -> its entries_ index */
+    NativeAdrenoHandleIndex index_;   /* live handle -> its entries_ index */
     size_t free_hint_=0,live_=0;   /* no free entry below free_hint_; live_ entries are used */
-    Queue queues_[NativeAdrenoAbiMaxQueues]{};
+    /* Queues as msm's submitqueues: as many as the client creates (queue 0 from open), grown on demand. */
+    Queue *queues_=nullptr;
+    uint32_t queue_capacity_=0;
+    bool growQueues();
+    /* A BO is limited by the client's GPU address window and memory only (Metal's maxBufferLength is the working set, not a constant). */
+    uint64_t maxBoBytes() const {return window_bytes_?window_bytes_:UINT64_C(1)<<input_bits_;}
     NativeAdrenoVm *vm_=nullptr;
     NativeAdrenoSubmit *submit_=nullptr;
     NativeAdrenoRing *ring_=nullptr;
@@ -52,9 +58,9 @@ class NativeAdrenoUserClient final {
     const NativeAdrenoStatus *status_=nullptr;
     const NativeAdrenoAbiDeviceInfo *info_=nullptr;
     uint32_t input_bits_=0,output_bits_=0;
-    /* Scope on the shared ring and GPU space: this client's queues are the submit object's queues [queue_base_, +MaxQueues), and with a
+    /* Scope on the shared ring and GPU space: this client's queues are the submit object's queues [queue_base_, +2^32), and with a
      * window (window_bytes_ nonzero) every mapping must lie inside [window_start_, +window_bytes_), which GetDeviceInfo reports as the VA. */
-    uint32_t queue_base_=0;
+    uint64_t queue_base_=0;
     uint32_t context_=0;   /* this client's GPU context for NativeAdrenoRing::useContext */
     /* A client owns a queue range once setScope() gave it one or it has submitted into the default one (a single client that never scopes owns
      * range 0). Before either, queue_base_ is only the default 0, which a scoped client may own, so a check of "this client's own range" would
@@ -78,9 +84,9 @@ public:
      * active native4K arena and are reported, never guessed. */
     IOReturn open(uint32_t abi_version,NativeAdrenoVm *,NativeAdrenoSubmit *,
         NativeAdrenoRing *,uint32_t input_bits,uint32_t output_bits);
-    /* One client of several on the same VM, submit object and ring: its queue range (queue_base a multiple of NativeAdrenoAbiMaxQueues) and
+    /* One client of several on the same VM, submit object and ring: its queue range (queue_base a multiple of 2^32, NativeAdrenoQueueRange) and
      * GPU address window (4 KiB aligned, inside the input range; bytes 0 = unrestricted). Only while open with no live object or job. */
-    IOReturn setScope(uint32_t queue_base,uint64_t window_start,uint64_t window_bytes);
+    IOReturn setScope(uint64_t queue_base,uint64_t window_start,uint64_t window_bytes);
     /* The board log's per-client row this client counts in (0..3; 4 the shared row). */
     void setStatsSlot(uint32_t slot) {stats_slot_=slot<4?slot:4;}
     /* Highest end address (exclusive) any mapping of this client has reached, 0 before the first. */
