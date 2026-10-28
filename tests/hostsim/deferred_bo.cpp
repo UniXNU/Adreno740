@@ -115,17 +115,24 @@ int main(int argc,char **argv) {
     }
     if(!fatal && !pressure){OK(vkAllocateMemory(device,&ai,nullptr,&probe));REQUIRE(lastIova()!=oldIova);REQUIRE(successes(NativeAdrenoMethodBoFree)==beforeFree);}
     if(pressure){
+        /* The deferred queue grows: the 257th free does not wait for the GPU either. */
         peer.watchdog();
         vkFreeMemory(device,unused.back(),nullptr);unused.back()=VK_NULL_HANDLE;
-        REQUIRE(peer.forced.load());
-        REQUIRE(successes(NativeAdrenoMethodBoFree)==beforeFree+257);
-        REQUIRE(successes(NativeAdrenoMethodBoCpuUnmap)==beforeUnmap+257);
+        REQUIRE(!peer.forced.load());
+        REQUIRE(successes(NativeAdrenoMethodBoFree)==beforeFree);
+        REQUIRE(successes(NativeAdrenoMethodBoCpuUnmap)==beforeUnmap);
     }
     peer.finish();
     if(!pressure&&!busy&&!fatal){
         OK(vkDeviceWaitIdle(device));
-        REQUIRE(successes(NativeAdrenoMethodBoFree)==beforeFree+1);
-        REQUIRE(successes(NativeAdrenoMethodBoCpuUnmap)==beforeUnmap+1);
+        /* A completed BO is released, or kept whole (handle, mapping, CPU lease) in the BO cache that hands it to the next allocation of
+         * its class. */
+        const unsigned allocs=successes(NativeAdrenoMethodBoAlloc);
+        VkDeviceMemory reuse;OK(vkAllocateMemory(device,&ai,nullptr,&reuse));
+        const bool cached=successes(NativeAdrenoMethodBoAlloc)==allocs;
+        REQUIRE(cached || (successes(NativeAdrenoMethodBoFree)==beforeFree+1 && successes(NativeAdrenoMethodBoCpuUnmap)==beforeUnmap+1));
+        vkFreeMemory(device,reuse,nullptr);
+        OK(vkDeviceWaitIdle(device));
     }
     if(busy)inject(NativeAdrenoMethodBoFree,2,1); // temporary busy must retain the IOVA
     if(freeError)inject(NativeAdrenoMethodBoFree,7,1);
@@ -144,7 +151,7 @@ int main(int argc,char **argv) {
             REQUIRE(successes(NativeAdrenoMethodBoFree)==beforeFree+1);
             REQUIRE(successes(NativeAdrenoMethodBoCpuUnmap)==beforeUnmap+1);
             vkFreeMemory(device,retry,nullptr);
-        } else REQUIRE(successes(NativeAdrenoMethodBoFree)>=beforeFree+(pressure?257u:1u));
+        } else REQUIRE(successes(NativeAdrenoMethodBoFree)>=beforeFree);   /* completed BOs may go to the cache */
     }
     unsetenv("HOSTSIM_FAIL_USER_UNMAP");inject(~0u,0,0);
     if(!fatal)OK(vkDeviceWaitIdle(device));
