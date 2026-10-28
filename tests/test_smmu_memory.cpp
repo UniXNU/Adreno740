@@ -12,45 +12,50 @@ IOReturn NativeAdrenoMaintainOwnedPages(void *mapping,size_t bytes,NativeAdrenoC
     CHECK(op==NativeAdrenoClean);++fixture.cache_calls;
     return fixture.cache_calls==fixture.cache_fail_call?kIOReturnIOError:kIOReturnSuccess;
 }
+void NativeAdrenoNotePhase(unsigned,size_t) {}
 int main()
 {
     unsigned profiles=0;
     for(unsigned bits=32;bits<=48;++bits)for(unsigned upper=0;upper<2;++upper) {
-        NativeAdrenoMemory memory;ArmSmmu4KLiveArena arena;ArmSmmu4KLiveState state{};
+        NativeAdrenoTablePages pages;ArmSmmu4KLiveArena arena;ArmSmmu4KLiveState state{};
         ArmSmmu4KLiveVisibility visibility;
-        CHECK(memory.allocate(8*4096,40,true,8*4096)==kIOReturnSuccess);
         uint64_t va=(upper?UINT64_MAX-(UINT64_C(1)<<bits)+1:0)+0x1ff000;
-        CHECK(NativeAdrenoPrepareSmmuMemory(&memory,bits,40,va,8192,upper,16,&arena,&state,&visibility)==kIOReturnSuccess);
-        CHECK(arena.config.table_physical==memory.spans()[0].physical && arena.mapping==memory.mapping());
-        CHECK(state.prepared && !state.poisoned && memory.deviceReferences()==1);
-        CHECK(memory.release()==kIOReturnBusy);
+        CHECK(NativeAdrenoPrepareSmmuMemory(&pages,bits,40,va,8192,upper,16,&arena,&state,&visibility)==kIOReturnSuccess);
+        CHECK(pages.pageCount()==1 && arena.config.table_physical==pages.pagePhysical(0) && arena.pages==pages.provider());
+        CHECK(state.prepared && !state.poisoned && state.tables.table_pages==1);
+        const volatile uint64_t *root=pages.pageMapping(0);
+        for(unsigned i=0;i<512;++i)CHECK(!root[i]);
         ArmSmmu4KLiveResult audit;
         CHECK(ArmSmmu4KLiveAudit(&arena,&state,nullptr,0,&audit)==ArmSmmu4KSuccess);
-        CHECK(!visibility.publish_table_page(visibility.cookie,arena.mapping,4096));
-        CHECK(visibility.publish_table_page(visibility.cookie,arena.mapping+memory.bytes()/8,4096));
-        CHECK(visibility.publish_table_page(visibility.cookie,arena.mapping,8192));
-        CHECK(visibility.publish_table_page(visibility.cookie,arena.mapping+1,4096));
-        /* No context was ever enabled in this test; retire the software hold. */
-        CHECK(memory.retireAfterQuiescence()==kIOReturnSuccess && memory.release()==kIOReturnSuccess);
-        CHECK(fixture.live.empty() && fixture.metadata.empty());++profiles;
+        volatile uint64_t *writable=const_cast<volatile uint64_t *>(root);
+        CHECK(!visibility.publish_table_page(visibility.cookie,writable,4096));
+        CHECK(visibility.publish_table_page(visibility.cookie,writable,8192));
+        CHECK(visibility.publish_table_page(visibility.cookie,writable+1,4096));
+        uint64_t foreign[1024] __attribute__((aligned(4096)));
+        CHECK(visibility.publish_table_page(visibility.cookie,reinterpret_cast<volatile uint64_t *>(foreign),4096));
+        /* The provider's own lookups: a page it gave, nothing else. */
+        CHECK(arena.pages->find(arena.pages->cookie,pages.pagePhysical(0))==root);
+        CHECK(!arena.pages->find(arena.pages->cookie,pages.pagePhysical(0)+4096));
+        CHECK(arena.pages->overlaps(arena.pages->cookie,pages.pagePhysical(0)-4096,4097));
+        CHECK(!arena.pages->overlaps(arena.pages->cookie,pages.pagePhysical(0)-4096,4096));
+        CHECK(pages.release()==kIOReturnSuccess && fixture.live.empty() && fixture.metadata.empty());++profiles;
     }
     unsigned refusals=0;
     for(unsigned failure=0;failure<4;++failure) {
         fixture=MemoryFixture{};
-        NativeAdrenoMemory memory;ArmSmmu4KLiveArena arena;ArmSmmu4KLiveState state{};
+        NativeAdrenoTablePages pages;ArmSmmu4KLiveArena arena;ArmSmmu4KLiveState state{};
         ArmSmmu4KLiveVisibility visibility;
-        if(failure==0)fixture.mode=Scattered;
-        CHECK(memory.allocate((failure==1?1:8)*4096,40,false,8*4096)==kIOReturnSuccess);
-        if(failure==2)fixture.cache_fail_call=2;
-        if(failure==3)CHECK(memory.holdForDevice()==kIOReturnSuccess);
-        IOReturn expected=failure==0?kIOReturnUnsupported:failure==1?kIOReturnNoResources:
-            failure==2?kIOReturnIOError:kIOReturnBusy;
-        CHECK(NativeAdrenoPrepareSmmuMemory(&memory,48,40,0xffff0000001ff000,8192,1,16,&arena,&state,&visibility)==expected);
+        if(failure==0)fixture.allocation_fail=true;
+        if(failure==1)fixture.null_mapping=true;
+        if(failure==2)fixture.cache_fail_call=1;
+        if(failure==3)pages.quarantine();
+        IOReturn expected=failure==0 || failure==1?kIOReturnNoMemory:failure==2?kIOReturnIOError:kIOReturnBusy;
+        IOReturn got=NativeAdrenoPrepareSmmuMemory(&pages,48,40,0xffff0000001ff000,8192,1,16,&arena,&state,&visibility);
+        CHECK(got==expected);
         CHECK(!visibility.publish_table_page && state.poisoned==(failure==2));
-        if(failure==3)CHECK(memory.retireAfterQuiescence()==kIOReturnSuccess);
-        CHECK(memory.release()==kIOReturnSuccess && fixture.live.empty() && fixture.metadata.empty());++refusals;
+        CHECK(pages.release()==(failure==3?kIOReturnBusy:kIOReturnSuccess) && fixture.live.empty() && fixture.metadata.empty());++refusals;
     }
-    std::printf("PASS: %u native allocator/table-pool bindings and %u capacity/scatter/publication/ownership refusals; no hardware context enabled\n",profiles,refusals);
+    std::printf("PASS: %u on-demand table-page bindings and %u allocation/range/publication/quarantine refusals; no hardware context enabled\n",profiles,refusals);
 }
 /* Physical-page maintenance (imported BOs): record it; no host page is touched. */
 /* Host double: the page attribute change of user BOs has no host equivalent (no host page is touched). */

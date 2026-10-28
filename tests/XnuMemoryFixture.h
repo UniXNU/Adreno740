@@ -113,4 +113,8 @@ public:
         ++fixture.segment_calls;*length=4096;return physical_base+2*offset;
     }
 };
+/* Clock and pmap types the driver's bookkeeping names; the host never measures with them. */
+using ppnum_t=uint32_t;
+inline uint64_t mach_absolute_time() {static uint64_t now;return ++now;}
+inline void nanoseconds_to_absolutetime(uint64_t ns,uint64_t *out) {*out=ns;}
 #endif

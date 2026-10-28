@@ -36,11 +36,12 @@ IOReturn NativeAdrenoGmuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,uns
         if(report->output_bits>40)report->output_bits=40;
         if(!report->output_bits)status=kIOReturnUnsupported;
     }
-    if(!status)status=gmu_.allocate(NativeAdrenoGmuDefaultSizes(TablePages*0x1000),report->output_bits);
+    if(!status)status=gmu_.allocate(NativeAdrenoGmuDefaultSizes(),report->output_bits);
     if(!status) {
         step(Prepare);
-        status=smmu_.prepare(&gmu_.tables(),0,0,GmuApertureBytes,NativeAdrenoSmmuContext::MaxLeaves,
-            bank,asid,1000,report->output_bits);
+        /* The GMU's own space is 0..2 GiB (a6xx_gmu_memory_probe: msm_gem_vm_create(drm, mmu, "gmu", 0x0, 0x80000000, true)), a 32-bit input. */
+        status=smmu_.prepare(&gmu_.tables(),0,0,GmuApertureBytes,GmuApertureBytes/4096,
+            bank,asid,1000,report->output_bits,32);
     }
     if(!status) {
         step(Program);

@@ -35,8 +35,6 @@ class NativeAdrenoGmuContext final {
 public:
     /* Allocate also reads ID2 first and refuses an output size the kit cannot encode. */
     enum Step : uint32_t {Allocate=1,Prepare,Program,Attach,VmAttach,Map,Ready};
-    /* Lower region: 1 L1 + 2 L2 + 1024 L3 pages for 2 GiB with a 32-bit input. */
-    enum : size_t {TablePages=1027};
     NativeAdrenoGmuContext()=default;
     NativeAdrenoGmuContext(const NativeAdrenoGmuContext &)=delete;
     NativeAdrenoGmuContext &operator=(const NativeAdrenoGmuContext &)=delete;

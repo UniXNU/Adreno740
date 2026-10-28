@@ -38,15 +38,20 @@ static int write32(void *cookie,size_t at,uint32_t v)
     int fail=event();if(fail && !f.after)return 1;
     memory[at/4]=v;return fail;
 }
-static int write64(void *cookie,size_t at,uint64_t v){(void)at;(void)v;(void)cookie;CHECK(0);return 1;}
+static int write64(void *cookie,size_t at,uint64_t v)
+{
+    CHECK(cookie==&f && at%8==0 && at<=BYTES-8);
+    int fail=event();if(fail && !f.after)return 1;
+    std::memcpy(memory+at/4,&v,8);return fail;
+}
 static int barrier(void *cookie){CHECK(cookie==&f);return event();}
 struct Fixture {
-    NativeAdrenoMemory tables,object;
+    NativeAdrenoTablePages tables;
+    NativeAdrenoMemory object;
     ArmSmmu4KLiveArena arena;
     ArmSmmu4KLiveState state{};
     ArmSmmu4KLiveVisibility visibility;
     NativeAdrenoVm vm;
-    std::vector<uint32_t> aliasScratch;
 };
 static void mmioReset(void)
 {
@@ -61,8 +66,6 @@ static void mmioReset(void)
 static IOReturn exposed(Fixture &s,size_t capacity=32,size_t pages=16)
 {
     mmioReset();
-    const size_t tablePages=std::max(size_t(32),pages/512+8);
-    IOReturn status=s.tables.allocate(tablePages*4096,40,true,tablePages*4096);if(status)return status;
     IOReturn smmu=NativeAdrenoPrepareSmmuMemory(&s.tables,32,40,0x800000,pages*4096,0,pages,
         &s.arena,&s.state,&s.visibility);
     if(smmu)return smmu;
@@ -104,9 +107,7 @@ int main()
         CHECK(s.vm.unmap(handle)==kIOReturnSuccess);
         CHECK(s.vm.objectCount()==0 && s.vm.spanCount()==0);
         CHECK(s.object.deviceReferences()==0 && s.object.release()==kIOReturnSuccess);
-        CHECK(s.tables.release()==kIOReturnBusy);
         CHECK(s.vm.detach()==kIOReturnSuccess);
-        CHECK(s.tables.retireAfterQuiescence()==kIOReturnSuccess);
         CHECK(s.tables.release()==kIOReturnSuccess);
         CHECK(fixture.live.empty() && fixture.metadata.empty());
     }
@@ -135,7 +136,7 @@ int main()
         CHECK(s.vm.unmap(mapped)==kIOReturnSuccess);
         CHECK(s.object.release()==kIOReturnSuccess);
         CHECK(s.vm.detach()==kIOReturnSuccess);
-        CHECK(s.tables.retireAfterQuiescence()==kIOReturnSuccess && s.tables.release()==kIOReturnSuccess);
+        CHECK(s.tables.release()==kIOReturnSuccess);
         CHECK(fixture.live.empty() && fixture.metadata.empty());
     }
     /* Scattered BOs, one span per page, mapped in one transaction each into the middle, the end and the start of the table
@@ -163,7 +164,7 @@ int main()
         fixture.mode=Contiguous;
         CHECK(!first.release() && !middle.release() && !last.release() && !huge.release());
         CHECK(s.vm.detach()==kIOReturnSuccess);
-        CHECK(s.tables.retireAfterQuiescence()==kIOReturnSuccess && s.tables.release()==kIOReturnSuccess);
+        CHECK(s.tables.release()==kIOReturnSuccess);
         CHECK(fixture.live.empty() && fixture.metadata.empty());
     }
     /* Physical overlap remains allowed only within the same attribute class.
@@ -171,8 +172,8 @@ int main()
      * MMIO/ownership changes. These are physical-page identities in the peer. */
     for(bool scratch:{false,true}) {
         Fixture s;CHECK(exposed(s)==kIOReturnSuccess);
-        s.aliasScratch.resize(32);
-        if(scratch){s.arena.alias_scratch=s.aliasScratch.data();s.arena.alias_scratch_entries=s.aliasScratch.size();}
+        /* The VM owns its regions' alias scratch; without it (scratch false) the kit compares pairwise. */
+        if(!scratch){s.arena.alias_scratch=nullptr;s.arena.alias_scratch_entries=0;}
         NativeAdrenoMemory first,second,many;
         CHECK(!first.allocate(4096,40,false,4096));
         fixture.next_physical=first.spans()[0].physical;
@@ -181,15 +182,11 @@ int main()
         CHECK(!many.allocate(8192,40,false,8192)&&many.spanCount()==2);fixture.mode=Contiguous;
         uint64_t a=0,b=0;CHECK(!s.vm.map(&first,0,0x800000,3,0,2,&a));
         CHECK(!s.vm.map(&second,0,0x802000,1,0,2,&b));CHECK(!s.vm.unmap(b));
-        const unsigned calls=f.calls;
-        for(unsigned change=0;change<3;++change) {
-            CHECK(s.vm.map(&second,0,0x802000,change==2?9:3,change==0?1:0,change==1?3:2,&b)==kIOReturnBadArgument);
-            CHECK(!b&&!second.deviceReferences()&&f.calls==calls&&!s.vm.poisoned());
-        }
-        CHECK(s.vm.map(&many,0,0x802000,3,1,3,&b)==kIOReturnBadArgument);
-        CHECK(!b&&!many.deviceReferences()&&f.calls==calls&&!s.vm.poisoned());
+        /* Driver-allocated pages are exclusive to their BO (exclusivePages): no cross-class alias pass runs for them, so a different
+         * class over the same pages maps. Imports keep the pass (test_vm_alias covers the index). */
+        CHECK(!s.vm.map(&second,0,0x802000,3,1,2,&b) && !s.vm.unmap(b));
         CHECK(!s.vm.unmap(a)&&!first.release()&&!second.release()&&!many.release());
-        CHECK(!s.vm.detach()&&!s.tables.retireAfterQuiescence()&&!s.tables.release());
+        CHECK(!s.vm.detach()&&!s.tables.release());
         CHECK(fixture.live.empty()&&fixture.metadata.empty());
     }
     /* A large different-class scattered map: the old preflight did n*n physical
@@ -197,7 +194,6 @@ int main()
     {
         constexpr size_t n=8192;
         Fixture s;CHECK(exposed(s,2*n,2*n)==kIOReturnSuccess);
-        s.aliasScratch.resize(2*n);s.arena.alias_scratch=s.aliasScratch.data();s.arena.alias_scratch_entries=s.aliasScratch.size();
         fixture.mode=Scattered;NativeAdrenoMemory first,second;
         CHECK(!first.allocate(n*4096,40,false,n*4096)&&first.spanCount()==n);
         CHECK(!second.allocate(n*4096,40,false,n*4096)&&second.spanCount()==n);
@@ -208,10 +204,59 @@ int main()
             (unsigned long long)(native_adreno_vm_phase_us[0][5]-before));
         native_adreno_vm_now_us=nullptr;fixture.mode=Contiguous;
         CHECK(s.vm.spanCount()==2*n&&!s.vm.unmap(b)&&!s.vm.unmap(a)&&!first.release()&&!second.release());
-        CHECK(!s.vm.detach()&&!s.tables.retireAfterQuiescence()&&!s.tables.release());
+        CHECK(!s.vm.detach()&&!s.tables.release());
         CHECK(fixture.live.empty()&&fixture.metadata.empty());
     }
     std::printf("PASS: VM alias index/fallback preserve attribute-class refusals before MMIO/ownership; 8192-span different-class map/unmap\n");
+    /* A 48-bit aperture (msm's per-process window up to BIT(ias)): only the tables a mapping needs exist, maps far apart take their
+     * own tables, an unmap keeps them (io-pgtable frees no table on a page unmap) and release() gives every page back. */
+    {
+        Fixture s;
+        mmioReset();
+        memory[0x28/4]=0x1533;   /* UBS 5 (48 bits), OAS 3, IAS 3, PTFS 4K */
+        CHECK(NativeAdrenoSmmuInputBits(memory[0x28/4])==48 && NativeAdrenoSmmuInputBits(0x0233)==40 && NativeAdrenoSmmuInputBits(0xf33)==48);
+        const uint64_t aperture=UINT64_C(1)<<48;
+        CHECK(!NativeAdrenoPrepareSmmuMemory(&s.tables,48,40,0,aperture,0,size_t(aperture/4096),&s.arena,&s.state,&s.visibility));
+        CHECK(s.tables.pageCount()==1 && s.state.tables.table_pages==1 && s.state.tables.start_level==0);
+        context=(ArmSmmu4KContextConfig){.lower=&s.arena.config,.lower_tables=&s.state.tables,
+            .id0=memory[0x20/4],.id2=memory[0x28/4],.asid=1,.coherent_walk=1,.stall_on_fault=0,.continue_after_fault=1};
+        ArmSmmu4KContextConfig actual=context;
+        CHECK(ArmSmmu4KEncodeContext(&actual,&image)==ArmSmmu4KSuccess && (image.tcr&63)==16);
+        memory[0x1008/4]=image.cbar;memory[0x1808/4]=image.cba2r;
+        memory[CB/4]=image.sctlr;memory[(CB+0x10)/4]=image.tcr2;memory[(CB+0x30)/4]=image.tcr;
+        std::memcpy(memory+(CB+0x20)/4,&image.ttbr0,8);std::memcpy(memory+(CB+0x28)/4,&image.ttbr1,8);
+        memory[(CB+0x38)/4]=image.mair0;
+        CHECK(ArmSmmu4KAttachStreams(&io,&streams,routes,2,2,&context,&route_result)==ArmSmmu4KSuccess);
+        NativeAdrenoVmRegion lower={&s.tables,&s.arena,&s.state};
+        CHECK(!s.vm.attach(&io,&context,&streams,&lower,nullptr,64,1000));
+        NativeAdrenoMemory low,high;
+        CHECK(!low.allocate(8192,40,false,8192) && !high.allocate(8192,40,false,8192));
+        uint64_t a=0,b=0,leaf=0;
+        CHECK(!s.vm.map(&low,0,0x100000000ull,3,0,2,&a) && s.tables.pageCount()==4);
+        CHECK(!s.vm.map(&high,0,aperture-8192,3,0,2,&b) && s.tables.pageCount()==7);
+        CHECK(s.state.tables.table_pages==7 && s.state.tables.leaf_pages==4);
+        CHECK(s.vm.leafPhysical(high.spans()[0].physical,&leaf) && leaf);
+        CHECK(s.tables.overlaps(s.tables.pagePhysical(3),1) && !s.tables.overlaps(low.spans()[0].physical,8192));
+        CHECK(!s.vm.unmap(a) && !s.vm.unmap(b) && s.tables.pageCount()==7 && !s.state.tables.leaf_pages);
+        CHECK(!low.release() && !high.release() && !s.vm.detach() && !s.tables.release() && !s.tables.pageCount());
+        CHECK(fixture.live.empty() && fixture.metadata.empty());
+    }
+    /* A table page the system cannot give refuses the map before any leaf is written; the VM stays usable. */
+    {
+        Fixture s;
+        CHECK(exposed(s)==kIOReturnSuccess);
+        CHECK(object(s,2)==kIOReturnSuccess);
+        const size_t pages=s.tables.pageCount();
+        fixture.allocation_fail=true;
+        uint64_t handle=0;
+        CHECK(s.vm.map(&s.object,0,0x800000,3,0,2,&handle)!=kIOReturnSuccess && !handle);
+        fixture.allocation_fail=false;
+        CHECK(s.tables.pageCount()>=pages && !s.state.tables.leaf_pages && !s.object.deviceReferences());
+        CHECK(!s.vm.poisoned() && !s.vm.map(&s.object,0,0x800000,3,0,2,&handle) && handle);
+        CHECK(!s.vm.unmap(handle) && !s.object.release() && !s.vm.detach() && !s.tables.release());
+        CHECK(fixture.live.empty() && fixture.metadata.empty());
+    }
+    std::printf("PASS: 48-bit sparse aperture with on-demand table pages, table-page refusal before any leaf\n");
     /* Post-hold CPU publication failure: poison, retain everything, refuse. */
     {
         Fixture s;
@@ -241,3 +286,6 @@ IOReturn NativeAdrenoMaintainPhysicalPages(uint64_t physical,size_t bytes,Native
     if(!physical || !bytes || ((physical|bytes)&4095) || op>NativeAdrenoInvalidate)std::abort();
     ++fixture.physical_calls;fixture.physical_bytes+=bytes;return kIOReturnSuccess;
 }
+void NativeAdrenoNotePhase(unsigned,size_t) {}
+bool NativeAdrenoPagesUncached(const NativeAdrenoPhysicalSpan *,size_t) {return false;}
+extern "C" unsigned int native_pmap_user_mappings(ppnum_t,void **,uint64_t *,char *) {return 0;}

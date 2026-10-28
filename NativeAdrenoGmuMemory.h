@@ -4,11 +4,12 @@
 #include "NativeAdrenoMemory.h"
 #include "NativeAdrenoVm.h"
 
+#include "NativeAdrenoSmmuMemory.h"
 /* Backing objects for the GMU cold start, laid out at the fixed IOVAs of the
  * GMU's own address space (0..2 GiB, the lower/TTBR0 region of its context
  * bank, as a6xx_gmu_memory_probe creates it): instruction cache payload, dummy,
- * debug and log buffers, HFI queues, plus the contiguous native4K table pool
- * that will translate them (the pool itself has no IOVA). Sizes are the ones the qualified GMU startup uses. All
+ * debug and log buffers, HFI queues, plus the native4K table pages that will
+ * translate them (taken on demand, no IOVA). Sizes are the ones the qualified GMU startup uses. All
  * objects are physically contiguous and page aligned; the allocator only
  * assigns addresses and never maps them or touches the SMMU. Any failure
  * releases what it allocated and leaves no layout. */
@@ -17,18 +18,17 @@ enum : uint64_t {
     GmuApertureBytes=0x80000000
 };
 struct NativeAdrenoGmuSizes {
-    uint64_t icache,dummy,debug,log,hfi,tables;
+    uint64_t icache,dummy,debug,log,hfi;
 };
-/* Exact sizes of the qualified startup; table pool is caller sized. */
-NativeAdrenoGmuSizes NativeAdrenoGmuDefaultSizes(size_t table_bytes);
+/* Exact sizes of the qualified startup. */
+NativeAdrenoGmuSizes NativeAdrenoGmuDefaultSizes();
 struct NativeAdrenoGmuMemoryLayout {
     uint64_t icache_iova,dummy_iova,debug_iova,log_iova,hfi_iova;
-    uint64_t tables_iova;
-    size_t tables_bytes;
     uint64_t end_iova;            /* first address after the whole reservation */
 };
 class NativeAdrenoGmuAllocator final {
-    NativeAdrenoMemory icache_,dummy_,debug_,log_,hfi_,tables_;
+    NativeAdrenoMemory icache_,dummy_,debug_,log_,hfi_;
+    NativeAdrenoTablePages tables_;
     NativeAdrenoGmuMemoryLayout layout_{};
     uint64_t handles_[5]{};
     bool ready_=false;
@@ -57,12 +57,12 @@ public:
     NativeAdrenoMemory &debug() {return debug_;}
     NativeAdrenoMemory &log() {return log_;}
     NativeAdrenoMemory &hfi() {return hfi_;}
-    NativeAdrenoMemory &tables() {return tables_;}
+    NativeAdrenoTablePages &tables() {return tables_;}
     const NativeAdrenoMemory &icache() const {return icache_;}
     const NativeAdrenoMemory &dummy() const {return dummy_;}
     const NativeAdrenoMemory &debug() const {return debug_;}
     const NativeAdrenoMemory &log() const {return log_;}
     const NativeAdrenoMemory &hfi() const {return hfi_;}
-    const NativeAdrenoMemory &tables() const {return tables_;}
+    const NativeAdrenoTablePages &tables() const {return tables_;}
 };
 #endif

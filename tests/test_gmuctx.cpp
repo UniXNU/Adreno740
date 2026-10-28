@@ -57,8 +57,8 @@ int main()
         CHECK(report.smr==((1u<<31)|5));
         CHECK(report.cbar==mmio[(0x1000+4)/4]);
         CHECK(report.sctlr==mmio[cb/4] && (report.sctlr&1));
-        /* TTBR0 holds the table pool and ASID 1; TTBR1 is unused. */
-        CHECK(report.ttbr0==((uint64_t(1)<<48)|context.allocator().tables().spans()[0].physical));
+        /* TTBR0 holds the root table page and ASID 1; TTBR1 is unused. */
+        CHECK(report.ttbr0==((uint64_t(1)<<48)|context.allocator().tables().pagePhysical(0)));
         uint64_t ttbr1;std::memcpy(&ttbr1,mmio+(cb+0x28)/4,8);
         CHECK((ttbr1&0x0000fffffffff000)==0);
         CHECK(context.bringUp(&io,1,1,2,5,nullptr,&report)==kIOReturnBusy);   /* one attempt per object */
@@ -99,7 +99,8 @@ int main()
         NativeAdrenoGmuContextReport report;
         CHECK(context.bringUp(&io,1,1,2,5,nullptr,&report)==kIOReturnSuccess && report.output_bits==36);
         CHECK((mmio[(cb+0x10)/4]&7)==1);
-        CHECK(context.allocator().tables().spans()[0].physical+0x1000*NativeAdrenoGmuContext::TablePages<=(UINT64_C(1)<<36));
+        for(size_t i=0;i<context.allocator().tables().pageCount();++i)
+            CHECK(context.allocator().tables().pagePhysical(i)+0x1000<=(UINT64_C(1)<<36));
     }
     /* An OAS code the kit cannot encode is refused before any allocation or write. */
     {

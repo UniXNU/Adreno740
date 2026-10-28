@@ -105,9 +105,11 @@ volatile uint32_t native_adreno_mount_fail[4];
 struct NativeAdrenoAskerRecord {char name[20]; uint32_t reads;};
 struct NativeAdrenoAskerRecord native_adreno_metal_askers[12];
 }
-/* Every user connection's GPU addresses: the board's VA range (GpuPowerProbe gDeviceInfo) of its own address space, above the kernel
- * buffers' fixed addresses that each address space also maps. A kernel connection (the board's self-test) maps where it likes. */
-static const uint64_t kClientWindowStart=0x20000000ull,kClientWindowBytes=0x60000000ull;
+/* Every user connection's GPU addresses: its own address space from GpuClientVaStart (msm ADRENO_VM_START) to the aperture's end, above
+ * the kernel buffers' fixed addresses and the GMEM window that each address space also maps, as msm's per-process VM
+ * (adreno_private_vm_size: BIT(ias) - ADRENO_VM_START). A kernel connection (the board's self-test) maps where it likes. */
+static uint64_t clientWindowBytes(uint32_t input_bits)
+{return input_bits>32 && input_bits<=48?(UINT64_C(1)<<input_bits)-GpuClientVaStart:0;}
 /* The board's qcom_scm_set_gpu_smmu_aperture result ([0] availability, [1] the call's x0: 0 is success); [2] the CP switch check's
  * status, [3] the table mode in use. */
 extern "C" {volatile uint32_t native_adreno_cp_aperture[4];
@@ -257,7 +259,8 @@ bool AGXDeviceUserClient::mount(bool kernel)
         IOReturn scoped=kIOReturnSuccess;
         if(!kernel) {
             base=g.next_queue_base;
-            scoped=base>UINT32_MAX-NativeAdrenoAbiMaxQueues?kIOReturnNoResources:core->setScope(base,kClientWindowStart,kClientWindowBytes);
+            const uint64_t window=clientWindowBytes(g.input_bits);
+            scoped=base>UINT32_MAX-NativeAdrenoAbiMaxQueues || !window?kIOReturnNoResources:core->setScope(base,GpuClientVaStart,window);
         } else scoped=core->setScope(0,0,0);
         if(scoped==kIOReturnSuccess) {
             if(!kernel)g.next_queue_base=base+NativeAdrenoAbiMaxQueues;

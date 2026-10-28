@@ -11,8 +11,6 @@ extern "C" volatile uint32_t native_adreno_pool_stats[8],native_adreno_pool_stat
 extern "C" volatile uint32_t native_adreno_wc_enabled,native_adreno_pool_wc,native_adreno_owned_coherent,native_adreno_io_coherent;
 static const uint64_t kIovas[GpuBufferCount]={GpuSqeIova,GpuRingIova,GpuMemptrsIova,GpuPwrupIova,GpuScratchIova};
 static const size_t kBytes[GpuBufferCount]={GpuSqeBytes,GpuRingBytes,GpuPageBytes,GpuPageBytes,GpuPageBytes};
-/* The process address spaces' cacheable table blocks: [0] reserved at bring-up, [1] VMs that took one, [2] VMs that took the BO pool. */
-extern "C" {volatile uint32_t native_adreno_table_blocks[3];}
 IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,unsigned asid,const unsigned slots[2],
     const uint16_t sids[2],void (*progress)(uint32_t),NativeAdrenoGmuContextReport *report)
 {
@@ -32,6 +30,8 @@ IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,uns
         report->output_bits=code<6?oas_bits[code]:0;
         if(report->output_bits>40)report->output_bits=40;
         if(!report->output_bits)status=kIOReturnUnsupported;
+        /* Stage-1 input size: smmu->va_size from ID2.UBS (arm_smmu_init_domain_context: ias = smmu->va_size for AArch64 stage 1). */
+        input_bits_=NativeAdrenoSmmuInputBits(report->id2);
     }
     /* The BO pool is taken first, while the VM still has long contiguous runs (the board sets the size from sheng-gpu-pool; 0 = scattered BOs only).
      * A pool that cannot be had at one size is tried at the next smaller; none is not an error. */
@@ -44,32 +44,12 @@ IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,uns
         /* Not fatal: without it each pooled BO changes its pages' attribute itself, as a scattered one does. */
         if(native_adreno_wc_enabled && !native_adreno_owned_coherent && NativeAdrenoMemory::poolBytes())native_adreno_pool_wc=(uint32_t)NativeAdrenoMemory::writeCombinePool()|1u<<31;
     }
-    if(!status)status=tables_.allocate(TablePages*0x1000,report->output_bits,true,TablePages*0x1000);
-    /* The process address spaces' table blocks, cacheable and contiguous, while long runs are still free. None is not an error. */
-    if(!status) {
-        const uint64_t limit=UINT64_C(1)<<report->output_bits;
-        IOBufferMemoryDescriptor *blocks=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
-            static_cast<IOOptionBits>(kIODirectionInOut)|static_cast<IOOptionBits>(kIOMemoryMapperNone)|kIOMemoryPhysicallyContiguous,
-            TableBlocks*TablePages*0x1000,(limit-1)&~UINT64_C(4095));
-        if(blocks && blocks->prepare()==kIOReturnSuccess) {
-            IOByteCount length=0;
-            const addr64_t physical=blocks->getPhysicalSegment(0,&length,kIOMemoryMapperNone);
-            unsigned char *virt=static_cast<unsigned char *>(blocks->getBytesNoCopy());
-            if(physical && !(physical&4095) && virt && !((uintptr_t)virt&4095) && length>=TableBlocks*TablePages*0x1000 &&
-                physical+TableBlocks*TablePages*0x1000<=limit) {
-                table_blocks_=blocks;table_virt_=virt;table_physical_=physical;blocks=nullptr;
-                native_adreno_table_blocks[0]=TableBlocks;
-            } else (void)blocks->complete();
-        }
-        if(blocks)blocks->release();
-    }
     for(unsigned i=0;!status && i<GpuBufferCount;++i)
         status=buffers_[i].allocate(kBytes[i],report->output_bits,true,kBytes[i]);
     if(!status) {
         step(Prepare);
-        status=smmu_.prepare(&tables_,0,0,GpuApertureBytes,NativeAdrenoSmmuContext::MaxLeaves,
-            bank,asid,1000,report->output_bits);
-        if(!status)smmu_.setAliasScratch(alias_scratch_,sizeof alias_scratch_/sizeof *alias_scratch_);
+        const uint64_t aperture=UINT64_C(1)<<input_bits_;
+        status=smmu_.prepare(&tables_,0,0,aperture,size_t(aperture/4096),bank,asid,1000,report->output_bits,input_bits_);
     }
     if(!status) {
         step(Program);
@@ -134,27 +114,12 @@ IOReturn NativeAdrenoGpuContext::createVm(NativeAdrenoProcessVm **out)
     NativeAdrenoProcessVm *p=new NativeAdrenoProcessVm;
     if(!p)return kIOReturnNoMemory;
     const unsigned bits=uint32_t(smmu_.arena()->config.output_bits);
-    /* From the BO pool, contiguous and reserved at bring-up: 4 MiB of free contiguous pages is rarely to be had once the system ran
-     * (i-pvm5: every try scanned 1.2 million pages for nothing, 50..200 ms each). Without room in the pool allocate() asks the allocator. */
-    IOReturn status=kIOReturnNoResources;
-    for(unsigned i=0;table_blocks_ && i<TableBlocks;++i)if(!(table_used_>>i&1)) {
-        status=p->tables_.borrow(table_virt_+(size_t)i*TablePages*0x1000,table_physical_+(uint64_t)i*TablePages*0x1000,TablePages*0x1000);
-        if(!status) {table_used_|=1u<<i;p->table_block_=(int)i;native_adreno_table_blocks[1]=native_adreno_table_blocks[1]+1;}
-        break;
-    }
-    if(status) {
-        status=p->tables_.allocate(TablePages*0x1000,bits,true,TablePages*0x1000,true);
-        native_adreno_table_blocks[2]=native_adreno_table_blocks[2]+1;
-    }
-    native_adreno_table_switches[7]=1;
-    if(!status) {
-        native_adreno_table_switches[7]=2;
-        status=NativeAdrenoPrepareSmmuMemory(&p->tables_,32,bits,0,GpuApertureBytes,0,NativeAdrenoSmmuContext::MaxLeaves,
-            &p->arena_,&p->state_,&p->visibility_);
-    }
+    const uint64_t aperture=UINT64_C(1)<<input_bits_;
+    native_adreno_table_switches[7]=2;
+    IOReturn status=NativeAdrenoPrepareSmmuMemory(&p->tables_,input_bits_,bits,0,aperture,0,size_t(aperture/4096),
+        &p->arena_,&p->state_,&p->visibility_);
     if(!status) {
         native_adreno_table_switches[7]=3;
-        p->arena_.alias_scratch=alias_scratch_;p->arena_.alias_scratch_entries=sizeof alias_scratch_/sizeof *alias_scratch_;
         /* The kernel table's context image with this table as the lower region and its own ASID. */
         p->config_=*smmu_.configHandle();
         p->config_.lower=&p->arena_.config;p->config_.lower_tables=&p->state_.tables;p->config_.asid=asid;p->config_.ttbr0_switched=1;
@@ -176,11 +141,7 @@ IOReturn NativeAdrenoGpuContext::createVm(NativeAdrenoProcessVm **out)
             bool clean=true;
             for(auto &h:p->handles_)if(h) {if(p->vm_.unmap(h))clean=false;else h=0;}
             if(clean && p->attached_ && p->vm_.detach())clean=false;
-            if(clean && p->tables_.deviceReferences())clean=!p->tables_.retireAfterQuiescence();
-            if(clean && !p->tables_.release()) {
-                if(p->table_block_>=0)table_used_&=~(1u<<p->table_block_);
-                delete p;return status;
-            }
+            if(clean && !p->tables_.release()) {delete p;return status;}
         }
         return status;
     }
@@ -202,10 +163,8 @@ IOReturn NativeAdrenoGpuContext::destroyVm(NativeAdrenoProcessVm *p)
     if(!status)status=p->vm_.detach();
     if(!status) {
         p->attached_=false;
-        /* The prepare's device reference on the table pool, dropped now that no TLB entry of the ASID is left. */
-        if(p->tables_.deviceReferences())status=p->tables_.retireAfterQuiescence();
-        if(!status)status=p->tables_.release();
-        if(!status && p->table_block_>=0) {table_used_&=~(1u<<p->table_block_);p->table_block_=-1;}
+        /* No TLB entry of the ASID is left and the table is not installed: its pages go back to the system. */
+        status=p->tables_.release();
     }
     if(status) {native_adreno_table_switches[6]=uint32_t(status)|0x80000000u;return status;}
     asids_[p->asid_>>6]&=~(1ull<<(p->asid_&63));
@@ -287,6 +246,10 @@ extern "C" IOReturn NativeAdrenoGpuContextBuffers(NativeAdrenoGpuBuffer out[5])
         out[i]={m.spans()[0].physical,m.bytes(),kIovas[i]};
     }
     return kIOReturnSuccess;
+}
+extern "C" unsigned NativeAdrenoGpuContextInputBits()
+{
+    return board_gpu_context && board_gpu_context->ready()?board_gpu_context->inputBits():0;
 }
 extern "C" NativeAdrenoVm *NativeAdrenoGpuContextVm()
 {

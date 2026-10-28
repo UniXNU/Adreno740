@@ -6,14 +6,14 @@
 
 /* One single-region GPU SMMU context (lower/TTBR0, as the GMU's own 0..2 GiB
  * space, or upper/TTBR1), composed from the qualified kits:
- * prepare an inactive native4K table pool, program the context bank through the
+ * prepare an inactive native4K table (its pages taken on demand), program the context bank through the
  * real register sequence, then attach the caller's streams. Every step is
  * separate and can only run in order; a failure leaves the earlier state
  * retained and marks this object unusable for further programming. The bank
  * number, ASID and stream slots are required inputs and are never guessed.
  * No power, clock, reset, fault-interrupt or global SMMU setup is performed. */
 class NativeAdrenoSmmuContext final {
-    NativeAdrenoMemory *tables_=nullptr;
+    NativeAdrenoTablePages *tables_=nullptr;
     ArmSmmu4KLiveArena arena_{};
     ArmSmmu4KLiveState state_{};
     ArmSmmu4KLiveVisibility visibility_{};
@@ -30,12 +30,11 @@ public:
     ~NativeAdrenoSmmuContext()=default;
     NativeAdrenoSmmuContext(const NativeAdrenoSmmuContext &)=delete;
     NativeAdrenoSmmuContext &operator=(const NativeAdrenoSmmuContext &)=delete;
-    /* A 2 GiB lower aperture, the GMU's, is 524288 leaves. */
-    enum : size_t {MaxLeaves=size_t(1)<<19};
-    /* iova/bytes describe the aperture in the chosen region; the pool must be contiguous. */
-    /* output_bits: the context's output size, at most the SMMU's ID2.OAS (Linux uses OAS for stage 1). */
-    IOReturn prepare(NativeAdrenoMemory *tables,unsigned upper,uint64_t iova,size_t bytes,
-        size_t leaf_budget,unsigned bank,unsigned asid,unsigned poll_budget,unsigned output_bits=40);
+    /* iova/bytes describe the aperture in the chosen region; leaf_budget bounds its mapped pages (the aperture's own page count).
+     * input_bits: the region's input size (NativeAdrenoSmmuInputBits of ID2); output_bits: the context's output size, at most the
+     * SMMU's ID2.OAS (Linux uses OAS for stage 1). tables must be empty: prepare takes the root from them. */
+    IOReturn prepare(NativeAdrenoTablePages *tables,unsigned upper,uint64_t iova,uint64_t bytes,
+        size_t leaf_budget,unsigned bank,unsigned asid,unsigned poll_budget,unsigned output_bits,unsigned input_bits);
     /* Reads actual IDs, programs and enables exactly this bank. */
     IOReturn program(const ArmSmmu4KIo *);
     /* Attach the caller's exact stream routes to the programmed bank. */
@@ -52,9 +51,6 @@ public:
     const ArmSmmu4KLiveArena *arena() const {return &arena_;}
     /* Handles for a NativeAdrenoVm that will map buffers through this bank. */
     ArmSmmu4KLiveArena *arenaHandle() {return &arena_;}
-    /* Scratch the kit's physical-alias checks sort in (ArmSmmu4KLiveArena::alias_scratch), owned by the caller for this context's
-     * lifetime; without it those checks compare pairwise. Only after prepare. */
-    void setAliasScratch(uint32_t *entries,size_t count) {arena_.alias_scratch=entries;arena_.alias_scratch_entries=entries?count:0;}
     ArmSmmu4KLiveState *stateHandle() {return &state_;}
     ArmSmmu4KContextConfig *configHandle() {return &config_;}
     ArmSmmu4KStreamState *streamsHandle() {return &streams_;}

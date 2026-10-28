@@ -25,13 +25,10 @@ static void reverse(ArmSmmu4KRange *first,ArmSmmu4KRange *last)
 {while(first<last && first<--last) {const ArmSmmu4KRange t=*first;*first++=*last;*last=t;}}
 static bool validBinding(const NativeAdrenoVmRegion &r,unsigned upper)
 {
-    return r.tables && r.arena && r.state && !r.tables->quarantined() &&
-        r.tables->deviceReferences() && r.tables->spanCount()==1 &&
-        r.tables->spans()[0].bytes==r.tables->bytes() && !r.tables->spans()[0].offset &&
-        r.arena->mapping==r.tables->mapping() && r.arena->upper_region==upper &&
-        r.arena->config.table_physical==r.tables->spans()[0].physical &&
-        r.arena->capacity_pages==r.tables->bytes()/4096 && r.state->prepared &&
-        !r.state->poisoned && !r.state->tables.leaf_pages;
+    return r.tables && r.arena && r.state && !r.tables->quarantined() && r.tables->provider() &&
+        r.arena->pages==r.tables->provider() && r.arena->upper_region==upper &&
+        r.tables->provider()->find(r.tables->provider()->cookie,r.arena->config.table_physical) &&
+        r.state->prepared && !r.state->poisoned && !r.state->tables.leaf_pages;
 }
 ArmSmmu4KLiveRegion NativeAdrenoVm::region(unsigned upper) const
 {
@@ -110,20 +107,18 @@ IOReturn NativeAdrenoVm::attach(const ArmSmmu4KIo *io,ArmSmmu4KContextConfig *co
         !budget || budget>1048576 || (lower && !validBinding(*lower,0)) || (upper && !validBinding(*upper,1)))
         return kIOReturnBadArgument;
     const size_t first=capacity<1024?capacity:1024;
-    ranges_=IONewData(ArmSmmu4KRange,first);if(!ranges_)return kIOReturnNoMemory;
-    mappings_=IONewData(Mapping,64);
-    if(!mappings_) {IODeleteData(ranges_,ArmSmmu4KRange,first);return kIOReturnNoMemory;}
+    ranges_=IONewData(ArmSmmu4KRange,first);alias_scratch_=IONewData(uint32_t,first);mappings_=IONewData(Mapping,64);
+    capacity_=first;mapping_capacity_=64;
+    if(!ranges_ || !alias_scratch_ || !mappings_ || !index_.allocate()) {freeTables();return kIOReturnNoMemory;}
     memset(mappings_,0,sizeof(Mapping)*64);
-    if(!index_.allocate()) {IODeleteData(ranges_,ArmSmmu4KRange,first);IODeleteData(mappings_,Mapping,64);return kIOReturnNoMemory;}
     free_hint_=0;high_=0;memset(class_spans_,0,sizeof(class_spans_));
-    capacity_=first;max_capacity_=capacity;mapping_capacity_=64;io_=*io;context_=context;streams_=streams;budget_=budget;
+    max_capacity_=capacity;io_=*io;context_=context;streams_=streams;budget_=budget;
     if(lower)regions_[0]=*lower;if(upper)regions_[1]=*upper;
     for(unsigned i=0;i<2;++i)if(regions_[i].arena) {
         if(NativeAdrenoBindSmmuVisibility(regions_[i].tables,&visibility_[i])!=kIOReturnSuccess) {
-            IODeleteData(ranges_,ArmSmmu4KRange,capacity_);IODeleteData(mappings_,Mapping,mapping_capacity_);index_.release();
-            ranges_=nullptr;mappings_=nullptr;capacity_=mapping_capacity_=0;
-            regions_[0]={};regions_[1]={};return kIOReturnBadArgument;
+            freeTables();regions_[0]={};regions_[1]={};return kIOReturnBadArgument;
         }
+        regions_[i].arena->alias_scratch=alias_scratch_;regions_[i].arena->alias_scratch_entries=capacity_;
     }
     attached_=true;
     ArmSmmu4KStatus status=observe();if(status)return fail(status);
@@ -133,10 +128,18 @@ IOReturn NativeAdrenoVm::detach()
 {
     if(poisoned_ || objects_ || spanCount())return kIOReturnBusy;
     if(!attached_)return kIOReturnNotReady;
-    IODeleteData(ranges_,ArmSmmu4KRange,capacity_);IODeleteData(mappings_,Mapping,mapping_capacity_);index_.release();
-    ranges_=nullptr;mappings_=nullptr;
+    for(auto &r:regions_)if(r.arena) {r.arena->alias_scratch=nullptr;r.arena->alias_scratch_entries=0;}
+    freeTables();
     attached_=false;regions_[0]={};regions_[1]={};context_=nullptr;streams_=nullptr;capacity_=max_capacity_=mapping_capacity_=0;
     return kIOReturnSuccess;
+}
+void NativeAdrenoVm::freeTables()
+{
+    if(ranges_)IODeleteData(ranges_,ArmSmmu4KRange,capacity_);
+    if(alias_scratch_)IODeleteData(alias_scratch_,uint32_t,capacity_);
+    if(mappings_)IODeleteData(mappings_,Mapping,mapping_capacity_);
+    index_.release();
+    ranges_=nullptr;alias_scratch_=nullptr;mappings_=nullptr;capacity_=mapping_capacity_=0;
 }
 bool NativeAdrenoVm::growRanges(size_t needed)
 {
@@ -145,9 +148,12 @@ bool NativeAdrenoVm::growRanges(size_t needed)
     size_t size=capacity_*2;if(size<needed)size=needed;if(size>max_capacity_)size=max_capacity_;
     ArmSmmu4KRange *made=IONewData(ArmSmmu4KRange,size);
     if(!made)return false;
+    uint32_t *scratch=IONewData(uint32_t,size);
+    if(!scratch) {IODeleteData(made,ArmSmmu4KRange,size);return false;}
     memcpy(made,ranges_,spanCount()*sizeof(*ranges_));
-    IODeleteData(ranges_,ArmSmmu4KRange,capacity_);
-    ranges_=made;capacity_=size;
+    IODeleteData(ranges_,ArmSmmu4KRange,capacity_);IODeleteData(alias_scratch_,uint32_t,capacity_);
+    ranges_=made;alias_scratch_=scratch;capacity_=size;
+    for(auto &r:regions_)if(r.arena) {r.arena->alias_scratch=alias_scratch_;r.arena->alias_scratch_entries=capacity_;}
     return true;
 }
 bool NativeAdrenoVm::growMappings()
@@ -214,8 +220,7 @@ IOReturn NativeAdrenoVm::preflight(const NativeAdrenoMemory *memory,unsigned upp
         if(span.offset!=offset || !span.physical || !span.bytes || ((span.physical|span.bytes)&4095) ||
             span.bytes>memory->bytes()-offset || span.physical>=limit || span.bytes>limit-span.physical)
             return kIOReturnBadArgument;
-        for(const auto &r:regions_)if(r.arena && overlap(span.physical,span.bytes,
-            r.arena->config.table_physical,r.arena->capacity_pages*UINT64_C(4096)))return kIOReturnBadArgument;
+        for(const auto &r:regions_)if(r.arena && r.tables->overlaps(span.physical,span.bytes))return kIOReturnBadArgument;
         offset+=span.bytes;
     }
     if(offset!=memory->bytes())return kIOReturnBadArgument;
@@ -266,7 +271,7 @@ IOReturn NativeAdrenoVm::preflight(const NativeAdrenoMemory *memory,unsigned upp
  * 5000-6000 spans each, every one checked against every other range. */
 bool NativeAdrenoVm::exclusivePages(const NativeAdrenoMemory *memory,unsigned cls) const
 {
-    if(!memory->imported())return true;
+    if(!memory || !memory->imported())return true;   /* preflight refuses a null one */
     size_t imports=0;for(size_t k=0;k<16;++k)imports+=import_spans_[k];
     if(imports!=import_spans_[cls&15])return false;
     const uint64_t pool=NativeAdrenoMemory::poolPhysical();const size_t poolBytes=NativeAdrenoMemory::poolBytes();
@@ -370,6 +375,14 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t 
             high.arena?&high:nullptr,upper,&visibility_[upper],changes,spans,budget_,&update):
         ArmSmmu4KLiveUpdateContextBatch(&io_,streams_->bank,context_,lower.arena?&lower:nullptr,
             high.arena?&high:nullptr,upper,&visibility_[upper],changes,spans,1,budget_,&update);
+    if(status==ArmSmmu4KCapacity) {
+        /* No table page could be had: the kit linked only empty tables and wrote no leaf, so the map is undone and the VM stays usable,
+         * as a failed io-pgtable map returns -ENOMEM. */
+        const size_t slot=size_t(record-mappings_);*record={};--objects_;if(slot<free_hint_)free_hint_=slot;
+        if(memory->retireAfterQuiescence()!=kIOReturnSuccess)return fail(ArmSmmu4KStateMismatch);
+        result_.operation=status;
+        return kIOReturnNoMemory;
+    }
     if(status)return fail(status);
     clock.lap(0,3);
     insert(spans,upper);record->mapped_spans=spans;result_.completed_spans=spans;
@@ -583,12 +596,14 @@ bool NativeAdrenoVm::leafPhysical(uint64_t target,uint64_t *physical) const
 {
     if(!physical || !attached_)return false;
     for(const auto &region:regions_) {
-        const NativeAdrenoMemory *tables=region.tables;
-        if(!tables || !tables->mapping() || tables->spanCount()!=1)continue;
-        const volatile uint64_t *words=static_cast<const volatile uint64_t *>(tables->mapping());
-        for(size_t i=0;i<tables->bytes()/8;++i) {
-            const uint64_t d=words[i];
-            if((d&3)==3 && (d&UINT64_C(0x0000fffffffff000))==target) {*physical=tables->spans()[0].physical+8*i;return true;}
+        const NativeAdrenoTablePages *tables=region.tables;
+        if(!tables)continue;
+        for(size_t p=0;p<tables->pageCount();++p) {
+            const volatile uint64_t *words=tables->pageMapping(p);
+            for(size_t i=0;i<512;++i) {
+                const uint64_t d=words[i];
+                if((d&3)==3 && (d&UINT64_C(0x0000fffffffff000))==target) {*physical=tables->pagePhysical(p)+8*i;return true;}
+            }
         }
     }
     return false;

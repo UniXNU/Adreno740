@@ -30,12 +30,13 @@ static int read64(void *c,size_t at,uint64_t *v)
 {CHECK(c==&mf && at%8==0 && at<=SMMU_BYTES-8);if(event())return 1;std::memcpy(v,mmio+at/4,8);return 0;}
 static int write32(void *c,size_t at,uint32_t v)
 {CHECK(c==&mf && at%4==0 && at<=SMMU_BYTES-4);int f=event();if(f && !mf.after)return 1;mmio[at/4]=v;return f;}
-static int write64(void *c,size_t at,uint64_t v){(void)c;(void)at;(void)v;CHECK(0);return 1;}
+static int write64(void *c,size_t at,uint64_t v)
+{CHECK(c==&mf && at%8==0 && at<=SMMU_BYTES-8);int f=event();if(f && !mf.after)return 1;std::memcpy(mmio+at/4,&v,8);return f;}
 static int barrier(void *c){CHECK(c==&mf);return event();}
 int main()
 {
     /* A GMU-only context: lower region covering the whole 0..2 GiB GMU space, no upper region. */
-    NativeAdrenoMemory tables;
+    NativeAdrenoTablePages tables;
     ArmSmmu4KLiveArena arena;
     ArmSmmu4KLiveState state{};
     ArmSmmu4KLiveVisibility visibility;
@@ -46,10 +47,9 @@ int main()
     mmio[0x24/4]=0x40000010;mmio[0x28/4]=0x1433;mmio[0]=0x436;
     for(unsigned i=0;i<8;++i)mmio[(0xc00+4*i)/4]=0x20000;
     mmio[0x800/4]=1u<<31|9;mmio[0xc00/4]=3;
-    CHECK(tables.allocate(1027*4096,40,true,1027*4096)==kIOReturnSuccess);
-    CHECK(NativeAdrenoPrepareSmmuMemory(&tables,32,40,0,GmuApertureBytes,0,size_t(1)<<19,
+    CHECK(NativeAdrenoPrepareSmmuMemory(&tables,32,40,0,GmuApertureBytes,0,GmuApertureBytes/4096,
         &arena,&state,&visibility)==kIOReturnSuccess);
-    CHECK(state.tables.table_pages==1027);
+    CHECK(state.tables.table_pages==1 && tables.pageCount()==1);
     context=(ArmSmmu4KContextConfig){.lower=&arena.config,.upper=nullptr,
         .lower_tables=&state.tables,.upper_tables=nullptr,.id0=mmio[0x20/4],
         .id2=mmio[0x28/4],.asid=1,.coherent_walk=1,.stall_on_fault=0,
@@ -66,7 +66,7 @@ int main()
     CHECK(vm.attach(&io,&context,&streams,&lower,nullptr,64,2000)==kIOReturnSuccess);
     CHECK(vm.spanCount()==0 && vm.objectCount()==0);
 
-    NativeAdrenoGmuSizes sizes{0x4000,0x1000,0x2000,0x1000,0x1000,0x10000};
+    NativeAdrenoGmuSizes sizes{0x4000,0x1000,0x2000,0x1000,0x1000};
     NativeAdrenoGmuAllocator allocator;
     CHECK(allocator.mapInto(&vm)==kIOReturnBadArgument); /* not allocated yet */
     CHECK(allocator.allocate(sizes)==kIOReturnSuccess);
@@ -83,7 +83,6 @@ int main()
     CHECK(allocator.unmapFrom(&vm)==kIOReturnSuccess);
     CHECK(allocator.release()==kIOReturnSuccess);
     CHECK(vm.detach()==kIOReturnSuccess);
-    CHECK(tables.retireAfterQuiescence()==kIOReturnSuccess);
     CHECK(tables.release()==kIOReturnSuccess);
     CHECK(fixture.live.empty() && fixture.metadata.empty());
     std::printf("PASS: 1 lower-region fixed-address GMU payload mapping and unmap, 1 pre-allocation refusal and 1 repeat-map refusal over a software SMMU peer\n");

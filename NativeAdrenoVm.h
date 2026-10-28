@@ -5,7 +5,7 @@
 #include "ArmSmmu4KStreams.h"
 #include "NativeAdrenoHandleIndex.h"
 struct NativeAdrenoVmRegion {
-    NativeAdrenoMemory *tables;
+    NativeAdrenoTablePages *tables;
     ArmSmmu4KLiveArena *arena;
     ArmSmmu4KLiveState *state;
 };
@@ -58,11 +58,15 @@ class NativeAdrenoVm final {
     ArmSmmu4KContextConfig *context_=nullptr;
     ArmSmmu4KStreamState *streams_=nullptr;
     ArmSmmu4KRange *ranges_=nullptr;
+    /* The kit's physical-alias sort scratch (ArmSmmu4KLiveArena::alias_scratch) for this VM's regions: one entry per range, grown with
+     * ranges_, as the smaller compared side never holds more ranges than the table. */
+    uint32_t *alias_scratch_=nullptr;
     size_t capacity_=0,lower_count_=0,upper_count_=0,objects_=0;
     /* Both tables grow on demand (a VM per GPU process: most use a few hundred objects): ranges_ up to max_capacity_ (attach's capacity),
      * mappings_ up to NativeAdrenoVmMaxObjects. */
     size_t max_capacity_=0,mapping_capacity_=0;
     bool growRanges(size_t needed);
+    void freeTables();
     bool growMappings();
     unsigned budget_=0;
     uint64_t next_handle_=1;
