@@ -191,8 +191,8 @@ static void nativeAdrenoHangcheck(void *,wait_result_t)
                 if(result.guilty==g.vm)native_adreno_recovery[7]=native_adreno_recovery[7]+1;
                 if(status)native_adreno_recovery[2]=native_adreno_recovery[2]+1;
                 else native_adreno_recovery[1]=native_adreno_recovery[1]+1;
-                /* msm: a hang no submission owns, or a GPU that did not come back, is everyone's fault. */
-                if(status || !result.guilty || result.guilty==g.vm)g.status.noteFault();
+                /* Only a GPU that did not come back is everyone's loss; after a restart every client goes on, as Metal's do. */
+                if(status)g.status.noteFault();
                 if(!status)g.status.noteSuspend();
             }
         }

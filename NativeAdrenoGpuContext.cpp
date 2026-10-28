@@ -207,6 +207,8 @@ IOReturn NativeAdrenoGpuContext::endFault(uint32_t out[4])
     const uint64_t offset=smmu_.stateHandle()->context_offset;
     if(!offset)return kIOReturnNotReady;
     if(io->read32(io->cookie,(size_t)offset+0x58,&out[0]))return kIOReturnIOError;
+    /* FSR bits 9-10 are the context's format (0x400: AArch64), not a fault: only the fault bits latch one. */
+    out[0]&=~UINT32_C(0x600);
     if(!out[0])return kIOReturnSuccess;
     if(io->read32(io->cookie,(size_t)offset+0x60,&out[1]) || io->read32(io->cookie,(size_t)offset+0x64,&out[2]) ||
         io->read32(io->cookie,(size_t)offset+0x68,&out[3]))return kIOReturnIOError;

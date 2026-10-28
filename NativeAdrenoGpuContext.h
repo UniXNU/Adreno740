@@ -80,7 +80,7 @@ public:
     IOReturn clearFault(uint32_t fsr,uint32_t far[3]);
     /* msm's handling of a GPU context fault before a restart (arm_smmu_context_fault, then msm_iommu_resume_translation with terminate):
      * a stalled transaction (FSR.SS) is terminated through CB_RESUME and the latched FSR written back. out[] = FSR, FAR lo, FAR hi,
-     * FSYNR0 as found; FSR 0 when no fault was latched. */
+     * FSYNR0 as found; FSR (its fault bits) 0 when no fault was latched. */
     IOReturn endFault(uint32_t out[4]);
     /* The bank's TTBR0 as the SMMU holds it now. */
     IOReturn readTtbr0(uint64_t *out) const;
