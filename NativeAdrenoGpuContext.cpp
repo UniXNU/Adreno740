@@ -8,7 +8,7 @@
 
 extern "C" volatile uint32_t native_adreno_pool_mib;
 extern "C" volatile uint32_t native_adreno_pool_stats[8],native_adreno_pool_status;
-extern "C" volatile uint32_t native_adreno_wc_enabled,native_adreno_pool_wc;
+extern "C" volatile uint32_t native_adreno_wc_enabled,native_adreno_pool_wc,native_adreno_owned_coherent,native_adreno_io_coherent;
 static const uint64_t kIovas[GpuBufferCount]={GpuSqeIova,GpuRingIova,GpuMemptrsIova,GpuPwrupIova,GpuScratchIova};
 static const size_t kBytes[GpuBufferCount]={GpuSqeBytes,GpuRingBytes,GpuPageBytes,GpuPageBytes,GpuPageBytes};
 /* The process address spaces' cacheable table blocks: [0] reserved at bring-up, [1] VMs that took one, [2] VMs that took the BO pool. */
@@ -42,7 +42,7 @@ IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,uns
             if(pooled==kIOReturnSuccess)break;
         }
         /* Not fatal: without it each pooled BO changes its pages' attribute itself, as a scattered one does. */
-        if(native_adreno_wc_enabled && NativeAdrenoMemory::poolBytes())native_adreno_pool_wc=(uint32_t)NativeAdrenoMemory::writeCombinePool()|1u<<31;
+        if(native_adreno_wc_enabled && !native_adreno_owned_coherent && NativeAdrenoMemory::poolBytes())native_adreno_pool_wc=(uint32_t)NativeAdrenoMemory::writeCombinePool()|1u<<31;
     }
     if(!status)status=tables_.allocate(TablePages*0x1000,report->output_bits,true,TablePages*0x1000);
     /* The process address spaces' table blocks, cacheable and contiguous, while long runs are still free. None is not an error. */

@@ -41,7 +41,8 @@ struct NativeAdrenoAbiParams {
     uint64_t max_bo_bytes;
 };
 enum {
-    NativeAdrenoParamsHostImport = 1  /* BoImport pins the caller's own pages (an IOSurface's) as a BO */
+    NativeAdrenoParamsHostImport = 1,  /* BoImport pins the caller's own pages (an IOSurface's) as a BO */
+    NativeAdrenoParamsOwnedCoherent = 2  /* BOs are cacheable for the CPU and mapped write-back inner-shareable for the GPU (IO coherence): map them with the default cache mode, not write-combined */
 };
 struct NativeAdrenoAbiBoAlloc {
     uint64_t bytes;               /* 4KiB multiple, <= max_bo_bytes */

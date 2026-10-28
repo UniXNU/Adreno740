@@ -2,7 +2,10 @@
 #include "NativeAdrenoUserClient.h"
 extern "C" volatile uint32_t native_adreno_trace_stage;
 /* 0 keeps user BOs cacheable and maintained before every submission (int-070..097); the board sets it from the sheng-gpu-wc boot argument. */
-extern "C" {volatile uint32_t native_adreno_wc_enabled=1;}
+/* sheng-gpu-owned-coherent=1: the GPU's own BOs use the IO-coherent path (CPU write-back view, GPU write-back inner-shareable mapping) instead of
+ * write-combine: no write-combined audit and no cache maintenance per submission. Effective only once the board proved IO coherence. */
+extern "C" {volatile uint32_t native_adreno_wc_enabled=1,native_adreno_owned_coherent=0;extern volatile uint32_t native_adreno_io_coherent;}
+static bool ownedCoherent() {return native_adreno_owned_coherent && native_adreno_io_coherent;}
 /* BoImport record: [0] calls, [1] refused, [2..5] last refusal (status, stage, bytes, address), [6..9] first refusal. Stages 1..3 are this file's
  * checks, 10..19 NativeAdrenoMemory::importTask's. */
 extern "C" {volatile uint64_t native_adreno_import_diag[10];}
@@ -170,7 +173,7 @@ IOReturn NativeAdrenoUserClient::query(NativeAdrenoAbiParams *params)
     if(!open_)return kIOReturnNotReady;
     params->abi_version=NativeAdrenoAbiVersion;
     params->input_bits=input_bits_;params->output_bits=output_bits_;
-    params->flags=NativeAdrenoParamsHostImport;params->max_bo_bytes=UINT64_C(1)<<NativeAdrenoAbiMaxBoBytesShift;
+    params->flags=NativeAdrenoParamsHostImport|(ownedCoherent()?NativeAdrenoParamsOwnedCoherent:0u);params->max_bo_bytes=UINT64_C(1)<<NativeAdrenoAbiMaxBoBytesShift;
     return kIOReturnSuccess;
 }
 /* Per client slot (4, the kernel's own client last): [0] live objects now, [1] their peak, [2] refused BoAllocs, [3] last refusal status,
@@ -222,7 +225,7 @@ IOReturn NativeAdrenoUserClient::allocBoInner(const NativeAdrenoAbiBoAlloc *requ
      * (the kernel's cacheable alias read zeros past the first line too). Turnip maps every BO asking kIOMapWriteCombineCache, the user's
      * cache bits replace the kernel's (IOUserClient::mapClientMemory64), and XNU's view machinery changes the page attribute to match, so
      * the aliases disagreed. A coherent own BO needs a client that asks for a write-back view. */
-    if(!status && native_adreno_wc_enabled)status=entry->memory.makeWriteCombined();
+    if(!status && native_adreno_wc_enabled && !ownedCoherent())status=entry->memory.makeWriteCombined();
     if(status) {
         /* A failed allocation can leave quarantine behind; never reuse it. */
         clear(*entry);
@@ -297,7 +300,7 @@ IOReturn NativeAdrenoUserClient::mapBo(const NativeAdrenoAbiBoMap *request,
      * non-cacheable: their CPU view is write-combined, and a snoop could find a stale line of the kernel's cacheable alias. */
     /* Only memory the GPU never writes is mapped coherent: sysmem passes written through write-back inner-shareable mappings stopped
      * the GPU inside its end-of-pass cache clean (BR and BV idle at the clean events), while non-coherent mappings never did. */
-    const bool coherent=entry->memory.imported() && native_adreno_io_coherent && !(permissions&2u);
+    const bool coherent=(entry->memory.imported() && native_adreno_io_coherent && !(permissions&2u)) || (!entry->memory.imported() && ownedCoherent());
     const IOReturn status=vm_->map(&entry->memory,0,request->iova,permissions,
         coherent?1u:request->writeback,coherent?3u:request->shareability,&handle);
     if(status)return status;
