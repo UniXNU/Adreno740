@@ -98,7 +98,7 @@ struct NativeAdrenoClientRecord {char name[20]; uint32_t opens, refused, closes,
 struct NativeAdrenoClientRecord native_adreno_client_log[8];
 /* The last text line (the plugin's failure reason) each process other than the render server streamed: process name and a 64-byte line. */
 struct NativeAdrenoClientText {char name[20]; char text[64];};
-struct NativeAdrenoClientText native_adreno_client_text[4];
+struct NativeAdrenoClientText native_adreno_client_text[8];
 /* Why the latest mount of a connection failed: [0] 1 no address space, 2 the core's open, 3 the window scope; [1] its IOReturn; [2] the queue base; [3] failures so far. */
 volatile uint32_t native_adreno_mount_fail[4];
 /* Processes that read MetalPluginName (the Metal discovery), first twelve names, with counts. */
@@ -715,9 +715,9 @@ extern "C" IOReturn native_adreno_new_user_client(IOService *provider,task_t own
         connection->setProperty("NativeSandboxGrant",kOSBooleanTrue);
         native_adreno_metal_diag.grants=native_adreno_metal_diag.grants+1;
     }
-    /* limit caps the connections granted to each process name, so one process that crashes on every launch cannot loop forever, and cannot use
-     * up the others' opens; a process other than the render server gets at most eight per boot. */
-    const unsigned cap=strncmp(opener,"backboardd",sizeof opener)?(limit && limit<8?limit:8):limit;
+    /* limit (boot-arg sheng-gpu-metal-opens, default 0 = none) caps the connections granted to each process name. No cap by default: a
+     * client that crashed and restarts (iconservicesagent, i-39b429634) must get the GPU again, or it is left without one for the boot. */
+    const unsigned cap=limit;
     IOLockLock(g.lock);
     NativeAdrenoClientRecord *record=kernel?nullptr:clientRecord(opener);
     const bool capped=cap && record && record->opens>=cap;
