@@ -93,7 +93,7 @@ IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,uns
         NativeAdrenoVmRegion lower={&tables_,smmu_.arenaHandle(),smmu_.stateHandle()};
         /* 65536 spans: 256 MiB of BOs even when every page is its own span. The Metal runtime pools its memory in 64 MiB blocks,
          * which XNU rarely finds physically contiguous; one scattered block is 16384 spans (int-070 ran out at 16384). */
-        status=vm_.attach(io,smmu_.configHandle(),smmu_.streamsHandle(),&lower,nullptr,131072,262144);
+        status=vm_.attach(io,smmu_.configHandle(),smmu_.streamsHandle(),&lower,nullptr,1048576,262144);
     }
     if(!status) {
         step(Map);
@@ -161,7 +161,7 @@ IOReturn NativeAdrenoGpuContext::createVm(NativeAdrenoProcessVm **out)
         p->state_.detached=1;p->state_.context_offset=smmu_.stateHandle()->context_offset;
         NativeAdrenoVmRegion lower={&p->tables_,&p->arena_,&p->state_};
         p->vm_.keepStreamsOnFailure();
-        status=p->vm_.attach(smmu_.ioHandle(),&p->config_,smmu_.streamsHandle(),&lower,nullptr,131072,262144);
+        status=p->vm_.attach(smmu_.ioHandle(),&p->config_,smmu_.streamsHandle(),&lower,nullptr,1048576,262144);
         if(status)native_adreno_table_switches[7]=0x30|uint32_t(p->vm_.lastResult().operation)<<8;
         if(!status)p->attached_=true;
     }

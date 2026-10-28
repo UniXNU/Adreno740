@@ -106,7 +106,7 @@ IOReturn NativeAdrenoVm::attach(const ArmSmmu4KIo *io,ArmSmmu4KContextConfig *co
     size_t capacity,unsigned budget)
 {
     if(attached_ || ranges_ || poisoned_)return kIOReturnBusy;
-    if(!io || !context || !streams || (!lower && !upper) || !capacity || capacity>262144 ||
+    if(!io || !context || !streams || (!lower && !upper) || !capacity || capacity>1048576 ||
         !budget || budget>1048576 || (lower && !validBinding(*lower,0)) || (upper && !validBinding(*upper,1)))
         return kIOReturnBadArgument;
     const size_t first=capacity<1024?capacity:1024;
