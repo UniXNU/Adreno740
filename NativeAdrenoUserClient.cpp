@@ -237,10 +237,13 @@ IOReturn NativeAdrenoUserClient::allocBoInner(const NativeAdrenoAbiBoAlloc *requ
     Entry *entry=free();
     if(!entry)return kIOReturnNoResources;
     /* A scattered allocation costs one VM span per physical page (int-030: 16 MiB came back as 4096 single-page spans, the
-     * whole span table), so larger objects try one contiguous run first and fall back to scattered pages unless the
-     * caller demanded contiguity. */
+     * whole span table), so without a pool larger objects try one contiguous run first and fall back to scattered pages unless the
+     * caller demanded contiguity. With the board's pool, the allocation below already takes a contiguous run from it first; a
+     * run from XNU would scan physical memory for every larger BO once the pool is full (untagged-203fd45bf: 96 MiB searches over
+     * 1.2 million pages, found nothing), as msm never does for a GEM object. */
     IOReturn status=kIOReturnUnsupported;
-    const bool prefer_contiguous=request->contiguous==0 && request->bytes>=NativeAdrenoClientContiguousFirstBytes;
+    const bool prefer_contiguous=request->contiguous==0 && request->bytes>=NativeAdrenoClientContiguousFirstBytes &&
+        !NativeAdrenoMemory::poolBytes();
     if(prefer_contiguous) {
         status=entry->memory.allocate((size_t)request->bytes,output_bits_,true,(size_t)request->bytes,true);
         if(status && !entry->memory.quarantined() && entry->memory.release()==kIOReturnSuccess)status=kIOReturnUnsupported;
