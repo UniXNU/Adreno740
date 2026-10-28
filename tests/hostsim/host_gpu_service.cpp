@@ -3,6 +3,7 @@
  * submit object and user-client core over the authored memory doubles, with a software "CP" that retires every submission at
  * once. It runs no shader and touches no hardware; it exists so the Turnip darwin backend can be driven through a real
  * Vulkan instance before the userspace side ever runs on the tablet. Narrow C interface for the IOKit shim translation unit. */
+#include <unistd.h>
 #include "XnuMemoryFixture.h"
 #include "NativeAdrenoGpuContext.h"
 #include "NativeAdrenoUserClient.h"
@@ -111,6 +112,8 @@ IOReturn translate(IOReturn status) {return status;}
 }
 
 extern "C" {
+/* The kernel KPI the user client names an import's task by; the host stand-in is this process. */
+int proc_selfpid(void) {return getpid();}
 /* Return codes are the fixture's IOReturn values; the shim translates them. */
 int host_gpu_open() {
     std::lock_guard<std::recursive_mutex> guard(serviceLock);

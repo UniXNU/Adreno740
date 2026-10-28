@@ -334,9 +334,9 @@ bool NativeAdrenoGpuService::start(IOService *provider)
                 /* The GMU context at its fixed a6xx_gmu.c addresses (NativeAdrenoGmuContext). The ring, fence,
                  * SQE and power-up list are read by the CP through the GPU's own streams (iommus 0/1) and need
                  * the GPU context, which is not built yet; they are never placed in the GMU context. */
-                const size_t ring_bytes=0x8000,fence_bytes=0x1000;
-                const uint64_t ring_iova=0,fence_iova=0,sqe_iova=0,pwrup_iova=0;
-                const uint64_t sqe_bytes=(reinterpret_cast<uintptr_t>(&native_adreno_sqe_firmware_image_size)&&
+                [[maybe_unused]] const size_t ring_bytes=0x8000,fence_bytes=0x1000;
+                [[maybe_unused]] const uint64_t ring_iova=0,fence_iova=0,sqe_iova=0,pwrup_iova=0;
+                [[maybe_unused]] const uint64_t sqe_bytes=(reinterpret_cast<uintptr_t>(&native_adreno_sqe_firmware_image_size)&&
                     reinterpret_cast<uintptr_t>(native_adreno_sqe_firmware_image))?
                     ((native_adreno_sqe_firmware_image_size+0xfff)&~UINT64_C(0xfff)):0;
                 NativeAdrenoSmmuWindow window{smmu_base,smmu_bytes};
@@ -344,8 +344,8 @@ bool NativeAdrenoGpuService::start(IOService *provider)
                     smmu_write32,smmu_write64,smmu_barrier};
                 NativeAdrenoGmuContextReport report{};
                 IOReturn status=gmu_ctx_.bringUp(&smmu_io,bank,asid,slot,uint16_t(sid),nullptr,&report);
-                NativeAdrenoGmuAllocator &gmu_=gmu_ctx_.allocator();
-                NativeAdrenoVm &vm_=gmu_ctx_.vm();
+                [[maybe_unused]] NativeAdrenoGmuAllocator &gmu_=gmu_ctx_.allocator();
+                [[maybe_unused]] NativeAdrenoVm &vm_=gmu_ctx_.vm();
                 if(status) {
                     IOLog("NativeAdreno: GMU context stopped at step %u status 0x%x; resources retained\n",
                         report.step,status);

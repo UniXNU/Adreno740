@@ -57,10 +57,13 @@ class NativeAdrenoRing final {
     uint32_t next_=0,rptr_shadow_=0,seqno_=0,completed_=0,submissions_=0;
     bool attached_=false,poisoned_=false,reset_pending_=false;
     uint32_t context_=0;
+    /* The GPU page table the CP runs (TTBR0 with its ASID in bits 63:48) and whether the next framed prologue must switch to it. */
+    uint64_t table_=0;
+    bool table_pending_=false;
     IOReturn poison();
     IOReturn writeWptr(uint32_t value);
     IOReturn readRptr(uint32_t *);
-    IOReturn emitPrologue(uint32_t at,bool reset,uint32_t *end);
+    IOReturn emitPrologue(uint32_t at,bool reset,bool table,uint32_t *end);
     IOReturn emitFence(uint32_t at,uint32_t seqno,uint32_t *end);
     IOReturn emitFramedFence(uint32_t at,uint32_t seqno,uint32_t *end);
     IOReturn submitWords(const uint32_t *words,size_t word_count,uint32_t *fence,bool framed);
@@ -94,6 +97,14 @@ public:
      * keep on-chip timestamps and counters that only that entry resets, so clients sharing the ring without it left one client's
      * counters to the next, and the threads waited on each other for good (int-249..254: BR in a later IB than BV, no fault). */
     void useContext(uint32_t context) {if(context!=context_) {context_=context;reset_pending_=true;}}
+    /* The GPU page table of the submission that comes next (a process's own table: TTBR0 with its ASID in bits 63:48). A change is
+     * a context switch with a table switch: the next framed prologue carries a6xx_set_pagetable()'s CP_SMMU_TABLE_UPDATE, which the CP
+     * executes after every earlier submission has finished (its CP_WAIT_TIMESTAMP), so each submission runs on its own table. */
+    void useTable(uint64_t ttbr0) {if(ttbr0 && ttbr0!=table_) {table_=ttbr0;table_pending_=true;reset_pending_=true;}}
+    /* What the bank holds now, set by the CPU (bring-up, or a table written while the GPU was idle): no packet is due for it. */
+    void tableInstalled(uint64_t ttbr0) {table_=ttbr0;table_pending_=false;}
+    uint64_t table() const {return table_;}
+    bool tablePending() const {return table_pending_;}
     /* Polls the CP-written timestamp after invalidating the fence page. Never
      * writes registers and never advances the ring. Timeout is not poison. */
     NativeAdrenoRingFence wait(uint32_t fence,const NativeAdrenoRingClock *,

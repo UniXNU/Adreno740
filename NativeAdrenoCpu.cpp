@@ -14,6 +14,25 @@ extern "C" unsigned int pmap_cache_attributes(ppnum_t pn);
 extern "C" {volatile uint64_t native_adreno_cache_stats[5];}
 /* Time spent checking and re-asserting write-combined page attributes (NativeAdrenoReassertWriteCombined), for the board page. */
 extern "C" {volatile uint64_t native_adreno_reassert_ticks;}
+extern "C" {volatile uint64_t native_adreno_maint_phase[8][2];}
+void NativeAdrenoNotePhase(unsigned phase,size_t bytes)
+{
+    __atomic_fetch_add(&native_adreno_maint_phase[phase&7][0],1,__ATOMIC_RELAXED);
+    __atomic_fetch_add(&native_adreno_maint_phase[phase&7][1],(bytes+1023)>>10,__ATOMIC_RELAXED);
+}
+bool NativeAdrenoPagesUncached(const NativeAdrenoPhysicalSpan *spans,size_t count)
+{
+    if(!spans || !count)return false;
+    for(size_t i=0;i<count;++i)
+        for(uint64_t offset=0;offset<spans[i].bytes;offset+=4096) {
+            const uint64_t page=spans[i].physical+offset;
+            /* Outside the kernel's DRAM (device memory such as the firmware framebuffer): never cached. */
+            if(page<gPhysBase || page-gPhysBase>=gPhysSize)continue;
+            /* Write-combined, device, posted and real-time attributes all carry VM_MEM_NOT_CACHEABLE; write-through does not. */
+            if(!(pmap_cache_attributes((ppnum_t)(page>>12))&VM_MEM_NOT_CACHEABLE))return false;
+        }
+    return true;
+}
 static void noteMaintenance(uint64_t began,size_t bytes)
 {
     const uint64_t ticks=mach_absolute_time()-began;
@@ -45,23 +64,29 @@ static IOReturn maintainOwnedPages(void *mapping,size_t bytes,NativeAdrenoCacheO
 {
     /* Whole owned pages avoid IVAC corruption of a neighbour's dirty line.
      * No Apple coherent-I/O shortcut is used for these noncoherent DMA paths.
-     * Pin this CPU while reading its CTR and issuing all cache operations. */
+     * Pin this CPU while reading its CTR and issuing a run of cache operations: runs of up to 64 pages, each closed by a DSB on the
+     * core that issued it, so preemption stays off for a bounded time (xnu-12377 panics past 6.25 ms; the 1.5 GiB pool took 41 ms). */
     if(!mapping || !bytes || (((uintptr_t)mapping|bytes)&4095) ||
         bytes>UINTPTR_MAX-(uintptr_t)mapping || op>NativeAdrenoInvalidate || op<NativeAdrenoClean)
         return kIOReturnBadArgument;
-    disable_preemption();
-    uint64_t ctr;__asm__ volatile("mrs %0, ctr_el0":"=r"(ctr));
-    size_t line=(size_t)4<<((ctr>>16)&15);
-    if(line>4096) {enable_preemption();return kIOReturnUnsupported;}
-    uintptr_t address=(uintptr_t)mapping,end=address+bytes;
-    __asm__ volatile("dsb sy":::"memory");
-    for(;address<end;address+=line) {
-        if(op==NativeAdrenoClean)__asm__ volatile("dc cvac, %0"::"r"(address):"memory");
-        else if(op==NativeAdrenoCleanInvalidate)__asm__ volatile("dc civac, %0"::"r"(address):"memory");
-        else __asm__ volatile("dc ivac, %0"::"r"(address):"memory");
+    uintptr_t address=(uintptr_t)mapping;
+    const uintptr_t end=address+bytes;
+    while(address<end) {
+        disable_preemption();
+        uint64_t ctr;__asm__ volatile("mrs %0, ctr_el0":"=r"(ctr));
+        size_t line=(size_t)4<<((ctr>>16)&15);
+        if(line>4096) {enable_preemption();return kIOReturnUnsupported;}
+        const uintptr_t stop=end-address>64*4096?address+64*4096:end;
+        __asm__ volatile("dsb sy":::"memory");
+        for(;address<stop;address+=line) {
+            if(op==NativeAdrenoClean)__asm__ volatile("dc cvac, %0"::"r"(address):"memory");
+            else if(op==NativeAdrenoCleanInvalidate)__asm__ volatile("dc civac, %0"::"r"(address):"memory");
+            else __asm__ volatile("dc ivac, %0"::"r"(address):"memory");
+        }
+        __asm__ volatile("dsb sy":::"memory");
+        enable_preemption();
     }
-    __asm__ volatile("dsb sy":::"memory");
-    enable_preemption();return kIOReturnSuccess;
+    return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoMaintainOwnedPages(void *mapping,size_t bytes,NativeAdrenoCacheOperation op)
 {

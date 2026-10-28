@@ -39,8 +39,16 @@ class NativeAdrenoSubmit final {
         uint32_t queue=0;
         bool active=false;
         uint64_t vm_next=0;   /* NativeAdrenoVm::nextHandle() at submission: a mapping with a handle from it on came later */
+        NativeAdrenoVm *vm=nullptr;   /* the GPU address space (process page table) the job's buffers belong to */
     } jobs_[8];
-    NativeAdrenoVm *vm_=nullptr;
+    NativeAdrenoVm *vm_=nullptr;   /* the default VM: the kernel's table, installed at bring-up */
+    /* Page table switching between processes: mode 0 none (one table for everything), 1 the CPU writes TTBR0 while the GPU is idle,
+     * 2 the CP switches in the ring (CP_SMMU_TABLE_UPDATE). table_vm_ is the VM whose table the GPU runs after the queued work. */
+    unsigned table_mode_=0;
+    NativeAdrenoVm *table_vm_=nullptr;
+    void *table_cookie_=nullptr;
+    IOReturn (*write_table_)(void *,uint64_t ttbr0)=nullptr;
+    IOReturn useVm(NativeAdrenoVm *,const NativeAdrenoRingClock *);
     NativeAdrenoRing *ring_=nullptr;
     NativeAdrenoSubmitStats stats_{};
     void noteStall(uint32_t observed,const NativeAdrenoRingClock *clock);   /* the CP's state for a fence that stopped advancing (native_adreno_stall) */
@@ -66,6 +74,17 @@ public:
      * submissions and is validated by the caller's open queue set. */
     IOReturn submit(const NativeAdrenoSubmitBuffer *,size_t,uint32_t queue,
         uint32_t *fence);
+    /* The same for the buffers of one process's VM (null: the default VM); with table switching on, the GPU runs the job on that
+     * VM's table. The clock is for the CPU switch's wait for the GPU to go idle. */
+    IOReturn submit(NativeAdrenoVm *,const NativeAdrenoSubmitBuffer *,size_t,uint32_t queue,uint32_t *fence,
+        const NativeAdrenoRingClock *);
+    /* Turns on table switching (mode 1 or 2, see table_mode_); write installs a TTBR0 from the CPU (used by mode 1 and to leave a
+     * table that is about to be freed). Only with no job outstanding. */
+    IOReturn setTableSwitching(unsigned mode,IOReturn (*write)(void *,uint64_t),void *cookie);
+    unsigned tableMode() const {return table_mode_;}
+    /* Before a VM is freed: waits for every job, and when the GPU's table is that VM's, installs the default table from the CPU. */
+    IOReturn forgetVm(NativeAdrenoVm *,const NativeAdrenoRingClock *,uint32_t timeout_us);
+    NativeAdrenoVm *defaultVm() const {return vm_;}
     bool queueOutstanding(uint32_t queue) const;
     /* Queues [first, first+count): whether any of their jobs is outstanding, and a wait for every one of them (oldest first) that
      * leaves other queues' jobs alone. Each client of the shared ring owns one such range. */

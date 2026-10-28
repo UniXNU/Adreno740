@@ -2,12 +2,17 @@
 #include "NativeAdrenoGpuContext.h"
 #include "ArmSmmu4KMmio.h"
 #include <IOKit/IOLib.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
+#include <kern/task.h>
+#include "AdrenoPM4.h"
 
 extern "C" volatile uint32_t native_adreno_pool_mib;
 extern "C" volatile uint32_t native_adreno_pool_stats[8],native_adreno_pool_status;
 extern "C" volatile uint32_t native_adreno_wc_enabled,native_adreno_pool_wc;
 static const uint64_t kIovas[GpuBufferCount]={GpuSqeIova,GpuRingIova,GpuMemptrsIova,GpuPwrupIova,GpuScratchIova};
 static const size_t kBytes[GpuBufferCount]={GpuSqeBytes,GpuRingBytes,GpuPageBytes,GpuPageBytes,GpuPageBytes};
+/* The process address spaces' cacheable table blocks: [0] reserved at bring-up, [1] VMs that took one, [2] VMs that took the BO pool. */
+extern "C" {volatile uint32_t native_adreno_table_blocks[3];}
 IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,unsigned asid,const unsigned slots[2],
     const uint16_t sids[2],void (*progress)(uint32_t),NativeAdrenoGmuContextReport *report)
 {
@@ -16,7 +21,7 @@ IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,uns
     if(used_)return kIOReturnBusy;
     if(!io || !slots || !sids || bank>63 || !asid || asid>0xffff || slots[0]>127 || slots[1]>127 ||
         slots[0]==slots[1])return kIOReturnBadArgument;
-    used_=true;
+    used_=true;kernel_asid_=asid;
     IOReturn status=kIOReturnSuccess;
     auto step=[&](Step s) {report->step=s;if(progress)progress(s);};
     step(Allocate);
@@ -40,6 +45,24 @@ IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,uns
         if(native_adreno_wc_enabled && NativeAdrenoMemory::poolBytes())native_adreno_pool_wc=(uint32_t)NativeAdrenoMemory::writeCombinePool()|1u<<31;
     }
     if(!status)status=tables_.allocate(TablePages*0x1000,report->output_bits,true,TablePages*0x1000);
+    /* The process address spaces' table blocks, cacheable and contiguous, while long runs are still free. None is not an error. */
+    if(!status) {
+        const uint64_t limit=UINT64_C(1)<<report->output_bits;
+        IOBufferMemoryDescriptor *blocks=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+            static_cast<IOOptionBits>(kIODirectionInOut)|static_cast<IOOptionBits>(kIOMemoryMapperNone)|kIOMemoryPhysicallyContiguous,
+            TableBlocks*TablePages*0x1000,(limit-1)&~UINT64_C(4095));
+        if(blocks && blocks->prepare()==kIOReturnSuccess) {
+            IOByteCount length=0;
+            const addr64_t physical=blocks->getPhysicalSegment(0,&length,kIOMemoryMapperNone);
+            unsigned char *virt=static_cast<unsigned char *>(blocks->getBytesNoCopy());
+            if(physical && !(physical&4095) && virt && !((uintptr_t)virt&4095) && length>=TableBlocks*TablePages*0x1000 &&
+                physical+TableBlocks*TablePages*0x1000<=limit) {
+                table_blocks_=blocks;table_virt_=virt;table_physical_=physical;blocks=nullptr;
+                native_adreno_table_blocks[0]=TableBlocks;
+            } else (void)blocks->complete();
+        }
+        if(blocks)blocks->release();
+    }
     for(unsigned i=0;!status && i<GpuBufferCount;++i)
         status=buffers_[i].allocate(kBytes[i],report->output_bits,true,kBytes[i]);
     if(!status) {
@@ -86,6 +109,157 @@ IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,uns
     report->status=status;
     return status;
 }
+extern "C" volatile uint32_t native_adreno_table_switches[8];
+IOReturn NativeAdrenoGpuContext::enableSwitching()
+{
+    if(!ready_)return kIOReturnNotReady;
+    if(!smmu_.stateHandle()->context_offset)return kIOReturnNotReady;
+    smmu_.configHandle()->ttbr0_switched=1;
+    return kIOReturnSuccess;
+}
+IOReturn NativeAdrenoGpuContext::writeTtbr0(uint64_t ttbr0)
+{
+    if(!ready_ || !smmu_.configHandle()->ttbr0_switched)return kIOReturnNotReady;
+    ArmSmmu4KProgramResult r;
+    return ArmSmmu4KWriteContextTtbr0(smmu_.ioHandle(),smmu_.stateHandle()->context_offset,ttbr0,&r)==ArmSmmu4KSuccess?
+        kIOReturnSuccess:kIOReturnIOError;
+}
+IOReturn NativeAdrenoGpuContext::createVm(NativeAdrenoProcessVm **out)
+{
+    if(!out)return kIOReturnBadArgument;*out=nullptr;
+    if(!ready_ || !smmu_.configHandle()->ttbr0_switched)return kIOReturnNotReady;
+    unsigned asid=0;
+    for(unsigned a=16;a<65536;++a)if(a!=kernel_asid_ && !(asids_[a>>6]>>(a&63)&1)) {asid=a;break;}
+    if(!asid) {native_adreno_table_switches[6]=uint32_t(kIOReturnNoResources);return kIOReturnNoResources;}
+    NativeAdrenoProcessVm *p=new NativeAdrenoProcessVm;
+    if(!p)return kIOReturnNoMemory;
+    const unsigned bits=uint32_t(smmu_.arena()->config.output_bits);
+    /* From the BO pool, contiguous and reserved at bring-up: 4 MiB of free contiguous pages is rarely to be had once the system ran
+     * (i-pvm5: every try scanned 1.2 million pages for nothing, 50..200 ms each). Without room in the pool allocate() asks the allocator. */
+    IOReturn status=kIOReturnNoResources;
+    for(unsigned i=0;table_blocks_ && i<TableBlocks;++i)if(!(table_used_>>i&1)) {
+        status=p->tables_.borrow(table_virt_+(size_t)i*TablePages*0x1000,table_physical_+(uint64_t)i*TablePages*0x1000,TablePages*0x1000);
+        if(!status) {table_used_|=1u<<i;p->table_block_=(int)i;native_adreno_table_blocks[1]=native_adreno_table_blocks[1]+1;}
+        break;
+    }
+    if(status) {
+        status=p->tables_.allocate(TablePages*0x1000,bits,true,TablePages*0x1000,true);
+        native_adreno_table_blocks[2]=native_adreno_table_blocks[2]+1;
+    }
+    native_adreno_table_switches[7]=1;
+    if(!status) {
+        native_adreno_table_switches[7]=2;
+        status=NativeAdrenoPrepareSmmuMemory(&p->tables_,32,bits,0,GpuApertureBytes,0,NativeAdrenoSmmuContext::MaxLeaves,
+            &p->arena_,&p->state_,&p->visibility_);
+    }
+    if(!status) {
+        native_adreno_table_switches[7]=3;
+        p->arena_.alias_scratch=alias_scratch_;p->arena_.alias_scratch_entries=sizeof alias_scratch_/sizeof *alias_scratch_;
+        /* The kernel table's context image with this table as the lower region and its own ASID. */
+        p->config_=*smmu_.configHandle();
+        p->config_.lower=&p->arena_.config;p->config_.lower_tables=&p->state_.tables;p->config_.asid=asid;p->config_.ttbr0_switched=1;
+        p->state_.detached=1;p->state_.context_offset=smmu_.stateHandle()->context_offset;
+        NativeAdrenoVmRegion lower={&p->tables_,&p->arena_,&p->state_};
+        p->vm_.keepStreamsOnFailure();
+        status=p->vm_.attach(smmu_.ioHandle(),&p->config_,smmu_.streamsHandle(),&lower,nullptr,131072,262144);
+        if(status)native_adreno_table_switches[7]=0x30|uint32_t(p->vm_.lastResult().operation)<<8;
+        if(!status)p->attached_=true;
+    }
+    for(unsigned i=0;!status && i<GpuBufferCount;++i) {
+        native_adreno_table_switches[7]=4+i;
+        status=p->vm_.map(&buffers_[i],0,kIovas[i],i?3u:5u,0,2,&p->handles_[i]);
+    }
+    if(status) {
+        native_adreno_table_switches[6]=uint32_t(status);
+        /* Nothing ran on the table: undo what can be undone; a poisoned VM keeps its memory. */
+        if(!p->vm_.poisoned()) {
+            bool clean=true;
+            for(auto &h:p->handles_)if(h) {if(p->vm_.unmap(h))clean=false;else h=0;}
+            if(clean && p->attached_ && p->vm_.detach())clean=false;
+            if(clean && p->tables_.deviceReferences())clean=!p->tables_.retireAfterQuiescence();
+            if(clean && !p->tables_.release()) {
+                if(p->table_block_>=0)table_used_&=~(1u<<p->table_block_);
+                delete p;return status;
+            }
+        }
+        return status;
+    }
+    native_adreno_table_switches[7]=0;
+    p->asid_=asid;asids_[asid>>6]|=1ull<<(asid&63);
+    ++live_vms_;
+    native_adreno_table_switches[2]=native_adreno_table_switches[2]+1;
+    native_adreno_table_switches[4]=live_vms_;
+    if(live_vms_>native_adreno_table_switches[5])native_adreno_table_switches[5]=live_vms_;
+    *out=p;
+    return kIOReturnSuccess;
+}
+IOReturn NativeAdrenoGpuContext::destroyVm(NativeAdrenoProcessVm *p)
+{
+    if(!p || !p->attached_)return kIOReturnBadArgument;
+    IOReturn status=kIOReturnSuccess;
+    for(auto &h:p->handles_)if(h) {status=p->vm_.unmap(h);if(status)break;h=0;}
+    if(!status)status=p->vm_.invalidateAsid();
+    if(!status)status=p->vm_.detach();
+    if(!status) {
+        p->attached_=false;
+        /* The prepare's device reference on the table pool, dropped now that no TLB entry of the ASID is left. */
+        if(p->tables_.deviceReferences())status=p->tables_.retireAfterQuiescence();
+        if(!status)status=p->tables_.release();
+        if(!status && p->table_block_>=0) {table_used_&=~(1u<<p->table_block_);p->table_block_=-1;}
+    }
+    if(status) {native_adreno_table_switches[6]=uint32_t(status)|0x80000000u;return status;}
+    asids_[p->asid_>>6]&=~(1ull<<(p->asid_&63));
+    --live_vms_;
+    native_adreno_table_switches[3]=native_adreno_table_switches[3]+1;
+    native_adreno_table_switches[4]=live_vms_;
+    delete p;
+    return kIOReturnSuccess;
+}
+IOReturn NativeAdrenoGpuContext::observeContext(uint32_t *kit_status,uint32_t out[8]) const
+{
+    if(!kit_status || !out)return kIOReturnBadArgument;
+    if(!ready_)return kIOReturnNotReady;
+    NativeAdrenoSmmuContext &smmu=const_cast<NativeAdrenoSmmuContext &>(smmu_);
+    ArmSmmu4KProgramResult r{};
+    const ArmSmmu4KStatus status=ArmSmmu4KObserveOwnedContext(smmu.ioHandle(),smmu.streamsHandle()->bank,smmu.configHandle(),&r);
+    *kit_status=uint32_t(status);
+    const ArmSmmu4KContextImage &v=r.readback;
+    out[0]=v.sctlr;out[1]=v.tcr;out[2]=v.tcr2;out[3]=v.mair0;out[4]=uint32_t(v.ttbr1);out[5]=uint32_t(v.ttbr1>>32);out[6]=v.cbar;
+    out[7]=r.fault_status;
+    return status==ArmSmmu4KSuccess?kIOReturnSuccess:kIOReturnIOError;
+}
+IOReturn NativeAdrenoGpuContext::clearFault(uint32_t fsr,uint32_t far[3])
+{
+    if(!far || !ready_)return kIOReturnBadArgument;
+    const ArmSmmu4KIo *io=smmu_.ioHandle();
+    const uint64_t offset=smmu_.stateHandle()->context_offset;
+    if(!offset)return kIOReturnNotReady;
+    if(io->read32(io->cookie,(size_t)offset+0x60,&far[0]) || io->read32(io->cookie,(size_t)offset+0x64,&far[1]) ||
+        io->read32(io->cookie,(size_t)offset+0x68,&far[2]))return kIOReturnIOError;
+    if(io->write32(io->cookie,(size_t)offset+0x58,fsr) || io->barrier(io->cookie))return kIOReturnIOError;
+    return kIOReturnSuccess;
+}
+IOReturn NativeAdrenoGpuContext::readTtbr0(uint64_t *out) const
+{
+    if(!out)return kIOReturnBadArgument;*out=0;
+    if(!ready_)return kIOReturnNotReady;
+    NativeAdrenoSmmuContext &smmu=const_cast<NativeAdrenoSmmuContext &>(smmu_);
+    const ArmSmmu4KIo *io=smmu.ioHandle();
+    const uint64_t offset=smmu.stateHandle()->context_offset;
+    if(!offset || !io->read64)return kIOReturnNotReady;
+    return io->read64(io->cookie,(size_t)offset+0x20,out)?kIOReturnIOError:kIOReturnSuccess;
+}
+IOReturn NativeAdrenoGpuContext::probeBuffer(NativeAdrenoProcessVm *p,uint64_t *handle,uint64_t *iova,size_t *bytes)
+{
+    if(!p || !p->attached_ || !handle || !iova || !bytes)return kIOReturnBadArgument;
+    volatile uint32_t *scratch=static_cast<volatile uint32_t *>(buffers_[4].mapping());
+    if(!scratch)return kIOReturnNotReady;
+    uint32_t nop=0;
+    if(AdrenoPM4Type7(0x10,0,&nop)!=AdrenoPM4Success)return kIOReturnInternalError;   /* CP_NOP */
+    scratch[0xF00/4]=nop;
+    *handle=p->handles_[4];*iova=GpuScratchIova+0xF00;*bytes=4;
+    return kIOReturnSuccess;
+}
 static NativeAdrenoGpuContext *board_gpu_context;
 extern "C" IOReturn NativeAdrenoGpuContextBringup(volatile uint8_t *smmu,size_t bytes,unsigned bank,unsigned asid,
     unsigned slot0,unsigned sid0,unsigned slot1,unsigned sid1,void (*progress)(uint32_t),
@@ -117,4 +291,8 @@ extern "C" IOReturn NativeAdrenoGpuContextBuffers(NativeAdrenoGpuBuffer out[5])
 extern "C" NativeAdrenoVm *NativeAdrenoGpuContextVm()
 {
     return board_gpu_context?board_gpu_context->vm():nullptr;
+}
+extern "C" NativeAdrenoGpuContext *NativeAdrenoGpuContextObject()
+{
+    return board_gpu_context && board_gpu_context->ready()?board_gpu_context:nullptr;
 }

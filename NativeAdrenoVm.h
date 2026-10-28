@@ -59,9 +59,15 @@ class NativeAdrenoVm final {
     ArmSmmu4KStreamState *streams_=nullptr;
     ArmSmmu4KRange *ranges_=nullptr;
     size_t capacity_=0,lower_count_=0,upper_count_=0,objects_=0;
+    /* Both tables grow on demand (a VM per GPU process: most use a few hundred objects): ranges_ up to max_capacity_ (attach's capacity),
+     * mappings_ up to NativeAdrenoVmMaxObjects. */
+    size_t max_capacity_=0,mapping_capacity_=0;
+    bool growRanges(size_t needed);
+    bool growMappings();
     unsigned budget_=0;
     uint64_t next_handle_=1;
     bool attached_=false,poisoned_=false,distrust_write_combined_=false;
+    bool fault_streams_=true;   /* a failure faults the bank's streams; off for a process table, whose streams are the kernel table's too */
     NativeAdrenoVmResult result_{};
     ArmSmmu4KLiveRegion region(unsigned) const;
     ArmSmmu4KStatus observe() const;
@@ -128,6 +134,8 @@ public:
     /* The same after cleaning and invalidating the CPU cache lines over the words: a BO zeroed through the kernel's cacheable mapping keeps
      * clean lines of those zeros there, which a plain read returns instead of what the client wrote through its own mapping since. */
     IOReturn peekWordsUncached(uint64_t iova,uint32_t *out,size_t count) const;
+    /* The physical address of the leaf descriptor that maps the page at target (the table walk coherence proof); false when none does. */
+    bool leafPhysical(uint64_t target,uint64_t *physical) const;
     /* The context bank's fault record for the board log: FSR, FAR (lo, hi) and FSYNR0. Reads only; never clears a fault. */
     IOReturn faultState(uint32_t out[4]) const;
     /* Map handles count up and are never reused, so they order mappings in time: the next one, and the one over a GPU address (0: none). */
@@ -137,6 +145,13 @@ public:
      * A timeout, interrupt bit alone or CPU-written timestamp is insufficient. */
     IOReturn retireJobAfterCompletion(uint64_t handle);
     bool poisoned() const {return poisoned_;}
+    /* A process address space: its failure poisons only itself (its tables and BOs), never the streams the kernel table shares. */
+    void keepStreamsOnFailure() {fault_streams_=false;}
+    /* The lower region's table root with this VM's ASID in bits 63:48: what the bank's TTBR0 holds while the GPU runs this VM. */
+    uint64_t ttbr0() const {return regions_[0].state && context_?regions_[0].state->tables.root_physical|(uint64_t)context_->asid<<48:0;}
+    unsigned asid() const {return context_?context_->asid:0;}
+    /* TLBIASID of this VM's ASID (its translations only), for an ASID about to be given to another table. */
+    IOReturn invalidateAsid();
     size_t objectCount() const {return objects_;}
     size_t spanCount() const {return lower_count_+upper_count_;}
     NativeAdrenoVmResult lastResult() const {return result_;}

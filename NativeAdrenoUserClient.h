@@ -30,11 +30,18 @@ class NativeAdrenoUserClient final {
         uint32_t metadata_bytes=0;
         uint32_t token=0;
         uint32_t mapping_leases=0;
+        uint32_t index=0;   /* its place in the chunks: token - 1 */
         char metadata[NativeAdrenoAbiMetadataBytes]{};
     };
-    /* Allocated at open(), all-zero is the free state. */
-    Entry *entries_=nullptr;
-    size_t entry_count_=0;
+    /* Entries in chunks of EntryChunk, allocated as the client's objects grow (a whole table per client was about 4 MiB, and every process
+     * may now open the GPU); a chunk never moves, so the VM's pointers into an entry's memory stay valid. All-zero is the free state. */
+    enum : size_t {EntryChunk=64,EntryChunks=NativeAdrenoClientMaxObjects/EntryChunk};
+    Entry *chunks_[EntryChunks]{};
+    size_t entry_count_=0;   /* entries in the allocated chunks */
+    Entry &at(size_t index) const {return chunks_[index/EntryChunk][index%EntryChunk];}
+    bool grow();
+    void releaseEntries();
+    uint32_t stats_slot_=4;   /* the board log's client row (4: the shared overflow row) */
     NativeAdrenoHandleIndex<NativeAdrenoClientMaxObjects> index_;   /* live handle -> its entries_ index */
     size_t free_hint_=0,live_=0;   /* no free entry below free_hint_; live_ entries are used */
     Queue queues_[NativeAdrenoAbiMaxQueues]{};
@@ -74,6 +81,8 @@ public:
     /* One client of several on the same VM, submit object and ring: its queue range (queue_base a multiple of NativeAdrenoAbiMaxQueues) and
      * GPU address window (4 KiB aligned, inside the input range; bytes 0 = unrestricted). Only while open with no live object or job. */
     IOReturn setScope(uint32_t queue_base,uint64_t window_start,uint64_t window_bytes);
+    /* The board log's per-client row this client counts in (0..3; 4 the shared row). */
+    void setStatsSlot(uint32_t slot) {stats_slot_=slot<4?slot:4;}
     /* Highest end address (exclusive) any mapping of this client has reached, 0 before the first. */
     uint64_t windowPeak() const {return window_peak_;}
     /* Whether any job is unobserved in the range this client owns (never, while it owns none). */
