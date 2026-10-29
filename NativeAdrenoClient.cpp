@@ -13,7 +13,7 @@ IOReturn NativeAdrenoClient::open(const NativeAdrenoTransport *transport)
     if(status) {transport_={};return status;}
     if(reply.abi_version!=NativeAdrenoAbiVersion || reply.input_bits<32 ||
         reply.input_bits>48 || reply.output_bits<32 || reply.output_bits>48 ||
-        !reply.max_bo_bytes || (reply.flags&~uint32_t(NativeAdrenoParamsHostImport|NativeAdrenoParamsOwnedCoherent|NativeAdrenoParamsPoolPressure))) {transport_={};return kIOReturnUnsupported;}
+        !reply.max_bo_bytes || (reply.flags&~uint32_t(NativeAdrenoParamsHostImport|NativeAdrenoParamsOwnedCoherent|NativeAdrenoParamsMemoryPressure))) {transport_={};return kIOReturnUnsupported;}
     params_=reply;open_=true;
     return kIOReturnSuccess;
 }

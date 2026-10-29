@@ -466,17 +466,26 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
         return kIOReturnSuccess;
     }
     NativeAdrenoMemory *backing=live_?core_->memoryForToken(type):nullptr;
-    if(backing) {
+    if(backing && backing->system() && backing->descriptor() && v && !v->descriptor) {
+        /* System memory: the view maps the BO's own descriptor, its VM object, as Metal's resources are mapped into their process. The
+         * pages keep the object's attribute (no device-pager view sets them back, int-160) and live while the view does. */
+        IOMemoryDescriptor *descriptor=backing->descriptor();
+        descriptor->retain();v->token=type;v->descriptor=descriptor;
+        descriptor->retain();*memory=descriptor;
+        *options=kIOMapAnywhere;
+        native_adreno_view_diag[1]=native_adreno_view_diag[1]+1;
+        status=kIOReturnSuccess;
+    }
+    else if(backing) {
         /* The BO's pages are cached in the kernel and the GPU's PTEs are non-cacheable, so the client needs an uncached
          * view. A mapping of the buffer descriptor with a different cache mode is not reliable, so describe the same raw
          * physical spans (the ones the SMMU maps) and ask for kIOMapInhibitCache, exactly how the board code maps the
          * ring and the GMU windows. The descriptor does not retain the pages: the client must unmap before BoCpuUnmap/BoFree. */
-        /* A BO's pages can come scattered, one span per page (a 64 MiB BO is 16384 of them): the descriptor takes them all, as many as the GPU's
-         * own table accepts. A fixed 64-entry array made every scattered BO above 256 KiB fail to map (VK_ERROR_MEMORY_MAP_FAILED, int-084),
-         * only when memory happened to be fragmented. The descriptor copies the ranges. */
-        enum {MaxSpans=65536};
+        /* A BO's pages can come scattered, one span per page (a 64 MiB BO is 16384 of them): the descriptor takes them all. A fixed 64-entry
+         * array made every scattered BO above 256 KiB fail to map (VK_ERROR_MEMORY_MAP_FAILED, int-084), only when memory happened to be
+         * fragmented. The descriptor copies the ranges. */
         const size_t count=backing->spanCount();
-        if(!count || count>MaxSpans)status=kIOReturnNoResources;
+        if(!count)status=kIOReturnNoResources;
         else {
             IOAddressRange *ranges=IONewData(IOAddressRange,count);
             if(!ranges)status=kIOReturnNoMemory;

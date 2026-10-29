@@ -200,7 +200,7 @@ IOReturn NativeAdrenoUserClient::query(NativeAdrenoAbiParams *params)
     params->abi_version=NativeAdrenoAbiVersion;
     params->input_bits=input_bits_;params->output_bits=output_bits_;
     params->flags=NativeAdrenoParamsHostImport|(ownedCoherent()?NativeAdrenoParamsOwnedCoherent:0u)|
-        (NativeAdrenoMemory::poolPressure()?NativeAdrenoParamsPoolPressure:0u);params->max_bo_bytes=maxBoBytes();
+        (NativeAdrenoMemory::memoryPressure()?NativeAdrenoParamsMemoryPressure:0u);params->max_bo_bytes=maxBoBytes();
     return kIOReturnSuccess;
 }
 /* Per client slot (4, the kernel's own client last): [0] live objects now, [1] their peak, [2] refused BoAllocs, [3] last refusal status,
@@ -236,26 +236,17 @@ IOReturn NativeAdrenoUserClient::allocBoInner(const NativeAdrenoAbiBoAlloc *requ
         return kIOReturnBadArgument;
     Entry *entry=free();
     if(!entry)return kIOReturnNoResources;
-    /* A scattered allocation costs one VM span per physical page (int-030: 16 MiB came back as 4096 single-page spans, the
-     * whole span table), so without a pool larger objects try one contiguous run first and fall back to scattered pages unless the
-     * caller demanded contiguity. With the board's pool, the allocation below already takes a contiguous run from it first; a
-     * run from XNU would scan physical memory for every larger BO once the pool is full (untagged-203fd45bf: 96 MiB searches over
-     * 1.2 million pages, found nothing), as msm never does for a GEM object. */
-    IOReturn status=kIOReturnUnsupported;
-    const bool prefer_contiguous=request->contiguous==0 && request->bytes>=NativeAdrenoClientContiguousFirstBytes &&
-        !NativeAdrenoMemory::poolBytes();
-    if(prefer_contiguous) {
-        status=entry->memory.allocate((size_t)request->bytes,output_bits_,true,(size_t)request->bytes,true);
-        if(status && !entry->memory.quarantined() && entry->memory.release()==kIOReturnSuccess)status=kIOReturnUnsupported;
-    }
-    if(status)
-        status=entry->memory.allocate((size_t)request->bytes,output_bits_,request->contiguous!=0,(size_t)request->bytes,true);
     /* User BOs are write-combined for the CPU, as the GPU maps them non-cacheable: no per-submission cache maintenance.
      * int-147 kept them cacheable under IO coherence and mapped the GPU side write-back: the first Turnip IB executed zeros and the GPU hung
-     * (the kernel's cacheable alias read zeros past the first line too). Turnip maps every BO asking kIOMapWriteCombineCache, the user's
-     * cache bits replace the kernel's (IOUserClient::mapClientMemory64), and XNU's view machinery changes the page attribute to match, so
-     * the aliases disagreed. A coherent own BO needs a client that asks for a write-back view. */
-    if(!status && native_adreno_wc_enabled && !ownedCoherent())status=entry->memory.makeWriteCombined();
+     * (the kernel's cacheable alias read zeros past the first line too). A coherent own BO needs a client that asks for a write-back view. */
+    const bool write_combined=native_adreno_wc_enabled && !ownedCoherent();
+    IOReturn status;
+    if(request->contiguous) {
+        /* Only a caller that needs one physical run gets the kernel's contiguous allocation (XNU scans physical memory for it). */
+        status=entry->memory.allocate((size_t)request->bytes,output_bits_,true,(size_t)request->bytes);
+        if(!status && write_combined)status=entry->memory.makeWriteCombined();
+    }
+    else status=entry->memory.allocateSystem((size_t)request->bytes,output_bits_,(size_t)request->bytes,write_combined);
     if(status) {
         /* A failed allocation can leave quarantine behind; never reuse it. */
         clear(*entry);

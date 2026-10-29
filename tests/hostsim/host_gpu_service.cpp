@@ -163,7 +163,9 @@ int host_gpu_map(uint32_t token,void **address,uint64_t *bytes) {
     std::lock_guard<std::recursive_mutex> guard(serviceLock);
     NativeAdrenoMemory *memory=opened?client.memoryForToken(token):nullptr;
     if(!memory)return kIOReturnBadArgument;
-    *address=memory->mapping();*bytes=memory->bytes();return kIOReturnSuccess;
+    /* System memory has no kernel mapping: the client's view maps its pages, which the fixture keeps in raw. */
+    *address=memory->mapping()?memory->mapping():memory->descriptor()?memory->descriptor()->raw:nullptr;
+    *bytes=memory->bytes();return *address?kIOReturnSuccess:kIOReturnBadArgument;
 }
 unsigned host_gpu_submissions() {std::lock_guard<std::recursive_mutex> guard(serviceLock);return submissions;}
 unsigned host_gpu_live_objects() {std::lock_guard<std::recursive_mutex> guard(serviceLock);return unsigned(client.liveObjects());}

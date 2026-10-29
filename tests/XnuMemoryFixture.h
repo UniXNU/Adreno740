@@ -16,7 +16,11 @@ constexpr IOReturn kIOReturnSuccess=0,kIOReturnBadArgument=1,kIOReturnBusy=2,
  kIOReturnNoResources=3,kIOReturnNoMemory=4,kIOReturnUnsupported=5,
  kIOReturnNotReady=6,kIOReturnIOError=7,kIOReturnTimeout=8,kIOReturnNotPermitted=9,kIOReturnInternalError=10;
 using IODirection=unsigned;
-constexpr unsigned kIODirectionOut=2,kIODirectionInOut=3,kIOMemoryMapperNone=0x800,kIOMemoryPhysicallyContiguous=0x10,kIOMemoryPersistent=0x10000;
+constexpr unsigned kIODirectionOut=2,kIODirectionInOut=3,kIOMemoryMapperNone=0x800,kIOMemoryPhysicallyContiguous=0x10,kIOMemoryPersistent=0x10000,
+ kIOMemoryPageable=0x20,kIOMapWriteCombineCache=0x400;
+/* The kernel's physical range (phystokv's), wide enough for every fixture address. */
+extern "C" {inline uint64_t gPhysBase=0,gPhysSize=UINT64_C(1)<<36;}
+inline void *IOMallocZero(size_t bytes) {return std::calloc(1,bytes);}
 inline void *kernel_task=reinterpret_cast<void *>(1);
 using task_t=void *;
 /* ScatterUnlessContiguous: what the tablet does, one physical page per span unless the caller asked for contiguous memory. */
@@ -24,6 +28,7 @@ enum SegmentMode {Contiguous,Scattered,ZeroPhysical,UnalignedPhysical,ShortSegme
 class IOBufferMemoryDescriptor;
 struct MemoryFixture {
     unsigned created=0,prepared=0,completed=0,released=0,cache_calls=0,segment_calls=0;
+    unsigned pageable=0,write_combined_entries=0;   /* inTaskWithOptions: pageable buffers with no task, those with a write-combined entry */
     unsigned allocation_fail_count=0;
     bool allocation_fail=false,prepare_fail=false,complete_fail=false,metadata_fail=false;
     bool write_protected_imports=false;   /* user ranges that can only be pinned for reading: prepare() of a writable one reports KERN_PROTECTION_FAILURE */
@@ -56,7 +61,22 @@ public:
     size_t bytes=0;
     uint64_t mask=0;
     uint64_t physical_base=0;
-    bool contiguous=false;
+    bool contiguous=false,unmapped=false;
+    unsigned retains=1;
+    /* Pageable memory with no task, as allocateSystem asks: no kernel mapping (getBytesNoCopy is null); raw stands for its pages. */
+    static IOBufferMemoryDescriptor *inTaskWithOptions(void *task,unsigned options,size_t bytes,size_t alignment) {
+        if(task || !(options&kIOMemoryMapperNone) || !(options&kIOMemoryPageable) || alignment!=4096)std::abort();
+        if(fixture.allocation_fail)return nullptr;
+        if(fixture.allocation_fail_count) {--fixture.allocation_fail_count;return nullptr;}
+        auto *d=new IOBufferMemoryDescriptor;
+        d->bytes=bytes;d->mask=~UINT64_C(0);d->physical_base=fixture.next_physical;d->unmapped=true;
+        fixture.next_physical+=2*bytes+0x10000;
+        if(posix_memalign(&d->raw,4096,bytes+4096))std::abort();
+        std::memset(d->raw,0,bytes+4096);
+        ++fixture.created;++fixture.pageable;if(options&kIOMapWriteCombineCache)++fixture.write_combined_entries;
+        fixture.live.push_back(d);return d;
+    }
+    void retain() {++retains;}
     static IOBufferMemoryDescriptor *inTaskWithPhysicalMask(void *task,unsigned options,size_t bytes,uint64_t mask) {
         if(task!=kernel_task || !(options&kIOMemoryMapperNone))std::abort();
         if(fixture.allocation_fail)return nullptr;
@@ -71,10 +91,11 @@ public:
     IOReturn prepare() {++fixture.prepared;return fixture.prepare_fail?kIOReturnIOError:kIOReturnSuccess;}
     IOReturn complete() {++fixture.completed;return fixture.complete_fail?kIOReturnIOError:kIOReturnSuccess;}
     void release() {
+        if(--retains)return;
         ++fixture.released;auto at=std::find(fixture.live.begin(),fixture.live.end(),this);
         if(at==fixture.live.end())std::abort();fixture.live.erase(at);std::free(raw);delete this;
     }
-    void *getBytesNoCopy() {return fixture.null_mapping?nullptr:static_cast<char *>(raw)+(fixture.unaligned_mapping?8:0);}
+    void *getBytesNoCopy() {return unmapped || fixture.null_mapping?nullptr:static_cast<char *>(raw)+(fixture.unaligned_mapping?8:0);}
     size_t getLength() {return bytes+(fixture.wrong_length?4096:0);}
     uint64_t getPhysicalSegment(size_t offset,size_t *length,unsigned options) {
         if((offset&4095) || offset>=bytes || options!=kIOMemoryMapperNone)std::abort();

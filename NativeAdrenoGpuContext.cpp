@@ -6,9 +6,6 @@
 #include <kern/task.h>
 #include "AdrenoPM4.h"
 
-extern "C" volatile uint32_t native_adreno_pool_mib;
-extern "C" volatile uint32_t native_adreno_pool_stats[8],native_adreno_pool_status;
-extern "C" volatile uint32_t native_adreno_wc_enabled,native_adreno_pool_wc,native_adreno_owned_coherent,native_adreno_io_coherent;
 static const uint64_t kIovas[GpuBufferCount]={GpuSqeIova,GpuRingIova,GpuMemptrsIova,GpuPwrupIova,GpuScratchIova};
 static const size_t kBytes[GpuBufferCount]={GpuSqeBytes,GpuRingBytes,GpuPageBytes,GpuPageBytes,GpuPageBytes};
 IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,unsigned asid,const unsigned slots[2],
@@ -32,18 +29,6 @@ IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,uns
         if(!report->output_bits)status=kIOReturnUnsupported;
         /* Stage-1 input size: smmu->va_size from ID2.UBS (arm_smmu_init_domain_context: ias = smmu->va_size for AArch64 stage 1). */
         input_bits_=NativeAdrenoSmmuInputBits(report->id2);
-    }
-    /* The BO pool: its first chunk is taken first, while the VM still has long contiguous runs (the board sets the size from sheng-gpu-pool;
-     * 0 = none). A chunk that cannot be had at one size is tried at the next smaller; none is not an error: the pool still grows on demand. */
-    if(!status) {
-        IOReturn pooled=kIOReturnNoMemory;
-        for(uint32_t mib=native_adreno_pool_mib;mib>=16 && pooled;mib>>=1) {
-            pooled=NativeAdrenoMemory::reservePool(report->output_bits,(size_t)mib<<20);
-            native_adreno_pool_stats[0]=pooled==kIOReturnSuccess?mib:0;native_adreno_pool_status=(uint32_t)pooled;
-        }
-        if(pooled)native_adreno_pool_status=(uint32_t)NativeAdrenoMemory::reservePool(report->output_bits,0);
-        /* Not fatal: without it each pooled BO changes its pages' attribute itself, as a scattered one does. */
-        if(native_adreno_wc_enabled && !native_adreno_owned_coherent)native_adreno_pool_wc=(uint32_t)NativeAdrenoMemory::writeCombinePool()|1u<<31;
     }
     for(unsigned i=0;!status && i<GpuBufferCount;++i)
         status=buffers_[i].allocate(kBytes[i],report->output_bits,true,kBytes[i]);

@@ -14,7 +14,6 @@
  * pointer values. A mapping is retirable only through freeBo, which unmaps
  * first and then releases the backing object; both steps must succeed.
  * Objects, queues and jobs are limited by memory and ring space only (msm's are: a fixed 4096-entry table crashed backboardd, i567). */
-enum : size_t {NativeAdrenoClientContiguousFirstBytes=65536};
 class NativeAdrenoUserClient final {
     struct Queue {uint32_t id=0;bool active=false;};
     struct Entry {

@@ -27,7 +27,7 @@ IOReturn NativeAdrenoReassertWriteCombined(const NativeAdrenoPhysicalSpan *,size
  * hold a line, so the GPU needs no CPU cache maintenance around them. */
 bool NativeAdrenoPagesUncached(const NativeAdrenoPhysicalSpan *,size_t count);
 /* CPU cache maintenance by the phase that asked for it, for the board log: [phase][0] passes, [phase][1] KiB. */
-enum NativeAdrenoMaintenancePhase {NativeAdrenoPhasePool,NativeAdrenoPhaseAllocate,NativeAdrenoPhaseMap,NativeAdrenoPhaseSubmit,
+enum NativeAdrenoMaintenancePhase {NativeAdrenoPhaseUnused,NativeAdrenoPhaseAllocate,NativeAdrenoPhaseMap,NativeAdrenoPhaseSubmit,
     NativeAdrenoPhaseUnmap,NativeAdrenoPhaseComplete,NativeAdrenoPhaseTable,NativeAdrenoPhaseDiagnostic};
 void NativeAdrenoNotePhase(unsigned phase,size_t bytes);
 
@@ -48,9 +48,8 @@ class NativeAdrenoMemory final {
     NativeAdrenoPhysicalSpan *spans_=nullptr;
     size_t bytes_=0,span_count_=0,span_capacity_=0;
     uint32_t device_references_=0;
-    bool prepared_=false,quarantined_=false,write_combined_=false,pooled_=false,borrowed_=false;
-    unsigned pool_chunk_=0;
-    size_t pool_offset_=0;
+    bool prepared_=false,quarantined_=false,write_combined_=false,system_=false,borrowed_=false,owned_=false;
+    IOReturn takeSegments(IOBufferMemoryDescriptor *,size_t bytes,uint64_t limit,bool contiguous);
     IOReturn maintainImported(size_t offset,size_t bytes,NativeAdrenoCacheOperation);
 public:
     NativeAdrenoMemory()=default;
@@ -63,25 +62,21 @@ public:
      * CPU native4K state and kernel page ABI are checked before allocation.
      * prepare(), raw unmapped physical segments, span/PA bounds and optional
      * physical contiguity are verified before zeroing/PoC publication. */
-    /* `pooled`: take the bytes from the BO pool (a chunk with room, or a new chunk). Only user BOs do: the pool is write-combined for
-     * the CPU (writeCombinePool), and the kernel's own objects (SMMU tables, ring, fence and firmware pages) are walked or read by the
-     * CPU through their cacheable mapping (int-153: page tables from the write-combined pool made each map's table update 2.6x slower). */
-    IOReturn allocate(size_t bytes,unsigned output_bits,bool contiguous,size_t byte_budget,bool pooled=false);
-    /* The BO pool: physically contiguous chunks cut into BOs, so a BO is one span of the GPU's table instead of one per scattered page
-     * (int-137: 59474 spans for 332 MiB, the span capacity ran out, BoMap failed and the compositor fell back to the CPU). Enables the
-     * pool for pages below 2^output_bits and takes `bytes` (0: none) as a first chunk while memory is not yet fragmented; that chunk stays.
-     * Every other chunk is taken from the system when no chunk has room (2 MiB, halved down to 64 KiB, or a large BO's own size) and given
-     * back when it empties. allocate(..., pooled=true) falls back to scattered pages only when the system has no such chunk. Board only. */
-    static IOReturn reservePool(unsigned output_bits,size_t bytes);
-    static size_t poolBytes();
-    /* Memory pressure: the system could not give the pool a chunk (the last BO fell back to scattered pages); cleared once the pool serves
-     * an allocation again. Clients read it in Query and give their cached BOs back. */
-    static bool poolPressure();
-    /* Whether [physical, physical+bytes) touches a pool chunk: its pages belong to pooled BOs alone. */
-    static bool poolContains(uint64_t physical,size_t bytes);
-    /* Every chunk write-combined once, for good, and every later chunk when it is made: a pooled BO then takes no page-attribute change
-     * on allocation or release. Board only, after reservePool, when user BOs are write-combined. */
-    static IOReturn writeCombinePool();
+    IOReturn allocate(size_t bytes,unsigned output_bits,bool contiguous,size_t byte_budget);
+    /* A user BO's memory from the system, as Metal's resources on iPadOS have it (pageable VM memory the GPU driver wires: a resource can be
+     * made purgeable, which only VM objects can be): an IOBufferMemoryDescriptor of pageable memory with no kernel mapping, wired by
+     * prepare(). The VM gives zero-filled pages and, for write-combined memory, sets the pages' attribute while it wires them, in one batch
+     * (vm_object_iopl_request, pmap_batch_set_cache_attributes, which also cleans the pages' lines), and gives the pages back with the
+     * default attribute (vm_object_reap). No kernel address range, no physical contiguity search, no fixed pool: the BO pool of 1536 MiB
+     * (untagged-ed1611b1) filled with the runtime's 4-64 MiB blocks, 404 BOs fell back to scattered kernel memory, 96 allocations of
+     * 96 MiB failed and the pressure it reported stayed on, so the clients' BO caches flushed and allocated again (5.6 GB of maintenance).
+     * Client views map this descriptor itself (the VM object and its attribute), not its physical pages. */
+    IOReturn allocateSystem(size_t bytes,unsigned output_bits,size_t byte_budget,bool write_combined);
+    /* Memory pressure: the system could not give a user BO its memory (allocateSystem failed); cleared by the next one that succeeds.
+     * Clients read it in Query and give their cached BOs back. */
+    static bool memoryPressure();
+    /* Whether any page of the spans belongs to a BO this driver allocated (allocate, allocateSystem) and has not released. */
+    static bool ownsAnyPage(const NativeAdrenoPhysicalSpan *,size_t count);
     /* Pins bytes at address in task (a user task's own pages) instead of allocating; prepare() wires them until release().
      * There is no kernel mapping: the owner keeps its CPU mapping and does its own cache maintenance around GPU use, so
      * publishForDevice/acquireDeviceWrites have nothing to do for this object. Spans and PA bounds are checked as for allocate. */
@@ -90,7 +85,8 @@ public:
      * forgets it. The process address spaces' page tables come from such blocks, reserved cacheable at bring-up. */
     IOReturn borrow(void *mapping,uint64_t physical,size_t bytes);
     bool imported() const {return imported_!=nullptr;}
-    bool pooled() const {return pooled_;}
+    /* Memory from allocateSystem: the VM owns its pages' attribute, and its client views map the descriptor. */
+    bool system() const {return system_;}
     /* An import of memory the owner maps read-only (the kernel could pin it for reading only): the GPU may read it, never write it. */
     bool readOnly() const {return read_only_;}
     bool ownerUncached() const {return owner_uncached_;}
@@ -98,12 +94,13 @@ public:
      * write-combined, so publishForDevice/acquireDeviceWrites have nothing left to do. release() restores the default attribute. */
     IOReturn makeWriteCombined();
     bool writeCombined() const {return write_combined_;}
-    /* NativeAdrenoReassertWriteCombined over this object's pages; nothing for an object that is not write-combined, nor for one from the
-     * BO pool: XNU set scattered BOs' pages back to the default attribute (int-160: 123847 pages), never a pool page (int-161: none in
-     * 1280 submissions, while walking the pool's pages took 0.65 ms of each). The submissions' line audit still covers every object. */
+    /* NativeAdrenoReassertWriteCombined over this object's pages; nothing for an object that is not write-combined, nor for system memory:
+     * XNU set the pages of BOs whose views mapped their physical pages back to the default attribute as it tore a device-pager view down
+     * (int-160: 123847 pages; untagged-2319cf3e5: 685208 pages, 3.8 s of submissions), while a view of a VM object maps it with the
+     * object's own attribute. The submissions' line audit still covers every object. */
     IOReturn reassertWriteCombined(uint32_t *reset) const
-    {return write_combined_ && span_count_ && !pooled_?NativeAdrenoReassertWriteCombined(spans_,span_count_,reset):kIOReturnSuccess;}
-    bool backed() const {return descriptor_ || imported_ || pooled_ || borrowed_;}
+    {return write_combined_ && span_count_ && !system_?NativeAdrenoReassertWriteCombined(spans_,span_count_,reset):kIOReturnSuccess;}
+    bool backed() const {return descriptor_ || imported_ || borrowed_;}
     /* Refuses device references/quarantine; only clears ownership after real
      * descriptor complete() succeeds. No automatic reset or resource recycling. */
     IOReturn release();

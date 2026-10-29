@@ -195,7 +195,6 @@ uint64_t NativeAdrenoGpuService::ring_now(void *)
     return microseconds;
 }
 extern "C" uint64_t (*native_adreno_vm_now_us)(void);
-extern "C" volatile uint32_t native_adreno_pool_mib;
 static uint64_t vm_clock_us(void) {uint64_t microseconds=0;NativeAdrenoKernelTime::now_us(nullptr,&microseconds);return microseconds;}
 IOService *NativeAdrenoGpuService::probe(IOService *provider,SInt32 *score)
 {
@@ -306,9 +305,6 @@ bool NativeAdrenoGpuService::start(IOService *provider)
      * bank, attaches the stream and maps the GMU payloads. Do not run it before the read-only power/clock observation
      * (sheng-gpu-power, docs/gpu-hardware-plan.md) shows the GPU SMMU powered and writable: the apps SMMU on this board is
      * hypervisor-managed (docs/native-ufs.md) and the adreno SMMU has not been shown to differ. */
-    {
-        uint32_t mib=1536;PE_parse_boot_argn("sheng-gpu-pool",&mib,sizeof(mib));native_adreno_pool_mib=mib;
-    }
     uint32_t bringup=0;
     if(PE_parse_boot_argn("sheng-gpu-bringup",&bringup,sizeof(bringup)) && bringup) {
         NativeAdrenoSmmuService *node=OSDynamicCast(NativeAdrenoSmmuService,smmu);

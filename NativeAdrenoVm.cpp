@@ -267,25 +267,14 @@ IOReturn NativeAdrenoVm::preflight(const NativeAdrenoMemory *memory,unsigned upp
 /* Whether no mapped range can alias memory's pages with another cache/shareability/privilege class. A buffer this driver allocated
  * owns its pages until its unmap has completed (the free waits for it). An import (a user range, usually an IOSurface, which any
  * process may import again) can alias only another import or a range of driver memory it covers: it is exclusive when every mapped
- * import has its class and none of its pages lies in the BO pool or in a mapped scattered buffer. i568: about 100 surface imports of
- * 5000-6000 spans each, every one checked against every other range. */
+ * import has its class and none of its pages lies in a buffer of this driver (NativeAdrenoMemory::ownsAnyPage). i568: about 100
+ * surface imports of 5000-6000 spans each, every one checked against every other range. */
 bool NativeAdrenoVm::exclusivePages(const NativeAdrenoMemory *memory,unsigned cls) const
 {
     if(!memory || !memory->imported())return true;   /* preflight refuses a null one */
     size_t imports=0;for(size_t k=0;k<16;++k)imports+=import_spans_[k];
     if(imports!=import_spans_[cls&15])return false;
-    const auto *spans=memory->spans();const size_t n=memory->spanCount();
-    for(size_t j=0;j<n;++j)if(NativeAdrenoMemory::poolContains(spans[j].physical,spans[j].bytes))return false;
-    size_t pairs=0;
-    for(size_t i=0;i<high_;++i) {
-        const Mapping &m=mappings_[i];
-        if(!m.memory || m.memory->imported() || m.memory->pooled())continue;
-        const size_t mn=m.memory->spanCount();
-        if(mn>(size_t)65536/(n?n:1) || (pairs+=mn*n)>(size_t)1<<20)return false;   /* too many to compare: the full check */
-        for(size_t a=0;a<mn;++a)for(size_t b=0;b<n;++b)
-            if(overlap(m.memory->spans()[a].physical,m.memory->spans()[a].bytes,spans[b].physical,spans[b].bytes))return false;
-    }
-    return true;
+    return !NativeAdrenoMemory::ownsAnyPage(memory->spans(),memory->spanCount());
 }
 NativeAdrenoVm::Mapping *NativeAdrenoVm::find(uint64_t handle)
 {return const_cast<Mapping *>(static_cast<const NativeAdrenoVm *>(this)->find(handle));}
@@ -563,14 +552,29 @@ IOReturn NativeAdrenoVm::auditRange(uint64_t iova,size_t bytes,uint32_t *lines,u
     }
     return kIOReturnBadArgument;
 }
+/* The DRAM word at offset of memory, through the board's uncached reader: system memory has no kernel mapping. */
+static bool dramWord(const NativeAdrenoMemory &memory,size_t offset,uint32_t *value)
+{
+    if(!native_adreno_dram_read32)return false;
+    for(size_t j=0;j<memory.spanCount();++j) {
+        const auto &span=memory.spans()[j];
+        if(offset>=span.offset && offset-span.offset<span.bytes)return !native_adreno_dram_read32(span.physical+(offset-span.offset),value);
+    }
+    return false;
+}
 IOReturn NativeAdrenoVm::peekWords(uint64_t iova,uint32_t *out,size_t count) const
 {
     if(!out || !attached_ || poisoned_)return kIOReturnBadArgument;
     for(size_t k=0;k<count;++k)out[k]=0;
     for(size_t i=0;i<high_;++i) {
         const Mapping &m=mappings_[i];
-        if(!m.memory || !m.memory->mapping() || iova<m.iova || iova-m.iova>=m.memory->bytes())continue;
+        if(!m.memory || iova<m.iova || iova-m.iova>=m.memory->bytes())continue;
         const size_t offset=(size_t)(iova-m.iova);
+        if(!m.memory->mapping()) {
+            for(size_t k=0;k<count && offset+4*k+4<=m.memory->bytes();++k)
+                if(!dramWord(*m.memory,offset+4*k,&out[k]))return kIOReturnUnsupported;
+            return kIOReturnSuccess;
+        }
         for(size_t k=0;k<count && offset+4*k+4<=m.memory->bytes();++k)out[k]=static_cast<const volatile uint32_t *>(m.memory->mapping())[offset/4+k];
         return kIOReturnSuccess;
     }
@@ -581,7 +585,8 @@ IOReturn NativeAdrenoVm::peekWordsUncached(uint64_t iova,uint32_t *out,size_t co
     if(!out || !attached_ || poisoned_ || !count)return kIOReturnBadArgument;
     for(size_t i=0;i<high_;++i) {
         const Mapping &m=mappings_[i];
-        if(!m.memory || !m.memory->mapping() || iova<m.iova || iova-m.iova>=m.memory->bytes())continue;
+        if(!m.memory || iova<m.iova || iova-m.iova>=m.memory->bytes())continue;
+        if(!m.memory->mapping())return peekWords(iova,out,count);   /* read from DRAM already */
         const size_t offset=(size_t)(iova-m.iova),first=offset&~(size_t)4095;
         const size_t end=offset+4*count<m.memory->bytes()?offset+4*count:m.memory->bytes();
         const size_t bytes=((end+4095)&~(size_t)4095)-first;
