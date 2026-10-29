@@ -358,12 +358,13 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t 
         const auto &span=memory->spans()[i];
         changes[i]={iova+span.offset,span.physical,span.bytes,permissions,writeback,shareability};
     }
+    /* preflight cleared the pages of conflicting aliases with every range of both regions (exclusive, or checked against the other
+     * classes' ranges there), so the table transaction does not check them against the existing ranges a second time: that pass
+     * sorted every other-class range on each import map (i35abaf83: imports not exclusive 1679 maps, 3.56 ms each, 79% of all map
+     * time). */
     ArmSmmu4KLiveRegion lower=region(0),high=region(1);ArmSmmu4KLiveResult update;
-    status=exclusive?
-        ArmSmmu4KLiveMapContextBatchExclusive(&io_,streams_->bank,context_,lower.arena?&lower:nullptr,
-            high.arena?&high:nullptr,upper,&visibility_[upper],changes,spans,budget_,&update):
-        ArmSmmu4KLiveUpdateContextBatch(&io_,streams_->bank,context_,lower.arena?&lower:nullptr,
-            high.arena?&high:nullptr,upper,&visibility_[upper],changes,spans,1,budget_,&update);
+    status=ArmSmmu4KLiveMapContextBatchExclusive(&io_,streams_->bank,context_,lower.arena?&lower:nullptr,
+        high.arena?&high:nullptr,upper,&visibility_[upper],changes,spans,budget_,&update);
     if(status==ArmSmmu4KCapacity) {
         /* No table page could be had: the kit linked only empty tables and wrote no leaf, so the map is undone and the VM stays usable,
          * as a failed io-pgtable map returns -ENOMEM. */
