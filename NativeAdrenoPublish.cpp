@@ -559,12 +559,28 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
         native_adreno_wait_outer[0]=native_adreno_wait_outer[0]+1;native_adreno_wait_outer[1]=native_adreno_wait_outer[1]+waited;
         if(waited>native_adreno_wait_outer[3])native_adreno_wait_outer[3]=waited;
     } else {
+        /* A BoAlloc's system pages are made and wired before the lock is taken (NativeAdrenoMemory::prepareSystem): i14aef633e spent 4.0 s
+         * in 5454 allocations under it, while every other process's submit, map and wait poll queued behind. The lock is held briefly
+         * first for the client's limits; pages the call does not take are given back after it. */
+        NativeAdrenoSystemPages pages{};
+        if(method==NativeAdrenoMethodBoAlloc && input && input_size==sizeof(NativeAdrenoAbiBoAlloc)) {
+            NativeAdrenoAbiBoAlloc request{};
+            memcpy(&request,input,sizeof(request));
+            IOLockLock(g.lock);
+            const uint64_t limit=connection->live_?connection->core_->boLimit():0;
+            IOLockUnlock(g.lock);
+            if(!request.contiguous && request.bytes && !(request.bytes&4095) && request.bytes<=limit)
+                (void)NativeAdrenoMemory::prepareSystem((size_t)request.bytes,NativeAdrenoUserClient::systemWriteCombined(),&pages);
+        }
         IOLockLock(g.lock);
+        if(connection->live_)connection->core_->offerSystemPages(pages.descriptor?&pages:nullptr);
         status=connection->live_?connection->core_->dispatch(method,input,input_size,output,output_size,&g.clock):kIOReturnNotReady;
+        if(connection->live_)connection->core_->offerSystemPages(nullptr);
         if(method==NativeAdrenoMethodBoMap && !status && connection->live_ && !connection->kernel_)
             if(NativeAdrenoClientRecord *record=clientRecord(connection->name_))
                 if(connection->core_->windowPeak()>>20>record->peak_mib)record->peak_mib=uint32_t(connection->core_->windowPeak()>>20);
         IOLockUnlock(g.lock);
+        NativeAdrenoMemory::discardSystem(&pages);
     }
     native_adreno_metal_diag.inflight=0;
     native_adreno_metal_diag.calls=native_adreno_metal_diag.calls+1;

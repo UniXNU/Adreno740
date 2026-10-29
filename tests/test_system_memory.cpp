@@ -51,6 +51,21 @@ int main()
     CHECK(!e.allocate(64u<<10,40,true,64u<<10) && e.mapping() && !e.system() && e.spanCount()==1);
     CHECK(!e.makeWriteCombined() && attribute_calls==1 && NativeAdrenoMemory::ownsAnyPage(e.spans(),1));
     CHECK(!e.release() && attribute_calls==2 && fixture.live.empty());
-    std::puts("PASS: system BOs: no task, no kernel mapping, write-combined entry, pressure, owned-page map, release");
+    /* Pages prepared before the driver's lock: a default-attribute BO's zero fill is written back there, allocateSystem adopts the
+     * descriptor without making or cleaning another, and pages it did not take go back whole. */
+    NativeAdrenoSystemPages pages{};
+    const unsigned prepared=fixture.prepared,cleans=physical_calls;
+    CHECK(!NativeAdrenoMemory::prepareSystem(64u<<10,false,&pages) && pages.descriptor && pages.cleaned && fixture.prepared==prepared+1);
+    CHECK(physical_calls>cleans);
+    const unsigned afterPrepare=physical_calls;
+    NativeAdrenoMemory f;
+    CHECK(!f.allocateSystem(64u<<10,40,64u<<10,false,&pages) && !pages.descriptor && f.system() && f.spanCount()==16);
+    CHECK(physical_calls==afterPrepare && fixture.prepared==prepared+1);
+    CHECK(!NativeAdrenoMemory::prepareSystem(64u<<10,true,&pages) && pages.descriptor && !pages.cleaned);
+    NativeAdrenoMemory g;   /* a request of another size makes its own */
+    CHECK(!g.allocateSystem(128u<<10,40,128u<<10,true,&pages) && pages.descriptor && fixture.prepared==prepared+3);
+    NativeAdrenoMemory::discardSystem(&pages);
+    CHECK(!pages.descriptor && !f.release() && !g.release() && fixture.live.empty());
+    std::puts("PASS: system BOs: no task, no kernel mapping, write-combined entry, pressure, owned-page map, release, prepared pages");
     return 0;
 }

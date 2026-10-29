@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 class IOBufferMemoryDescriptor;
+/* System memory prepared outside the driver's lock (NativeAdrenoMemory::prepareSystem). */
+struct NativeAdrenoSystemPages {IOBufferMemoryDescriptor *descriptor=nullptr;size_t bytes=0;bool write_combined=false,cleaned=false;};
 class IOMemoryDescriptor;
 struct NativeAdrenoPhysicalSpan {uint64_t offset,physical,bytes;};
 struct NativeAdrenoCpuState {
@@ -71,7 +73,13 @@ public:
      * (untagged-ed1611b1) filled with the runtime's 4-64 MiB blocks, 404 BOs fell back to scattered kernel memory, 96 allocations of
      * 96 MiB failed and the pressure it reported stayed on, so the clients' BO caches flushed and allocated again (5.6 GB of maintenance).
      * Client views map this descriptor itself (the VM object and its attribute), not its physical pages. */
-    IOReturn allocateSystem(size_t bytes,unsigned output_bits,size_t byte_budget,bool write_combined);
+    IOReturn allocateSystem(size_t bytes,unsigned output_bits,size_t byte_budget,bool write_combined,
+        struct NativeAdrenoSystemPages *prepared=nullptr);
+    /* allocateSystem's slow part, which needs no driver state: the descriptor made and wired (the VM's zero fill and attribute) and, for
+     * default-attribute pages, the zero fill written back. The caller does it before taking the driver's lock (i14aef633e: 5454 BoAllocs
+     * held it 4.0 s, every other process's submit waiting); allocateSystem adopts it, and discardSystem gives back one it did not take. */
+    static IOReturn prepareSystem(size_t bytes,bool write_combined,struct NativeAdrenoSystemPages *out);
+    static void discardSystem(struct NativeAdrenoSystemPages *);
     /* Memory pressure: the system could not give a user BO its memory (allocateSystem failed); cleared by the next one that succeeds.
      * Clients read it in Query and give their cached BOs back. */
     static bool memoryPressure();
