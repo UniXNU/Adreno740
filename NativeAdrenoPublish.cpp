@@ -63,6 +63,14 @@ extern "C" IOReturn native_gop_handoff_call(uint32_t op,task_t task,const void *
 enum : UInt32 {NativeAdrenoExportMethod=0x7100,NativeAdrenoExportMaxPiece=3968};
 extern "C" int boot_log_export_put(uint32_t generation,uint32_t total,uint32_t offset,const void *data,uint32_t size) __attribute__((weak_import));
 extern "C" {volatile uint32_t native_adreno_export_stats[4];}   /* [0] pieces taken, [1] refused, [2] last generation, [3] its total bytes */
+/* Import: method NativeAdrenoImportMethod reads the board's import region (the read-only part of the userdata reserve that the host writes,
+ * UniXNU-sheng drivers/ShengUfs native_ufs_import_read), which holds the pipeline caches compiled ahead on the host. Input {u64 byte offset},
+ * a multiple of 4096; output: whole 4096-byte blocks from there, at most NativeAdrenoImportMaxBytes. A zero-length output answers the
+ * region's size (u64). Only the render server may read it; no GPU state is touched. */
+enum : UInt32 {NativeAdrenoImportMethod=0x7101,NativeAdrenoImportMaxBytes=4096};
+extern "C" uint64_t native_ufs_import_blocks(void) __attribute__((weak_import));
+extern "C" int native_ufs_import_read(uint64_t,uint32_t,void *) __attribute__((weak_import));
+extern "C" {volatile uint64_t native_adreno_import_stats[3];}   /* [0] reads served, [1] refused, [2] bytes served */
 extern "C" IOMemoryDescriptor *native_gop_handoff_memory(void);
 
 /* Mailbox: a last-resort command channel for a sandbox that admits no external-method selector at all. It is one shared page (memory
@@ -571,6 +579,26 @@ IOReturn AGXDeviceUserClient::run(uint32_t method,const void *input,size_t input
         if(stored) {native_adreno_export_stats[1]=native_adreno_export_stats[1]+1;return kIOReturnBadArgument;}
         native_adreno_export_stats[0]=native_adreno_export_stats[0]+1;
         native_adreno_export_stats[2]=piece.generation;native_adreno_export_stats[3]=piece.total;
+        return kIOReturnSuccess;
+    }
+    if(method==NativeAdrenoImportMethod) {
+        char caller[20]={};proc_selfname(caller,sizeof caller);
+        uint64_t offset=0;
+        if(input && input_size==sizeof(offset))memcpy(&offset,input,sizeof(offset));
+        const uint64_t blocks=&native_ufs_import_blocks && &native_ufs_import_read?native_ufs_import_blocks():0;
+        IOReturn status=kIOReturnBadArgument;
+        if(!blocks)status=kIOReturnNotReady;
+        else if(input_size==sizeof(offset) && !strncmp(caller,"backboardd",sizeof caller) && !(offset&4095)) {
+            if(output_size==sizeof(uint64_t) && output) {
+                /* The size query: an output of exactly eight bytes answers the region's bytes instead of data. */
+                const uint64_t bytes=blocks*4096;memcpy(output,&bytes,sizeof(bytes));status=kIOReturnSuccess;
+            } else if(output && output_size && output_size<=NativeAdrenoImportMaxBytes && !(output_size&4095) &&
+                offset/4096+output_size/4096<=blocks)
+                status=native_ufs_import_read(offset/4096,uint32_t(output_size/4096),output)?kIOReturnSuccess:kIOReturnIOError;
+        }
+        if(status) {native_adreno_import_stats[1]=native_adreno_import_stats[1]+1;return status;}
+        native_adreno_import_stats[0]=native_adreno_import_stats[0]+1;
+        native_adreno_import_stats[2]=native_adreno_import_stats[2]+output_size;
         return kIOReturnSuccess;
     }
     if(method==NativeAdrenoMethodBoCpuUnmap && input && input_size==sizeof(NativeAdrenoAbiBoCpuUnmap)) {
