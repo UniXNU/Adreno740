@@ -42,6 +42,7 @@ class NativeAdrenoUserClient final {
     bool grow();
     void releaseEntries();
     uint32_t stats_slot_=4;   /* the board log's client row (4: the shared overflow row) */
+    uint64_t owned_bytes_=0,owned_peak_=0;   /* its own BOs' bytes now and at most (imports not counted), for the board log */
     NativeAdrenoHandleIndex index_;   /* live handle -> its entries_ index */
     size_t free_hint_=0,live_=0;   /* no free entry below free_hint_; live_ entries are used */
     /* Queues as msm's submitqueues: as many as the client creates (queue 0 from open), grown on demand. */

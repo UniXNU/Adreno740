@@ -207,6 +207,8 @@ IOReturn NativeAdrenoUserClient::query(NativeAdrenoAbiParams *params)
  * [4] bytes of the last refused request, [5] the window's highest mapped end in MiB above its start. Turnip turns any refusal into
  * VK_ERROR_OUT_OF_DEVICE_MEMORY, which its command streams do not check (int-237: backboardd wrote through a NULL stream pointer). */
 extern "C" {volatile uint32_t native_adreno_client_stats[5][6];}
+/* Per client slot: MiB of its own BOs live now and at most (imports not counted). */
+extern "C" {volatile uint32_t native_adreno_client_bytes[5][2];}
 static volatile uint32_t *clientStats(uint32_t slot) {
     return native_adreno_client_stats[slot<4?slot:4];
 }
@@ -258,6 +260,8 @@ IOReturn NativeAdrenoUserClient::allocBoInner(const NativeAdrenoAbiBoAlloc *requ
     publish(*entry);
     entry->mapped=0;entry->iova=0;entry->mapped_state=false;
     reply->handle=entry->handle;
+    owned_bytes_+=entry->memory.bytes();if(owned_bytes_>owned_peak_)owned_peak_=owned_bytes_;
+    {volatile uint32_t *b=native_adreno_client_bytes[stats_slot_<4?stats_slot_:4];b[0]=(uint32_t)(owned_bytes_>>20);b[1]=(uint32_t)(owned_peak_>>20);}
     return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoUserClient::importBo(const NativeAdrenoAbiBoImport *request,void *task,
@@ -355,8 +359,13 @@ IOReturn NativeAdrenoUserClient::freeBo(const NativeAdrenoAbiBoFree *request)
         if(unmap) {noteFreeRefused(entry->imported,entry->handle,unmap);return unmap;}
         entry->mapped_state=false;entry->mapped=0;entry->iova=0;
     }
+    const size_t bytes=entry->memory.bytes();
     const IOReturn release=entry->memory.release();
     if(release) {noteFreeRefused(entry->imported,entry->handle,release);return release;}
+    if(!entry->imported) {
+        owned_bytes_-=bytes<owned_bytes_?bytes:owned_bytes_;
+        native_adreno_client_bytes[stats_slot_<4?stats_slot_:4][0]=(uint32_t)(owned_bytes_>>20);
+    }
     if(entry->imported) {native_adreno_import_live[0]=native_adreno_import_live[0]-1;noteImportState(entry->handle,2);}
     clear(*entry);
     return kIOReturnSuccess;
