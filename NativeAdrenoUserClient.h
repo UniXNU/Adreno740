@@ -71,6 +71,7 @@ class NativeAdrenoUserClient final {
     uint64_t window_start_=0,window_bytes_=0,window_peak_=0;
     uint64_t next_handle_=1;
     bool open_=false;
+    NativeAdrenoSystemPages *offered_pages_=nullptr;
     Entry *find(uint64_t);
     Entry *free();
     void clear(Entry &);
@@ -104,6 +105,12 @@ public:
     uint32_t mappingLeases(uint32_t token) const;
     IOReturn query(NativeAdrenoAbiParams *);
     IOReturn allocBo(const NativeAdrenoAbiBoAlloc *,NativeAdrenoAbiBoAllocReply *);
+    /* BoAlloc's system pages prepared before the driver's lock (NativeAdrenoMemory::prepareSystem), offered to the next allocBo under the
+     * lock and withdrawn after it (null: none); allocBo takes them when they fit its request. */
+    void offerSystemPages(NativeAdrenoSystemPages *pages) {offered_pages_=pages;}
+    /* What prepareSystem needs before the lock: whether this client's BOs are write-combined, and its largest BO. */
+    static bool systemWriteCombined();
+    uint64_t boLimit() const {return maxBoBytes();}
     IOReturn allocBoInner(const NativeAdrenoAbiBoAlloc *,NativeAdrenoAbiBoAllocReply *);
     IOReturn mapBo(const NativeAdrenoAbiBoMap *,NativeAdrenoAbiBoMapReply *);
     /* BoImport: pins the caller's pages. Only the IOKit wrapper can call it, with the calling task; dispatch() refuses the method

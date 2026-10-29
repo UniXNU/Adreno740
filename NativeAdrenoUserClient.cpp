@@ -6,6 +6,7 @@ extern "C" volatile uint32_t native_adreno_trace_stage;
  * write-combine: no write-combined audit and no cache maintenance per submission. Effective only once the board proved IO coherence. */
 extern "C" {volatile uint32_t native_adreno_wc_enabled=1,native_adreno_owned_coherent=0;extern volatile uint32_t native_adreno_io_coherent;}
 static bool ownedCoherent() {return native_adreno_owned_coherent && native_adreno_io_coherent;}
+bool NativeAdrenoUserClient::systemWriteCombined() {return native_adreno_wc_enabled && !ownedCoherent();}
 /* BoImport record: [0] calls, [1] refused, [2..5] last refusal (status, stage, bytes, address), [6..9] first refusal. Stages 1..3 are this file's
  * checks, 10..19 NativeAdrenoMemory::importTask's. */
 extern "C" {volatile uint64_t native_adreno_import_diag[10];}
@@ -241,14 +242,14 @@ IOReturn NativeAdrenoUserClient::allocBoInner(const NativeAdrenoAbiBoAlloc *requ
     /* User BOs are write-combined for the CPU, as the GPU maps them non-cacheable: no per-submission cache maintenance.
      * int-147 kept them cacheable under IO coherence and mapped the GPU side write-back: the first Turnip IB executed zeros and the GPU hung
      * (the kernel's cacheable alias read zeros past the first line too). A coherent own BO needs a client that asks for a write-back view. */
-    const bool write_combined=native_adreno_wc_enabled && !ownedCoherent();
+    const bool write_combined=systemWriteCombined();
     IOReturn status;
     if(request->contiguous) {
         /* Only a caller that needs one physical run gets the kernel's contiguous allocation (XNU scans physical memory for it). */
         status=entry->memory.allocate((size_t)request->bytes,output_bits_,true,(size_t)request->bytes);
         if(!status && write_combined)status=entry->memory.makeWriteCombined();
     }
-    else status=entry->memory.allocateSystem((size_t)request->bytes,output_bits_,(size_t)request->bytes,write_combined);
+    else status=entry->memory.allocateSystem((size_t)request->bytes,output_bits_,(size_t)request->bytes,write_combined,offered_pages_);
     if(status) {
         /* A failed allocation can leave quarantine behind; never reuse it. */
         clear(*entry);
