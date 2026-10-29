@@ -595,8 +595,13 @@ IOReturn AGXDeviceUserClient::run(uint32_t method,const void *input,size_t input
         uint64_t offset=0;
         if(input && input_size==sizeof(offset))memcpy(&offset,input,sizeof(offset));
         const uint64_t blocks=&native_ufs_import_blocks && &native_ufs_import_read?native_ufs_import_blocks():0;
+        /* sheng-gpu-prime=0: no shader priming at all. The render server's plugin reads this refusal as "neither import the pipelines
+         * compiled ahead nor prime the OS's libraries itself" (AdrenoMetal CacheImport.h, cacheimport::gPrimingOff). */
+        static int prime=-1;
+        if(prime<0) {uint32_t value=1;PE_parse_boot_argn("sheng-gpu-prime",&value,sizeof value);prime=value?1:0;}
         IOReturn status=kIOReturnBadArgument;
-        if(!blocks)status=kIOReturnNotReady;
+        if(!prime)status=kIOReturnNotPermitted;
+        else if(!blocks)status=kIOReturnNotReady;
         else if(input_size==sizeof(offset) && !strncmp(caller,"backboardd",sizeof caller) && !(offset&4095)) {
             if(output_size==sizeof(uint64_t) && output) {
                 /* The size query: an output of exactly eight bytes answers the region's bytes instead of data. */
