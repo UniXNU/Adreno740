@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: MIT */
-/* IOKit entry points the Turnip darwin backend uses, answered by the host copy of the kernel stack. Inserted with DYLD_INSERT_LIBRARIES
+/* IOKit entry points the Turnip darwin backend uses, answered by the host copy of the kernel stack; every other service is the system's. Inserted with DYLD_INSERT_LIBRARIES
  * and redirected by dyld interposing. Never built for the tablet. */
 #include <IOKit/IOKitLib.h>
 #include <mach/mach.h>
@@ -46,24 +46,27 @@ static CFMutableDictionaryRef shim_IOServiceMatching(const char *name) {
     if(trace())fprintf(stderr,"shim: IOServiceMatching(%s)\n",name);
     if(!strcmp(name,"NativeAdrenoGpuPublished"))return reinterpret_cast<CFMutableDictionaryRef>(1);
     if(!strcmp(name,"IOAcceleratorES"))return reinterpret_cast<CFMutableDictionaryRef>(2);
-    return nullptr;
+    return IOServiceMatching(name);   /* any other service is the system's (IOSurface for a CARenderer instrument) */
 }
 static io_service_t shim_IOServiceGetMatchingService(mach_port_t,CFDictionaryRef matching) {
     if(trace())fprintf(stderr,"shim: IOServiceGetMatchingService(%p)\n",(const void *)matching);
-    return static_cast<io_service_t>(reinterpret_cast<uintptr_t>(matching));
+    const uintptr_t ours=reinterpret_cast<uintptr_t>(matching);
+    if(ours==1 || ours==2)return static_cast<io_service_t>(ours);
+    return IOServiceGetMatchingService(kIOMainPortDefault,matching);
 }
 static kern_return_t shim_IOServiceOpen(io_service_t service,task_port_t,uint32_t type,io_connect_t *connect) {
     if(trace())fprintf(stderr,"shim: IOServiceOpen(%u, 0x%x)\n",service,type);
-    if(service!=1 && service!=2)return kIOReturnBadArgument;
+    if(service!=1 && service!=2)return IOServiceOpen(service,mach_task_self(),type,connect);
     if(service==2 && type!=0x4147)return kIOReturnNotPermitted;
     const kern_return_t kr=translate(host_gpu_open());
     if(trace())fprintf(stderr,"shim: open -> 0x%x\n",kr);
     if(kr==KERN_SUCCESS) {*connect=7;gOpenKind=service;}
     return kr;
 }
-static kern_return_t shim_IOServiceClose(io_connect_t) {return translate(host_gpu_close());}
-static kern_return_t shim_IOObjectRelease(io_object_t) {return KERN_SUCCESS;}
-static kern_return_t shim_IOConnectCallStructMethod(mach_port_t,uint32_t selector,const void *in,size_t in_size,void *out,size_t *out_size) {
+static kern_return_t shim_IOServiceClose(io_connect_t connect) {return connect==7?translate(host_gpu_close()):IOServiceClose(connect);}
+static kern_return_t shim_IOObjectRelease(io_object_t object) {return object==1 || object==2 || object==7?KERN_SUCCESS:IOObjectRelease(object);}
+static kern_return_t shim_IOConnectCallStructMethod(mach_port_t connect,uint32_t selector,const void *in,size_t in_size,void *out,size_t *out_size) {
+    if(connect!=7)return IOConnectCallStructMethod(connect,selector,in,in_size,out,out_size);
     if(gOpenKind==2) {
         if(selector!=kAdmitted)return kIOReturnNotPermitted;
         const uint32_t *header=static_cast<const uint32_t *>(in);
@@ -79,13 +82,16 @@ static kern_return_t shim_IOConnectCallStructMethod(mach_port_t,uint32_t selecto
     }
     return translate(host_gpu_call(selector,in,in_size,out,out_size?*out_size:0));
 }
-static kern_return_t shim_IOConnectMapMemory64(io_connect_t,uint32_t type,task_port_t,mach_vm_address_t *address,mach_vm_size_t *size,IOOptionBits) {
+static kern_return_t shim_IOConnectMapMemory64(io_connect_t connect,uint32_t type,task_port_t task,mach_vm_address_t *address,mach_vm_size_t *size,
+    IOOptionBits options) {
+    if(connect!=7)return IOConnectMapMemory64(connect,type,task,address,size,options);
     void *mapping=nullptr;uint64_t bytes=0;
     const kern_return_t kr=translate(host_gpu_map(type,&mapping,&bytes));
     if(kr==KERN_SUCCESS) {*address=reinterpret_cast<mach_vm_address_t>(mapping);*size=bytes;}
     return kr;
 }
-static kern_return_t shim_IOConnectUnmapMemory64(io_connect_t,uint32_t,task_port_t,mach_vm_address_t) {
+static kern_return_t shim_IOConnectUnmapMemory64(io_connect_t connect,uint32_t type,task_port_t task,mach_vm_address_t address) {
+    if(connect!=7)return IOConnectUnmapMemory64(connect,type,task,address);
     return getenv("HOSTSIM_FAIL_USER_UNMAP") ? kIOReturnIOError : KERN_SUCCESS;
 }
 /* HOSTSIM_PAGE_SIZE=4096: Turnip sizes and places BOs with the page size (os_get_page_size, getpagesize), 16 KiB on this Mac and 4 KiB on the
