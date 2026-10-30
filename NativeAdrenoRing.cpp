@@ -62,6 +62,10 @@ enum : uint32_t {
      * in the entry is the UCHE flush Linux sends after the switch. */
     RingSmmuTableUpdate = 0x53,
     RingTableWords = 7,
+    RingRegToMem = 0x3e,      /* CP_REG_TO_MEM */
+    RingAlwaysOnCounter = 0x0980,   /* CP_ALWAYS_ON_COUNTER, 64 bit */
+    RingStampWords = 4,
+    RingStampOffset = 512,    /* the timeline slots in the fence page: 64 of 16 bytes */
     RingFenceWords = 7,       /* kernel bring-up submissions: TYPE4 scratch + TYPE7 event */
     RingFramedFenceWords = 31,/* user submissions: scratch, BV timestamp, BR wait, ring timestamp */
     RingBvFenceOffset = 12    /* msm_rbmemptrs.bv_fence; +8 is bv_rptr, the BV RPTR shadow hw init programs */
@@ -159,16 +163,23 @@ static size_t packet(uint32_t *words,size_t at,uint32_t opcode,const uint32_t *p
     for(uint32_t i=0;i<count;++i)words[at+1+i]=payload[i];
     return at+1+count;
 }
+/* CP_REG_TO_MEM of the always-on counter into the timeline slot of this fence (second: the end half). */
+static size_t stamp(uint32_t *words,size_t at,uint64_t fence_iova,uint32_t seqno,bool end)
+{
+    const uint64_t to=fence_iova+RingStampOffset+(uint64_t)(seqno&63)*16+(end?8:0);
+    const uint32_t payload[3]={RingAlwaysOnCounter|(2u<<18)|(1u<<30),(uint32_t)to,(uint32_t)(to>>32)};
+    return packet(words,at,RingRegToMem,payload,3);
+}
 /* Thread selection and IFPC disable before the user buffers, as a7xx_submit() does; the first submission after
  * requestContextReset() also carries the context entry a6xx_set_pagetable() emits when a new context first submits.
  * Every prologue ends its BR-only part with the GPU cache flush and invalidate described at RingCacheFlush7. */
 IOReturn NativeAdrenoRing::emitPrologue(uint32_t at,bool reset,bool table,uint32_t *end)
 {
     const uint32_t mask=(uint32_t)(ring_bytes_/4-1);
-    uint32_t words[RingPrologueWords+RingResetWords+RingTableWords]={0};
+    uint32_t words[RingPrologueWords+RingResetWords+RingTableWords+RingStampWords]={0};
     const uint32_t br=RingSyncThreads|RingThreadBr,syncBoth=RingSyncThreads|RingThreadBoth,both=RingThreadBoth,marker=0x101;
     if(table && !reset)return poison();
-    const uint32_t count=RingPrologueWords+(reset?RingResetWords:0)+(table?RingTableWords:0);
+    const uint32_t count=RingPrologueWords+(reset?RingResetWords:0)+(table?RingTableWords:0)+(stamps_?RingStampWords:0);
     size_t n=packet(words,0,RingThreadControl,&br,1);
     if(reset) {
         const uint64_t at4=fence_iova_+4;
@@ -194,6 +205,7 @@ IOReturn NativeAdrenoRing::emitPrologue(uint32_t at,bool reset,bool table,uint32
     if(n)n=packet(words,n,RingFenceOpcode,&flush,1);
     if(n)n=packet(words,n,RingFenceOpcode,&invalidate7,1);
     if(n)n=packet(words,n,RingWaitForIdle,nullptr,0);
+    if(n && stamps_)n=stamp(words,n,fence_iova_,seqno_+1,false);
     if(n)n=packet(words,n,RingThreadControl,&both,1);
     if(n)n=packet(words,n,RingSetMarker,&marker,1);
     if(n!=count)return poison();
@@ -220,7 +232,8 @@ IOReturn NativeAdrenoRing::emitFence(uint32_t at,uint32_t seqno,uint32_t *end)
 IOReturn NativeAdrenoRing::emitFramedFence(uint32_t at,uint32_t seqno,uint32_t *end)
 {
     const uint32_t mask=(uint32_t)(ring_bytes_/4-1);
-    uint32_t words[RingFramedFenceWords]={0};
+    uint32_t words[RingFramedFenceWords+RingStampWords]={0};
+    const uint32_t total=RingFramedFenceWords+(stamps_?RingStampWords:0);
     if(AdrenoPM4Type4(RingScratch,1,&words[0])!=AdrenoPM4Success)return poison();
     words[1]=seqno;
     /* The timestamp goes to +4 (msm_rbmemptrs.fence), where wait() reads it; +0 is the CP's RPTR shadow. */
@@ -231,6 +244,7 @@ IOReturn NativeAdrenoRing::emitFramedFence(uint32_t at,uint32_t seqno,uint32_t *
     const uint32_t bvWait[4]={0,(uint32_t)bv,(uint32_t)(bv>>32),seqno};
     const uint32_t fence[4]={RingFenceEvent|RingFenceEnable|RingFenceIrq,(uint32_t)at4,(uint32_t)(at4>>32),seqno};
     size_t n=packet(words,2,RingThreadControl,&br,1);
+    if(n && stamps_)n=stamp(words,n,fence_iova_,seqno,true);
     if(n)n=packet(words,n,RingFenceOpcode,&depth,1);
     if(n)n=packet(words,n,RingFenceOpcode,&color,1);
     if(n)n=packet(words,n,RingThreadControl,&bvThread,1);
@@ -240,9 +254,9 @@ IOReturn NativeAdrenoRing::emitFramedFence(uint32_t at,uint32_t seqno,uint32_t *
     if(n)n=packet(words,n,RingFenceOpcode,fence,4);
     if(n)n=packet(words,n,RingThreadControl,&both,1);
     if(n)n=packet(words,n,RingSetMarker,&marker,1);
-    if(n!=RingFramedFenceWords)return poison();
-    for(uint32_t i=0;i<RingFramedFenceWords;++i)ring_[(at+i)&mask]=words[i];
-    *end=(at+RingFramedFenceWords)&mask;return kIOReturnSuccess;
+    if(n!=total)return poison();
+    for(uint32_t i=0;i<total;++i)ring_[(at+i)&mask]=words[i];
+    *end=(at+total)&mask;return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoRing::attach(const NativeAdrenoRingIo *io,const NativeAdrenoRingCache *cache,
     void *ring,size_t ring_bytes,uint64_t ring_iova,void *fence,size_t fence_bytes,uint64_t fence_iova)
@@ -292,6 +306,19 @@ IOReturn NativeAdrenoRing::restart(uint32_t completed)
     seqno_=completed;completed_=completed;
     context_=0;reset_pending_=true;table_=0;table_pending_=false;
     return kIOReturnSuccess;
+}
+uint32_t NativeAdrenoRing::timeline(uint32_t fence,uint64_t *start,uint64_t *end)
+{
+    /* status bits: 1 attached, 2 stamps on, 4 page big enough, 8 page acquired, 16 slot read */
+    if(!start || !end)return 0;
+    *start=*end=0;
+    uint32_t status=(attached_?1u:0u)|(stamps_?2u:0u)|(fence_bytes_>=RingStampOffset+64*16?4u:0u);
+    if(status!=7)return status;
+    if(cache_.acquire(cache_.cookie,fence_,fence_bytes_))return status;
+    status|=8;
+    const volatile uint32_t *slot=fence_+(RingStampOffset+(fence&63)*16)/4;
+    *start=(uint64_t)slot[1]<<32|slot[0];*end=(uint64_t)slot[3]<<32|slot[2];
+    return status|16;   /* the raw words: the caller judges them */
 }
 IOReturn NativeAdrenoRing::fenceValue(uint32_t *value)
 {
@@ -391,7 +418,7 @@ IOReturn NativeAdrenoRing::submitWords(const uint32_t *words,size_t word_count,u
     const uint32_t size_words=(uint32_t)(ring_bytes_/4),mask=size_words-1;
     const bool reset=framed && reset_pending_,table=reset && table_pending_;
     /* A plain (kernel) submission cannot carry the switch: a pending table waits for the next framed one. */
-    const uint32_t extra=framed?RingPrologueWords+(reset?RingResetWords:0)+(table?RingTableWords:0)+RingFramedFenceWords:RingFenceWords;
+    const uint32_t extra=framed?RingPrologueWords+(reset?RingResetWords:0)+(table?RingTableWords:0)+RingFramedFenceWords+(stamps_?2*RingStampWords:0):RingFenceWords;
     if(word_count>size_words-extra-8)return kIOReturnNoResources;
     uint32_t rptr=0;IOReturn status=readRptr(&rptr);
     if(status)return status;
