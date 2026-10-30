@@ -890,6 +890,17 @@ static IOReturn checkCpSwitch()
     if(!status && !freed && observed)status=kIOReturnNotPermitted;
     return status?status:freed;
 }
+/* For the display's direct scanout (NativeLegacyDisplay): the newest fence handed out and the newest one the CP has written. The compositor
+ * submits a frame's swap when its command buffer is scheduled, not when the GPU finished it; a display that reads the surface itself waits
+ * for the fences handed out before the swap arrived. False before the GPU is published. */
+extern "C" bool native_adreno_fences(uint32_t *submitted,uint32_t *retired)
+{
+    if(!g.published || !g.ring || !submitted || !retired)return false;
+    uint32_t value=0;
+    if(g.ring->fenceValue(&value))return false;
+    *submitted=g.ring->lastSubmitted();*retired=value;
+    return true;
+}
 /* Publishes the service once. Everything passed in must outlive the system (the board probe keeps them in statics) and
  * the VM, submit object and ring must already be attached to the live GPU context. The core must not be open. */
 extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit *submit,NativeAdrenoRing *ring,
