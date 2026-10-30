@@ -60,10 +60,10 @@ extern "C" {volatile uint32_t native_adreno_ib_log[4][4+28];volatile uint32_t na
 extern "C" volatile uint32_t native_adreno_table_switches[8];
 /* Where the last recover() stopped: [0] the step (1 fence read, 2 restart hook, 3 table write, 4 nop encode, 5 replay vm, 6 replay submit), [1] the IOReturn or value there, [2] fence, [3] last submitted. */
 extern "C" {volatile uint32_t native_adreno_recover_trace[4];}
-/* The jobs' timeline (the newest 256 retired): [0] fence | indirect buffers << 32, [1] submit time (us), [2] the CP's always-on counter before the
+/* The jobs' timeline (the newest native_adreno_tl_cap retired, allocated at attach): [0] fence | indirect buffers << 32, [1] submit time (us), [2] the CP's always-on counter before the
  * job's buffers, [3] after them (19.2 MHz ticks; 0 when not stamped), [4] GPU level at submit | observed retire time << 8 (us, low 56 bits),
  * [5] jobs retired before it that are still counted (the sequence number). native_adreno_tl_count is the total. */
-extern "C" {volatile uint64_t native_adreno_tl[256][6];volatile uint32_t native_adreno_tl_count;}
+extern "C" {volatile uint64_t (*native_adreno_tl)[6]=nullptr;volatile uint32_t native_adreno_tl_cap=0;volatile uint32_t native_adreno_tl_count;}
 /* The stall handler's actions (the newest 32): [0] time (us), [1] fence, [2] event (1 write pointer given again and translations dropped, 3 bus drain,
  * 4 snapshot, 0 the stall ended) | timed-out waits << 8, [3] time the fence had been pending (us), [4] read and write pointer before | after << 32 for
  * events 1 and 3, [5] client queue, [6] the job's first buffer handle | its buffer count << 48, [7] the sequence number. */
@@ -95,6 +95,11 @@ IOReturn NativeAdrenoSubmit::attach(NativeAdrenoVm *vm,NativeAdrenoRing *ring)
     if(attached_ || poisoned_ || vm_ || ring_)return kIOReturnBusy;
     if(!vm || !ring || vm->poisoned() || ring->poisoned())return kIOReturnBadArgument;
     vm_=vm;ring_=ring;attached_=true;stats_={};table_vm_=vm;
+    if(!native_adreno_tl) {
+        const uint32_t cap=16384;
+        volatile uint64_t (*memory)[6]=(volatile uint64_t (*)[6])IOMallocZero(sizeof(uint64_t)*6*cap);
+        if(memory) {native_adreno_tl=memory;native_adreno_tl_cap=cap;}
+    }
     return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoSubmit::setTableSwitching(unsigned mode,IOReturn (*write)(void *,uint64_t),void *cookie)
@@ -146,11 +151,13 @@ IOReturn NativeAdrenoSubmit::release(Job &job)
     if(vm->acquireImported())return poison();
     {
         uint64_t start=0,end=0;
-        const uint32_t n=native_adreno_tl_count;volatile uint64_t *slot=native_adreno_tl[n&255];
         const uint32_t stamped=ring_?ring_->timeline(job.fence,&start,&end):0;
-        slot[0]=(uint64_t)job.fence|(uint64_t)job.count<<32|(uint64_t)stamped<<58;slot[1]=job.submit_us;
-        slot[2]=start;slot[3]=end;slot[4]=(uint64_t)job.level;slot[5]=n;
-        native_adreno_tl_count=n+1;
+        if(native_adreno_tl_cap) {
+            const uint32_t n=native_adreno_tl_count;volatile uint64_t *slot=native_adreno_tl[n&(native_adreno_tl_cap-1)];
+            slot[0]=(uint64_t)job.fence|(uint64_t)job.count<<32|(uint64_t)stamped<<58;slot[1]=job.submit_us;
+            slot[2]=start;slot[3]=end;slot[4]=(uint64_t)job.level;slot[5]=n;
+            native_adreno_tl_count=n+1;
+        }
     }
     job={};return kIOReturnSuccess;
 }
