@@ -448,7 +448,7 @@ bool NativeAdrenoGpuService::start(IOService *provider)
                                             ring_status=ring_.attach(&ring_io,&cache,ring_mem_.mapping(),
                                                 ring_bytes,ring_iova,fence_mem_.mapping(),fence_bytes,fence_iova);
                                             /* sheng-gpu-timeline (default 1): framed submissions stamp the CP's always-on counter before and after their buffers. */
-                                            {unsigned timeline=1;PE_parse_boot_argn("sheng-gpu-timeline",&timeline,sizeof(timeline));ring_.setTimeline(timeline!=0);}
+                                            {unsigned timeline=0;const bool given=PE_parse_boot_argn("sheng-gpu-timeline",&timeline,sizeof(timeline));ring_.setTimeline(!given || timeline!=0);}   /* the argument only turns it off */
                                             if(!ring_status && sqe_bytes) {
                                                 memcpy(sqe_mem_.mapping(),native_adreno_sqe_firmware_image,
                                                     size_t(native_adreno_sqe_firmware_image_size));
