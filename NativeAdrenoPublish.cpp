@@ -79,7 +79,14 @@ class AGXDeviceUserClient;
 /* The render server's connection serves the mailbox; it is retained while set (under g.lock), so the poller never runs on a freed object. */
 static AGXDeviceUserClient *gMailboxOwner=nullptr;
 void nativeAdrenoMailboxPoller(void *,wait_result_t);
-static IOReturn runCore(AGXDeviceUserClient *,uint32_t method,const void *input,size_t input_size,void *output,size_t output_size);
+static IOReturn runCore(AGXDeviceUserClient *,uint32_t method,const void *input,size_t input_size,void *output,size_t output_size,uint64_t *lockWait);
+/* Every call into a connection, for the boot export (kernel.gpucalls.bin): when it came in (mach units), microseconds in the driver and
+ * of those waiting for the device lock, the ABI method, the caller's pid, the status, and for an allocation its KiB. The newest 262144;
+ * the board's export code allocates the ring once the home screen draws, and no call is recorded before. */
+struct NativeAdrenoCallRec {uint64_t entered;uint32_t us,lock_us;uint16_t method,flags;int32_t pid;uint32_t status,kib;};
+static_assert(sizeof(NativeAdrenoCallRec)==32,"call record");
+extern "C" {NativeAdrenoCallRec *native_adreno_call_ring;volatile uint32_t native_adreno_call_count;int proc_selfpid(void);}
+static void lockTimed(uint64_t *waited);
 
 /* The two sandbox gates IOServiceOpen applies after newUserClient (XNU IOUserClient.cpp is_io_service_open_extended): the MACF open check on
  * the client object and the sandbox's filter resolver. They are run here for the caller too, only to record which one refuses it. */
@@ -233,10 +240,11 @@ class AGXDeviceUserClient : public IOUserClient {
     void dropViews(uint32_t token);
     static IOReturn action(OSObject *target,void *reference,IOExternalMethodArguments *arguments);
     IOReturn run(uint32_t method,const void *input,size_t input_size,void *output,size_t output_size);
+    IOReturn runTimed(uint32_t method,const void *input,size_t input_size,void *output,size_t output_size,uint64_t *lockWait);
 public:
     void setHandoffOnly() {handoffOnly_=true;}
     bool mount(bool kernel);
-    friend IOReturn runCore(AGXDeviceUserClient *,uint32_t,const void *,size_t,void *,size_t);
+    friend IOReturn runCore(AGXDeviceUserClient *,uint32_t,const void *,size_t,void *,size_t,uint64_t *);
     friend void nativeAdrenoMailboxPoller(void *,wait_result_t);
     IOReturn clientClose() APPLE_KEXT_OVERRIDE;
     void free() APPLE_KEXT_OVERRIDE;
@@ -265,7 +273,7 @@ void nativeAdrenoMailboxPoller(void *,wait_result_t)
             AGXDeviceUserClient *owner=gMailboxOwner;
             if(owner)owner->retain();
             IOLockUnlock(g.lock);
-            status=owner?runCore(owner,method,input,in_size,output,out_size):kIOReturnNotReady;
+            status=owner?runCore(owner,method,input,in_size,output,out_size,nullptr):kIOReturnNotReady;
             if(owner)owner->release();
             if(!status)memcpy(const_cast<uint32_t *>(gMailboxWords)+0x200,output,out_size);
         }
@@ -511,7 +519,14 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
 /* Fence waits as the callers see them (int-147; method 6's own statistics count every poll): [0] waits, [1] us waited in total, [2] pauses
  * taken outside the connection lock, [3] the longest wait in us. */
 extern "C" {volatile uint64_t native_adreno_wait_outer[4];}
-static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const void *input,size_t input_size,void *output,size_t output_size)
+static void lockTimed(uint64_t *waited)
+{
+    if(!waited || IOLockTryLock(g.lock)) {if(!waited)IOLockLock(g.lock);return;}
+    const uint64_t began=mach_absolute_time();
+    IOLockLock(g.lock);
+    *waited+=mach_absolute_time()-began;
+}
+static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const void *input,size_t input_size,void *output,size_t output_size,uint64_t *lockWait)
 {
     if(method==NativeAdrenoMethodSetMetadata && input && input_size==sizeof(NativeAdrenoAbiMetadata)) {
         const NativeAdrenoAbiMetadata *meta=static_cast<const NativeAdrenoAbiMetadata *>(input);
@@ -540,7 +555,7 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
         uint64_t waited=0;
         for(;;) {
             /* The connection's own core while it is live; a close that ran between two polls ends the wait. */
-            IOLockLock(g.lock);
+            lockTimed(lockWait);
             status=connection->live_?connection->core_->dispatch(method,&poll,sizeof(poll),output,output_size,&g.clock):kIOReturnNotReady;
             IOLockUnlock(g.lock);
             waited=g.clock.now_us(g.clock.cookie)-began;
@@ -558,13 +573,13 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
         if(method==NativeAdrenoMethodBoAlloc && input && input_size==sizeof(NativeAdrenoAbiBoAlloc)) {
             NativeAdrenoAbiBoAlloc request{};
             memcpy(&request,input,sizeof(request));
-            IOLockLock(g.lock);
+            lockTimed(lockWait);
             const uint64_t limit=connection->live_?connection->core_->boLimit():0;
             IOLockUnlock(g.lock);
             if(!request.contiguous && request.bytes && !(request.bytes&4095) && request.bytes<=limit)
                 (void)NativeAdrenoMemory::prepareSystem((size_t)request.bytes,NativeAdrenoUserClient::systemWriteCombined(),&pages);
         }
-        IOLockLock(g.lock);
+        lockTimed(lockWait);
         if(connection->live_)connection->core_->offerSystemPages(pages.descriptor?&pages:nullptr);
         status=connection->live_?connection->core_->dispatch(method,input,input_size,output,output_size,&g.clock):kIOReturnNotReady;
         if(connection->live_)connection->core_->offerSystemPages(nullptr);
@@ -581,6 +596,23 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
     return status;
 }
 IOReturn AGXDeviceUserClient::run(uint32_t method,const void *input,size_t input_size,void *output,size_t output_size)
+{
+    uint64_t lockWait=0;
+    const uint64_t entered=mach_absolute_time();
+    const IOReturn status=runTimed(method,input,input_size,output,output_size,&lockWait);
+    if(NativeAdrenoCallRec *ring=native_adreno_call_ring) {
+        uint64_t ns=0,lockNs=0;
+        absolutetime_to_nanoseconds(mach_absolute_time()-entered,&ns);absolutetime_to_nanoseconds(lockWait,&lockNs);
+        const uint32_t n=__atomic_fetch_add(&native_adreno_call_count,1,__ATOMIC_RELAXED);
+        NativeAdrenoCallRec &r=ring[n&262143];
+        r.entered=entered;r.us=uint32_t(ns/1000);r.lock_us=uint32_t(lockNs/1000);r.method=uint16_t(method);r.flags=0;r.pid=proc_selfpid();
+        r.status=uint32_t(status);
+        r.kib=method==NativeAdrenoMethodBoAlloc && input && input_size==sizeof(NativeAdrenoAbiBoAlloc)?
+            uint32_t(static_cast<const NativeAdrenoAbiBoAlloc *>(input)->bytes>>10):0;
+    }
+    return status;
+}
+IOReturn AGXDeviceUserClient::runTimed(uint32_t method,const void *input,size_t input_size,void *output,size_t output_size,uint64_t *lockWait)
 {
     if(method>=NativeAdrenoHandoffBase && method<=NativeAdrenoHandoffLast)
         return native_gop_handoff_call(method-NativeAdrenoHandoffBase,current_task(),input,input_size,output,output_size);
@@ -618,7 +650,7 @@ IOReturn AGXDeviceUserClient::run(uint32_t method,const void *input,size_t input
         memcpy(&request,input,sizeof(request));
         NativeAdrenoAbiBoAllocReply reply{};
         native_adreno_metal_diag.inflight=method+1;
-        IOLockLock(g.lock);
+        lockTimed(lockWait);
         const IOReturn status=live_?core_->importBo(&request,current_task(),&reply):kIOReturnNotReady;
         IOLockUnlock(g.lock);
         native_adreno_metal_diag.inflight=0;
@@ -628,7 +660,7 @@ IOReturn AGXDeviceUserClient::run(uint32_t method,const void *input,size_t input
         if(!status)memcpy(output,&reply,sizeof(reply));
         return status;
     }
-    return runCore(this,method,input,input_size,output,output_size);
+    return runCore(this,method,input,input_size,output,output_size,lockWait);
 }
 IOReturn AGXDeviceUserClient::action(OSObject *target,void *,IOExternalMethodArguments *arguments)
 {
