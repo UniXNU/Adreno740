@@ -58,6 +58,8 @@ extern "C" {volatile uint32_t native_adreno_unstick[15];}
 /* The IBs of the last submissions: [slot] fence, iova low/high, bytes, then the first 28 dwords of the first IB (read as the kernel maps it). */
 extern "C" {volatile uint32_t native_adreno_ib_log[4][4+28];volatile uint32_t native_adreno_ib_log_count;}
 extern "C" volatile uint32_t native_adreno_table_switches[8];
+/* Where the last recover() stopped: [0] the step (1 fence read, 2 restart hook, 3 table write, 4 nop encode, 5 replay vm, 6 replay submit), [1] the IOReturn or value there, [2] fence, [3] last submitted. */
+extern "C" {volatile uint32_t native_adreno_recover_trace[4];}
 IOReturn NativeAdrenoSubmit::poison()
 {
     poisoned_=true;return kIOReturnIOError;
@@ -503,7 +505,9 @@ IOReturn NativeAdrenoSubmit::recover(NativeAdrenoRestart restart,void *cookie,co
     if(!restart)return kIOReturnUnsupported;
     const uint32_t last=ring_->lastSubmitted();
     uint32_t fence=0;
-    if(ring_->fenceValue(&fence) || fence>last)return poison();
+    {const IOReturn fr=ring_->fenceValue(&fence);
+    native_adreno_recover_trace[2]=fence;native_adreno_recover_trace[3]=last;
+    if(fr || fence>last) {native_adreno_recover_trace[0]=1;native_adreno_recover_trace[1]=uint32_t(fr);return poison();}}
     /* What already completed retires as usual. */
     for(auto &job:jobs_)if(job.active && job.fence<=fence) {
         IOReturn status=release(job);if(status)return status;
@@ -518,27 +522,29 @@ IOReturn NativeAdrenoSubmit::recover(NativeAdrenoRestart restart,void *cookie,co
     }
     IOReturn status=restart(cookie,ring_,hung);
     out->status=status;
-    if(status)return poison();
+    if(status) {native_adreno_recover_trace[0]=2;native_adreno_recover_trace[1]=uint32_t(status);return poison();}
     poisoned_=false;hang_fence_=hung;progress_retries_=0;
     if(guilty) {status=release(*guilty);if(status)return status;}
     /* The GPU is idle after the restart's CP init: the CPU installs the kernel table, and each replayed job switches to its own. */
     if(table_mode_) {
-        if(!write_table_ || write_table_(table_cookie_,vm_->ttbr0()))return poison();
+        if(!write_table_) {native_adreno_recover_trace[0]=3;native_adreno_recover_trace[1]=0;return poison();}
+        status=write_table_(table_cookie_,vm_->ttbr0());
+        if(status) {native_adreno_recover_trace[0]=3;native_adreno_recover_trace[1]=uint32_t(status);return poison();}
         if(table_mode_==2)ring_->tableInstalled(vm_->ttbr0());
         table_vm_=vm_;
     }
     uint32_t nop=0;
-    if(AdrenoPM4Type7(0x10,0,&nop)!=AdrenoPM4Success)return poison();   /* CP_NOP */
+    if(AdrenoPM4Type7(0x10,0,&nop)!=AdrenoPM4Success) {native_adreno_recover_trace[0]=4;return poison();}   /* CP_NOP */
     for(uint32_t next=hung+1;next && next<=last;++next) {
         Job *job=find(next);
         NativeAdrenoVm *vm=job && job->vm?job->vm:vm_;
         const bool run=job && !vm->unusable() && job->word_count;
         status=useVm(vm,clock);
-        if(status)return poison();
+        if(status) {native_adreno_recover_trace[0]=5;native_adreno_recover_trace[1]=uint32_t(status);return poison();}
         ring_->useContext(job?job->context:0);
         uint32_t value=0;
         status=ring_->submitFramed(run?job->words:&nop,run?job->word_count:1,&value);
-        if(status || value!=next)return poison();
+        if(status || value!=next) {native_adreno_recover_trace[0]=6;native_adreno_recover_trace[1]=status?uint32_t(status):value;return poison();}
         ++out->replayed;
     }
     ++stats_.restarts;

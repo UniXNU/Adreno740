@@ -5,6 +5,7 @@ extern "C" {volatile uint32_t native_adreno_trace_stage;}
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
 #include <kern/task.h>
+extern "C" boolean_t PE_parse_boot_argn(const char *,void *,int);
 
 static bool outputWidth(unsigned bits)
 {return bits==32 || bits==36 || bits==40 || bits==42 || bits==44 || bits==48;}
@@ -14,6 +15,8 @@ extern "C" {volatile uint32_t native_adreno_import_stage;volatile uint64_t nativ
 /* BO memory for the board log: [0] user BOs from the system (allocateSystem), [1] their spans, [2] refused, [3] the last refusal's status,
  * [4] MiB of them live, [5] the peak, [6] kernel-mapped BOs (allocate), [7] import spans. */
 extern "C" {volatile uint32_t native_adreno_bo_memory[8];}
+/* Contiguous BO runs: [0] made, [1] refused by the free memory (those BOs fell back to pageable pages). */
+extern "C" {volatile uint32_t native_adreno_bo_contig[2];}
 namespace {
 uint64_t systemBytes,systemPeak;
 bool pressure;
@@ -117,6 +120,17 @@ static IOBufferMemoryDescriptor *systemDescriptor(size_t bytes,bool write_combin
     IOOptionBits options=static_cast<IOOptionBits>(kIODirectionInOut)|static_cast<IOOptionBits>(kIOMemoryMapperNone)|
         static_cast<IOOptionBits>(kIOMemoryPageable);
     if(write_combined)options|=kIOMapWriteCombineCache;
+    /* Pageable pages arrive one by one (a BO averaged 69 spans); from `sheng-gpu-bo-contig` KiB up a BO first asks for one physically
+     * contiguous run (one span, one table walk), and a request the free memory cannot serve falls back to pageable pages. */
+    static uint32_t contigKiB=UINT32_MAX;
+    if(contigKiB==UINT32_MAX) {contigKiB=0;PE_parse_boot_argn("sheng-gpu-bo-contig",&contigKiB,sizeof contigKiB);}
+    if(contigKiB && bytes>=size_t(contigKiB)*1024) {
+        IOBufferMemoryDescriptor *run=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(nullptr,
+            (options&~static_cast<IOOptionBits>(kIOMemoryPageable))|static_cast<IOOptionBits>(kIOMemoryPhysicallyContiguous),bytes,UINT64_C(0xfffffffff000));
+        if(run && run->prepare()==kIOReturnSuccess) {native_adreno_bo_contig[0]=native_adreno_bo_contig[0]+1;return run;}
+        if(run)run->release();
+        native_adreno_bo_contig[1]=native_adreno_bo_contig[1]+1;
+    }
     IOBufferMemoryDescriptor *descriptor=IOBufferMemoryDescriptor::inTaskWithOptions(nullptr,options,bytes,4096);
     if(descriptor && descriptor->prepare()!=kIOReturnSuccess) {descriptor->release();descriptor=nullptr;}
     return descriptor;
