@@ -11,7 +11,6 @@ bool NativeAdrenoUserClient::systemWriteCombined() {return native_adreno_wc_enab
  * checks, 10..19 NativeAdrenoMemory::importTask's. */
 extern "C" {volatile uint64_t native_adreno_import_diag[10];}
 /* Imports of 16 MiB or more (the compositor's scanout surfaces), oldest overwritten: per entry the caller's address, the first physical page, the bytes. */
-extern "C" {volatile uint64_t native_adreno_import_big[16*3];volatile uint32_t native_adreno_import_big_count;}
 extern "C" volatile uint32_t native_adreno_import_stage;
 /* Imports and their release (int-233/234: Core Animation's render thread waited in vm_deallocate for pages a kernel wiring held): [0] imports
  * alive, [1] frees of an import refused, [2] last refusal status; then the 8 newest imports as {address, pid<<40|bytes, handle, state}, state
@@ -291,11 +290,6 @@ IOReturn NativeAdrenoUserClient::importBo(const NativeAdrenoAbiBoImport *request
     entry->mapped=0;entry->iova=0;entry->mapped_state=false;entry->imported=true;
     reply->handle=entry->handle;
     native_adreno_import_live[0]=native_adreno_import_live[0]+1;
-    if(request->bytes>=(16ull<<20) && entry->memory.spanCount()) {
-        const uint32_t n=native_adreno_import_big_count;native_adreno_import_big_count=n+1;
-        const unsigned at=(n%16)*3;
-        native_adreno_import_big[at]=request->address;native_adreno_import_big[at+1]=entry->memory.spans()[0].physical;native_adreno_import_big[at+2]=request->bytes;
-    }
     {
         const unsigned slot=3+(gImportNext++%8)*4;
         native_adreno_import_live[slot]=request->address;native_adreno_import_live[slot+1]=(uint64_t)proc_selfpid()<<40|request->bytes;

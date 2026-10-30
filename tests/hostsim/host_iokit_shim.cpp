@@ -110,3 +110,10 @@ INTERPOSE(shim_IOObjectRelease, IOObjectRelease);
 INTERPOSE(shim_IOConnectCallStructMethod, IOConnectCallStructMethod);
 INTERPOSE(shim_IOConnectMapMemory64, IOConnectMapMemory64);
 INTERPOSE(shim_IOConnectUnmapMemory64, IOConnectUnmapMemory64);
+
+// Symbols the driver sources reference that the board package provides on the tablet: the GPU level the submit log records, and the boot
+// argument reader (no argument is ever set on the host).
+extern "C" {
+volatile uint32_t native_gpu_dcvs[15];
+int PE_parse_boot_argn(const char *, void *, int) {return 0;}
+}

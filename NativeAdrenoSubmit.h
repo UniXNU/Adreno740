@@ -53,6 +53,8 @@ class NativeAdrenoSubmit final {
         uint64_t vm_next=0;   /* NativeAdrenoVm::nextHandle() at submission: a mapping with a handle from it on came later */
         NativeAdrenoVm *vm=nullptr;   /* the GPU address space (process page table) the job's buffers belong to */
         uint32_t context=0;           /* the ring context it ran in (NativeAdrenoRing::useContext) */
+        uint64_t submit_us=0;         /* the clock when the write pointer moved (0: no clock), and the GPU level then (native_gpu_dcvs) */
+        uint32_t level=0;
         size_t word_count=0;          /* its ring words (the IB packets), kept to replay it after a GPU restart */
         uint32_t words[NativeAdrenoSubmitMaxBuffers*4]{};
     };

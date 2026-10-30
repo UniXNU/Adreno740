@@ -60,6 +60,9 @@ class NativeAdrenoRing final {
     /* The GPU page table the CP runs (TTBR0 with its ASID in bits 63:48) and whether the next framed prologue must switch to it. */
     uint64_t table_=0;
     bool table_pending_=false;
+    /* Timeline stamps: a framed submission reads the CP's always-on counter (19.2 MHz) into the fence page before its user buffers and after
+     * them, as a6xx_submit() does for its stats (CP_REG_TO_MEM, REG 0x0980, 64 bit). Slot fence % 64 at +512, 16 bytes: start, end. */
+    bool stamps_=false;
     IOReturn poison();
     IOReturn writeWptr(uint32_t value);
     IOReturn readRptr(uint32_t *);
@@ -93,6 +96,10 @@ public:
     /* The next framed submission starts with the A7XX context entry of a6xx_set_pagetable() (BR/BV counters, on-chip
      * timestamps and resource table cleared between thread syncs); a new user client requests it, as Linux does per context. */
     void requestContextReset() {reset_pending_=true;}
+    /* Turns the timeline stamps on or off for the framed submissions after this call; off by default. */
+    void setTimeline(bool on) {stamps_=on;}
+    /* The always-on counter ticks the CP read before and after the user buffers of a fence's submission (a status word: 1 attached, 2 stamps on, 4 page big enough, 8 page acquired, 16 slot read). Invalidates the fence page first. */
+    uint32_t timeline(uint32_t fence,uint64_t *start,uint64_t *end);
     /* The client whose submission comes next. A change of client is a context switch: as a6xx_set_pagetable() does whenever the
      * submitting context differs from the ring's last one, the next framed prologue carries the context entry. Turnip's BR/BV barriers
      * keep on-chip timestamps and counters that only that entry resets, so clients sharing the ring without it left one client's
@@ -154,5 +161,6 @@ public:
     uint32_t completedFence() const {return completed_;}
     uint32_t submissions() const {return submissions_;}
     uint32_t readPointer() const {return rptr_shadow_;}
+    uint32_t writePointer() const {return next_;}
 };
 #endif

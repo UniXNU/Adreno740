@@ -4,6 +4,7 @@
 #define NATIVE_ADRENO_XNU_MEMORY_FIXTURE_H
 #include <cstddef>
 #include <cstdint>
+typedef int boolean_t;   /* the kernel's PE_parse_boot_argn declaration in NativeAdrenoMemory.cpp */
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>

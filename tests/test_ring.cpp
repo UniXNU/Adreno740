@@ -116,6 +116,29 @@ int main()
         CHECK(r.wait(2,&clock_,5000,&observed)==NativeAdrenoRingFenceArgument);
         CHECK(r.detach()==kIOReturnSuccess);
     }
+    /* Timeline stamps: the CP's always-on counter is read into the fence page before the user words and after them, and read back by fence. */
+    {
+        reset();NativeAdrenoRing r;
+        CHECK(attach(r)==kIOReturnSuccess);
+        r.setTimeline(true);
+        const uint32_t words[4]={0x11111111,0x22222222,0x33333333,0x44444444};
+        uint32_t end=0;
+        CHECK(r.submitFramed(words,4,&end)==kIOReturnSuccess && end==1);
+        CHECK(peer.writes.back().first==0x0807 && peer.writes.back().second==46+8);
+        auto op=[](uint32_t header) {return (header>>28)==7u?(header>>16)&0x7fu:0xffu;};
+        CHECK(op(ring[6])==0x26 && op(ring[7])==0x3e && ring[8]==(0x980u|(2u<<18)|(1u<<30)) && ring[9]==0x108000u+512+16 && ring[10]==0);
+        CHECK(op(ring[11])==0x17 && ring[12]==3 && op(ring[13])==0x65 && ring[14]==0x101);
+        for(unsigned i=0;i<4;++i)CHECK(ring[15+i]==words[i]);
+        CHECK(op(ring[21])==0x17 && ring[22]==1 && op(ring[23])==0x3e && ring[24]==(0x980u|(2u<<18)|(1u<<30)) && ring[25]==0x108000u+512+16+8 && ring[26]==0);
+        CHECK(op(ring[27])==0x46 && ring[28]==0x18);
+        uint64_t start=0,stop=0;
+        fence[132]=1000;fence[133]=0;fence[134]=1700;fence[135]=0;
+        CHECK(r.timeline(1,&start,&stop)==31 && start==1000 && stop==1700);
+        fence[134]=0;fence[135]=0;
+        CHECK(r.timeline(1,&start,&stop)==31 && start==1000 && stop==0);
+        NativeAdrenoRing off;
+        CHECK(attach(off)==kIOReturnSuccess && off.timeline(1,&start,&stop)==5);
+    }
     /* A requested context reset puts a6xx_set_pagetable()'s A7XX context entry into the next framed prologue, once. */
     {
         reset();NativeAdrenoRing r;CHECK(attach(r)==kIOReturnSuccess);
