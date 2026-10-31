@@ -120,16 +120,28 @@ static IOBufferMemoryDescriptor *systemDescriptor(size_t bytes,bool write_combin
     IOOptionBits options=static_cast<IOOptionBits>(kIODirectionInOut)|static_cast<IOOptionBits>(kIOMemoryMapperNone)|
         static_cast<IOOptionBits>(kIOMemoryPageable);
     if(write_combined)options|=kIOMapWriteCombineCache;
-    /* Pageable pages arrive one by one (a BO averaged 69 spans); from `sheng-gpu-bo-contig` KiB up a BO first asks for one physically
-     * contiguous run (one span, one table walk), and a request the free memory cannot serve falls back to pageable pages. */
+    /* Pageable pages arrive one by one (a BO averaged 69 spans); from `sheng-gpu-bo-contig` KiB up to 128 KiB a BO first asks for one
+     * physically contiguous run (one span, one table walk), and a request the free memory cannot serve falls back to pageable pages.
+     * A contiguous request the kernel cannot serve scans every free page before it gives up: in ibb10331f24 124 such searches (0.1 to
+     * 64 MiB) took 163 ms each at the median and 21.7 s in all, synchronously in the caller (the render server's and the widget
+     * renderer's allocations, the stalls at an app launch and on the widget page), while every success was 64 to 128 KiB. So larger
+     * BOs never ask, and after a failure no request of that size or larger asks again for 5 s. */
     static uint32_t contigKiB=UINT32_MAX;
     if(contigKiB==UINT32_MAX) {contigKiB=0;PE_parse_boot_argn("sheng-gpu-bo-contig",&contigKiB,sizeof contigKiB);}
-    if(contigKiB && bytes>=size_t(contigKiB)*1024) {
+    static const size_t contigMax=size_t(128)*1024;
+    static size_t failedBytes=0;
+    static uint64_t failedAt=0,backoff=0;
+    if(!backoff)nanoseconds_to_absolutetime(UINT64_C(5000000000),&backoff);
+    const uint64_t now=mach_absolute_time();
+    if(failedBytes && now-failedAt>=backoff)failedBytes=0;
+    if(contigKiB && bytes>=size_t(contigKiB)*1024 && bytes<=contigMax && !(failedBytes && bytes>=failedBytes)) {
         IOBufferMemoryDescriptor *run=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(nullptr,
             (options&~static_cast<IOOptionBits>(kIOMemoryPageable))|static_cast<IOOptionBits>(kIOMemoryPhysicallyContiguous),bytes,UINT64_C(0xfffffffff000));
         if(run && run->prepare()==kIOReturnSuccess) {native_adreno_bo_contig[0]=native_adreno_bo_contig[0]+1;return run;}
         if(run)run->release();
         native_adreno_bo_contig[1]=native_adreno_bo_contig[1]+1;
+        if(!failedBytes || bytes<failedBytes)failedBytes=bytes;
+        failedAt=now;
     }
     IOBufferMemoryDescriptor *descriptor=IOBufferMemoryDescriptor::inTaskWithOptions(nullptr,options,bytes,4096);
     if(descriptor && descriptor->prepare()!=kIOReturnSuccess) {descriptor->release();descriptor=nullptr;}
