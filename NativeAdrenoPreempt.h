@@ -52,6 +52,15 @@ struct NativeAdrenoPreemptStats {
     uint32_t last_us;         /* how long the last completed switch took */
 };
 
+/* The newest 16 switches, one row each (words): [0] sequence, [1..2] trigger time (us), [3..4] end time (us, 0 pending), [5] from | to << 8 |
+ * outcome << 16 (0 pending, 1 done, 2 timed out, 3 a register write refused), [6] CP_CONTEXT_SWITCH_CNTL read right after the trigger,
+ * [7] the same at the end, [8] RBBM_STATUS, [9] RBBM_INT_0_STATUS and [10] CP_HW_FAULT at the end, [11] CP_RB_RPTR | CP_RB_WPTR << 16 at the
+ * end, [12..15] ring 0's record before the trigger and [16..19] ring 1's (read pointer, write pointer, errno, info), [20..27] both again at the
+ * end, [28..33] the CP's IB state when a switch timed out (NativeAdrenoRing::progressState). native_adreno_switch_count is the total. */
+enum : uint32_t {NativeAdrenoSwitchLogRows=16,NativeAdrenoSwitchLogWords=34};
+extern "C" volatile uint32_t native_adreno_switch_log[NativeAdrenoSwitchLogRows][NativeAdrenoSwitchLogWords];
+extern "C" volatile uint32_t native_adreno_switch_count;
+
 class NativeAdrenoPreempt final {
     NativeAdrenoPreemptIo io_{};
     NativeAdrenoPreemptRings rings_{};
@@ -63,6 +72,10 @@ class NativeAdrenoPreempt final {
     void *clock_cookie_=nullptr;
     uint64_t trigger_us_=0;
     NativeAdrenoPreemptStats stats_{};
+    volatile uint32_t *event_=nullptr;   /* the log row of the switch in flight */
+    void snapshot(volatile uint32_t *row,unsigned first) const;
+    volatile uint32_t *openEvent(uint32_t to);
+    void closeEvent(uint32_t outcome);
 public:
     NativeAdrenoPreempt()=default;
     ~NativeAdrenoPreempt()=default;
@@ -81,6 +94,10 @@ public:
     static bool writeSmmuInfo(uint8_t *page,uint64_t ttbr0,uint32_t asid,uint32_t context_idr);
     /* The write pointer a record resumes at (the CP writes it back after saving), for the caller to give again. */
     static uint32_t recordWptr(const uint8_t *record);
+    /* Before each switch only the write pointer is given again: the read pointer, the info and errno words are the CP's (it saves them
+     * into the record when it switches the ring out), so rewriting the whole record would send the ring back to its start. */
+    static bool setRecordWptr(uint8_t *record,uint32_t wptr);
+    static uint32_t recordWord(const uint8_t *record,uint32_t byte_offset);
     /* Switch the CP to `ring`, which must not be the loaded one: its SMMU info and record go out first, then the control word
      * with STOP. `uses_gmem` asks for the GMEM save and restore. False where a switch is still in flight or a register refused. */
     bool trigger(uint32_t ring,bool uses_gmem);
@@ -89,9 +106,14 @@ public:
     bool complete();
     bool inFlight() const {return armed_;}
     uint32_t loaded() const {return loaded_;}
+    /* A switch triggered more than `limit_us` ago and still not complete. */
+    bool timedOut(uint32_t limit_us) const;
+    /* The switch in flight did not finish: the log row takes the CP's IB state (progress) and the registers, and the switch ends as timed out. */
+    void noteTimeout(const uint32_t progress[6]);
+    uint32_t readCntl() const;   /* CP_CONTEXT_SWITCH_CNTL as the hardware holds it (all ones when unreadable); STOP set means a switch is not done */
     uint32_t target() const {return next_;}
     /* After a GPU reset: `ring` is the one the CP runs and nothing is in flight. */
-    void restart(uint32_t ring) {loaded_=ring;armed_=false;}
+    void restart(uint32_t ring) {loaded_=ring;armed_=false;event_=nullptr;}
     NativeAdrenoPreemptStats stats() const {return stats_;}
     void noteDisjointSkip() {stats_.disjoint_skips=stats_.disjoint_skips+1;}
     void noteSkipped() {stats_.skipped=stats_.skipped+1;}

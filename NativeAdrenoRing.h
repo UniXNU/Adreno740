@@ -69,12 +69,16 @@ class NativeAdrenoRing final {
      * ring->restore_wptr), which restoreWptr() does. secondary_: this ring never programs CP_RB_* (the CP has one ring register
      * set; the second ring's base, read-pointer shadow and control word reach it through its preemption record). */
     bool preempt_=false,secondary_=false,restore_wptr_=false;
+    /* Whether this ring's write pointer may be written to the register now: the CP runs this ring and no switch is in flight (msm's
+     * a6xx_flush writes CP_RB_WPTR only for cur_ring, and not while a6xx_in_preempt). The first ring starts as the one the CP runs. A
+     * ring that is not current appends its words and leaves restore_wptr_ for the switch's arrival. */
+    bool current_=true;
     uint64_t record_iova_=0,smmu_iova_=0,bv_rptr_iova_=0;
     uint32_t control_=0;
     IOReturn poison();
     IOReturn writeWptr(uint32_t value);
     IOReturn readRptr(uint32_t *);
-    IOReturn emitPrologue(uint32_t at,bool reset,bool table,uint32_t *end);
+    IOReturn emitPrologue(uint32_t at,bool reset,bool table,uint32_t *end,uint32_t number);
     IOReturn emitFence(uint32_t at,uint32_t seqno,uint32_t *end);
     IOReturn emitFramedFence(uint32_t at,uint32_t seqno,uint32_t *end);
     IOReturn emitFramedFence(uint32_t at,uint32_t seqno,uint32_t *end,bool yield);
@@ -102,8 +106,10 @@ public:
      * (attachSecondary) never moves CP_RB_WPTR: its fence is written when the CP
      * is switched to it and restoreWptr() gives the pointer. */
     /* A second ring of the same GPU (NativeAdrenoPreempt): its memory is mapped and its read pointer read, but no CP_RB_* register
-     * is written, because the CP has one set and learns this ring from its preemption record on each switch. */
-    IOReturn attachSecondary(void *ring,size_t ring_bytes,uint64_t ring_iova,void *fence,size_t fence_bytes,uint64_t fence_iova);
+     * is written, because the CP has one set and learns this ring from its preemption record on each switch. The register and cache
+     * callbacks are the first ring's: a submission publishes its words and orders them through them. */
+    IOReturn attachSecondary(const NativeAdrenoRingIo *io,const NativeAdrenoRingCache *cache,
+        void *ring,size_t ring_bytes,uint64_t ring_iova,void *fence,size_t fence_bytes,uint64_t fence_iova);
     /* CP preemption for this ring: the GPU addresses of its preemption record (NativeAdrenoPreempt::writeRecord) and of the
      * a7xx_cp_smmu_info page its switch reads, and the read-pointer shadow of the BV thread. A ring without it never yields and
      * never carries the record packet, as before. */
@@ -111,11 +117,15 @@ public:
     bool preemption() const {return preempt_;}
     /* The write pointer that waits for a switch (a ring that is not the CP's own appends without moving CP_RB_WPTR). */
     bool restorePending() const {return restore_wptr_;}
+    void setCurrent(bool current) {current_=current;}
+    bool current() const {return current_;}
     /* Gives the waiting write pointer again; after a switch into this ring, and after a restart. */
     IOReturn restoreWptr();
     /* Fills this ring's preemption record (msm's a6xx_preempt_record): its base, its read-pointer shadow, its BV shadow, its CP_RB_CNTL
      * and the write pointer the CP resumes at. */
     IOReturn writePreemptRecord(uint8_t *record) const;
+    /* The write pointer the CP resumes this ring at, written into its record before a switch to it. */
+    IOReturn writePreemptWptr(uint8_t *record) const;
     /* The register values the record repeats, for the caller's own record writes. */
     uint32_t controlValue() const {return control_;}
     uint64_t ringIova() const {return ring_iova_;}
