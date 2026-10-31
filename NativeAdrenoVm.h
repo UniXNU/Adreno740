@@ -40,28 +40,33 @@ class NativeAdrenoVm final {
         NativeAdrenoMemory *memory=nullptr;
         uint64_t handle=0,iova=0;
         size_t spans=0,mapped_spans=0;
-        unsigned permissions=0,writeback=0,shareability=0,jobs=0;
+        unsigned permissions=0,writeback=0,shareability=0,jobs=0,upper=0;
     };
     Mapping *mappings_=nullptr;
     NativeAdrenoHandleIndex index_;   /* live handle -> its mappings_ slot */
     size_t free_hint_=0;   /* no free mappings_ slot below it */
     size_t high_=0;   /* no live mappings_ slot at or above it: the walks over every mapping stop there */
-    size_t class_spans_[16]{};   /* ranges_ per alias class, so a map counts the other classes without a walk */
+    size_t class_spans_[16]{};   /* mapped spans per alias class, so a map counts the other classes without a walk */
     size_t import_spans_[16]{};   /* the imported mappings' ranges per alias class */
     NativeAdrenoVmRegion regions_[2]{};
     ArmSmmu4KLiveVisibility visibility_[2]{};
     ArmSmmu4KIo io_{};
     ArmSmmu4KContextConfig *context_=nullptr;
     ArmSmmu4KStreamState *streams_=nullptr;
-    ArmSmmu4KRange *ranges_=nullptr;
-    /* The kit's physical-alias sort scratch (ArmSmmu4KLiveArena::alias_scratch) for this VM's regions: one entry per range, grown with
-     * ranges_, as the smaller compared side never holds more ranges than the table. */
+    /* The mapped objects of each region by GPU address (mappings_ slots, the lower region's first): a map finds its place and a free
+     * hole there. It replaced a sorted list of every mapped span (one per 4 KiB page of system memory, about a million), whose insert
+     * moved the list's tail and whose growth copied it under the driver's lock (i fc8d9e7fe: BoMap held it up to 70 ms, 3.0 s in all). */
+    uint32_t *order_=nullptr;
+    size_t order_count_[2]{};
+    /* One mapping's spans as the table transaction takes them, and the kit's physical-alias sort scratch
+     * (ArmSmmu4KLiveArena::alias_scratch) for them: capacity_ entries each, grown to the largest mapping. */
+    ArmSmmu4KRange *changes_=nullptr;
     uint32_t *alias_scratch_=nullptr;
     size_t capacity_=0,lower_count_=0,upper_count_=0,objects_=0;
     /* Both tables grow on demand with no limit but memory (a VM per GPU process: most use a few hundred objects; a fixed table filled up
      * at 1024, then 4096 mappings: int-237, i567). */
     size_t mapping_capacity_=0;
-    bool growRanges(size_t needed);
+    bool growScratch(size_t needed);
     void freeTables();
     bool growMappings();
     unsigned budget_=0;
@@ -70,7 +75,9 @@ class NativeAdrenoVm final {
     uint64_t faults_=0,hangs_=0;
     bool fault_streams_=true;   /* a failure faults the bank's streams; off for a process table, whose streams are the kernel table's too */
     NativeAdrenoVmResult result_{};
-    ArmSmmu4KLiveRegion region(unsigned) const;
+    /* A region with the existing ranges the kit is told of: none for a map (its pages' leaves must be invalid, which the kit checks in
+     * the table), the mapping's own for its unmap. The whole-verification update of a region is its first, which finds it empty. */
+    ArmSmmu4KLiveRegion region(unsigned,const ArmSmmu4KRange *ranges=nullptr,size_t count=0) const;
     ArmSmmu4KStatus observe() const;
     /* The route check alone: the table walk is the update's own (it verifies every region before the first store and after the last), so
      * map/unmap pay a full extra audit only every 64th operation (int-139: 4 full walks of the 2 GiB aperture made every map 70 ms). */
@@ -80,9 +87,12 @@ class NativeAdrenoVm final {
     IOReturn fail(ArmSmmu4KStatus);
     Mapping *find(uint64_t);
     const Mapping *find(uint64_t) const;
-    size_t rangeAt(uint64_t iova) const;
-    void insert(size_t,unsigned);
-    void erase(size_t,size_t,unsigned);
+    size_t orderBegin(unsigned upper) const {return upper?order_count_[0]:0;}
+    size_t orderEnd(unsigned upper) const {return upper?order_count_[0]+order_count_[1]:order_count_[0];}
+    /* The first mapping of the region whose last byte is at or past iova (orderEnd when none). */
+    size_t orderAt(unsigned upper,uint64_t iova) const;
+    void insert(Mapping *);
+    bool erase(Mapping *);
     IOReturn preflight(const NativeAdrenoMemory *,unsigned,uint64_t,unsigned,unsigned,unsigned,bool exclusive) const;
     bool exclusivePages(const NativeAdrenoMemory *,unsigned cls) const;
 public:
