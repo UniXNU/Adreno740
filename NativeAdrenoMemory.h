@@ -6,7 +6,9 @@
 #include <stdint.h>
 class IOBufferMemoryDescriptor;
 /* System memory prepared outside the driver's lock (NativeAdrenoMemory::prepareSystem). */
-struct NativeAdrenoSystemPages {IOBufferMemoryDescriptor *descriptor=nullptr;size_t bytes=0;bool write_combined=false,cleaned=false;};
+/* made, wired: when the descriptor was made and when its pages were wired (mach units), for the allocation trace. */
+struct NativeAdrenoSystemPages {IOBufferMemoryDescriptor *descriptor=nullptr;size_t bytes=0;bool write_combined=false,cleaned=false;
+    uint64_t made=0,wired=0;};
 class IOMemoryDescriptor;
 struct NativeAdrenoPhysicalSpan {uint64_t offset,physical,bytes;};
 struct NativeAdrenoCpuState {

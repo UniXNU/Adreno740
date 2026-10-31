@@ -115,7 +115,7 @@ failed:
 }
 /* No task: the memory is mapped nowhere until a client view maps it. The cache mode is the memory entry's, so every mapping of it (the
  * client views) and the pages themselves take it. */
-static IOBufferMemoryDescriptor *systemDescriptor(size_t bytes,bool write_combined)
+static IOBufferMemoryDescriptor *systemDescriptor(size_t bytes,bool write_combined,uint64_t *made=nullptr,uint64_t *wired=nullptr)
 {
     IOOptionBits options=static_cast<IOOptionBits>(kIODirectionInOut)|static_cast<IOOptionBits>(kIOMemoryMapperNone)|
         static_cast<IOOptionBits>(kIOMemoryPageable);
@@ -144,14 +144,18 @@ static IOBufferMemoryDescriptor *systemDescriptor(size_t bytes,bool write_combin
         failedAt=now;
     }
     IOBufferMemoryDescriptor *descriptor=IOBufferMemoryDescriptor::inTaskWithOptions(nullptr,options,bytes,4096);
+    if(made)*made=mach_absolute_time();
     if(descriptor && descriptor->prepare()!=kIOReturnSuccess) {descriptor->release();descriptor=nullptr;}
+    if(wired)*wired=mach_absolute_time();
     return descriptor;
 }
 IOReturn NativeAdrenoMemory::prepareSystem(size_t bytes,bool write_combined,NativeAdrenoSystemPages *out)
 {
     if(!out || out->descriptor || !bytes || (bytes&4095))return kIOReturnBadArgument;
-    IOBufferMemoryDescriptor *descriptor=systemDescriptor(bytes,write_combined);
+    uint64_t made=0,wired=0;
+    IOBufferMemoryDescriptor *descriptor=systemDescriptor(bytes,write_combined,&made,&wired);
     if(!descriptor)return kIOReturnNoMemory;
+    if(!made)made=wired=mach_absolute_time();   /* a contiguous run: made and wired in one step */
     if(descriptor->getLength()!=bytes) {descriptor->complete();descriptor->release();return kIOReturnUnsupported;}
     bool cleaned=false;
     /* Default-attribute pages may still hold the zero fill in a CPU's cache: written back here, by physical runs, as allocateSystem would. */
@@ -168,7 +172,7 @@ IOReturn NativeAdrenoMemory::prepareSystem(size_t bytes,bool write_combined,Nati
         }
         if(cleaned)NativeAdrenoNotePhase(NativeAdrenoPhaseAllocate,bytes);
     }
-    out->descriptor=descriptor;out->bytes=bytes;out->write_combined=write_combined;out->cleaned=cleaned;
+    out->descriptor=descriptor;out->bytes=bytes;out->write_combined=write_combined;out->cleaned=cleaned;out->made=made;out->wired=wired;
     return kIOReturnSuccess;
 }
 void NativeAdrenoMemory::discardSystem(NativeAdrenoSystemPages *pages)
