@@ -62,10 +62,12 @@ extern "C" volatile uint32_t native_adreno_table_switches[8];
 extern "C" {volatile uint32_t native_adreno_recover_trace[4];}
 /* The jobs' timeline (the newest native_adreno_tl_cap retired, allocated at attach): [0] fence | indirect buffers << 32 | ring status << 58, [1] submit
  * time (us), [2] the CP's always-on counter before the job's buffers, [3] after them (19.2 MHz ticks; 0 when not stamped), [4] GPU level at submit |
- * the submitting pid << 32, [5] when the driver saw the job retired (us, the submission clock). native_adreno_tl_count is the total. */
+ * the submitting pid << 32, [5] when the driver saw the job retired (us, the submission clock), [6] ring | (priority + 1) << 4 | GPU role << 8 |
+ * ring the CP ran at submit << 16 | switch in flight << 20 | restarts that replayed it << 24, [7] when it was last replayed (us, 0 never).
+ * native_adreno_tl_count is the total. */
 /* sheng-diag=1, set by the service before any client attaches: the driver's diagnostics (the jobs' timeline, the CP stamps) run only then. */
 extern "C" {volatile uint32_t native_adreno_diag;}
-extern "C" {volatile uint64_t (*native_adreno_tl)[6]=nullptr;volatile uint32_t native_adreno_tl_cap=0;volatile uint32_t native_adreno_tl_count;}
+extern "C" {volatile uint64_t (*native_adreno_tl)[8]=nullptr;volatile uint32_t native_adreno_tl_cap=0;volatile uint32_t native_adreno_tl_count;}
 /* The stall handler's actions (the newest 32): [0] time (us), [1] fence, [2] event (1 write pointer given again and translations dropped, 3 bus drain,
  * 4 snapshot, 0 the stall ended) | timed-out waits << 8, [3] time the fence had been pending (us), [4] read and write pointer before | after << 32 for
  * events 1 and 3, [5] client queue, [6] the job's first buffer handle | its buffer count << 48, [7] the sequence number. */
@@ -99,7 +101,7 @@ IOReturn NativeAdrenoSubmit::attach(NativeAdrenoVm *vm,NativeAdrenoRing *ring)
     vm_=vm;ring_=ring;rings_[0]=ring;ring_count_=1;attached_=true;stats_={};table_vm_=vm;
     if(!native_adreno_tl && native_adreno_diag) {   /* the jobs' timeline is a diagnostic (sheng-diag=1) */
         const uint32_t cap=16384;
-        volatile uint64_t (*memory)[6]=(volatile uint64_t (*)[6])IOMallocZero(sizeof(uint64_t)*6*cap);
+        volatile uint64_t (*memory)[8]=(volatile uint64_t (*)[8])IOMallocZero(sizeof(uint64_t)*8*cap);
         if(memory) {native_adreno_tl=memory;native_adreno_tl_cap=cap;}
     }
     return kIOReturnSuccess;
@@ -175,9 +177,11 @@ NativeAdrenoRing *NativeAdrenoSubmit::ringOfFence(uint32_t fence) const
  * A ring alone takes everything. */
 unsigned NativeAdrenoSubmit::ringForPriority() const
 {
-    if(!preemption())return 0;
+    if(!preemption() || preempt_dead_)return 0;
+    /* Only the low and the background levels (2, 3) take the second ring: everything else, the compositor's default included, stays
+     * on the ring the CP already runs, so a switch that fails costs the background work and not the screen. */
     const int32_t p=next_priority_;
-    return p==0 || p==4 || p==5 ?0:1;
+    return p==2 || p==3 || (preempt_setup_.mode>=2 && p==1)?1:0;
 }
 /* Whether `handles` shares no buffer with any job outstanding on `index`: the conservative test that lets a queued job overtake the
  * running ring. A job writes what it names (the driver cannot see its binds), so any sharing keeps the order. */
@@ -190,6 +194,16 @@ bool NativeAdrenoSubmit::ringDisjoint(unsigned index,const uint64_t *handles,siz
     }
     return true;
 }
+const NativeAdrenoSubmit::Job *NativeAdrenoSubmit::pendingOn(unsigned index)
+{
+    NativeAdrenoRing *const r=ring(index);
+    uint32_t done=0;
+    if(!r || r->fenceValue(&done))return nullptr;
+    const Job *first=nullptr;
+    for(const auto &job:jobs_)
+        if(job.active && job.ring==index && (int32_t)(job.fence-done)>0 && (!first || (int32_t)(job.fence-first->fence)<0))first=&job;
+    return first;
+}
 /* Moves the CP to the other ring when that ring has work queued, its buffers do not overlap the running ring's, and the CP is not
  * already switching. msm's a6xx_preempt_trigger, with the ring choice made by priority instead of round-robin. */
 void NativeAdrenoSubmit::driveSwitch(const NativeAdrenoRingClock *clock)
@@ -198,28 +212,46 @@ void NativeAdrenoSubmit::driveSwitch(const NativeAdrenoRingClock *clock)
     if(!preemption())return;
     /* A switch the interrupt saw finish (or that finished while its handler could not take the lock) is taken first. */
     if(preempt_.inFlight()) {
-        if(!preemptIrq())return;
+        if(!preemptIrq()) {
+            /* The CP never finished a switch: no more are tried (the restart in recover() brings the CP back). */
+            if(preempt_.timedOut(PreemptSwitchTimeoutUs)) {
+                uint32_t progress[6]={};
+                (void)ring(0)->progressState(progress);
+                preempt_.noteTimeout(progress);
+                markPreemptDead(2);
+            }
+            return;
+        }
     }
+    if(preempt_dead_)return;
     const uint32_t loaded=preempt_.loaded();
+    /* Ring 0 is the high ring: while it has work the CP does not leave it for the low ring, and it takes the CP back from the low ring as
+     * soon as it has some. The low ring's work still gets the GPU when the high ring is idle, and after it has waited PreemptAgingUs. */
+    const Job *const high=pendingOn(0);
     for(unsigned i=0;i<ring_count_;++i) {
         if(i==loaded)continue;
-        /* The oldest job waiting on `i` and whether its buffers are clear of the running ring's. */
-        const Job *first=nullptr;
-        for(const auto &job:jobs_)if(job.active && job.ring==i && (!first || (int32_t)(job.fence-first->fence)<0))first=&job;
+        /* The oldest job waiting on `i` (one the ring's CP has not finished) and whether its buffers are clear of the running ring's. */
+        const Job *const first=pendingOn(i);
         if(!first)continue;
+        if(i!=0 && high) {
+            const uint64_t now=clock_now_?clock_now_(clock_cookie_):0;
+            if(!(now && first->submit_us && now-first->submit_us>PreemptAgingUs))continue;
+        }
         if(!ringDisjoint(loaded,first->handles,first->count)) {preempt_.noteDisjointSkip();continue;}
-        /* The incoming ring's preemption record, rewritten now: its base, shadows, control word and the write pointer the CP
-         * resumes at (msm sets record_ptr->wptr = get_wptr(ring) before every switch). Its SMMU info keeps the page table the
-         * ring's CP will run. */
+        /* The incoming ring's preemption record keeps what it was given at setup and what the CP saved into it when it switched the
+         * ring out (read pointer, info, errno); only the write pointer the CP resumes at is given again before every switch. */
         NativeAdrenoRing *const incoming=ring(i);
         if(!incoming || !preempt_setup_.pages.record_cpu[i] || !preempt_setup_.pages.smmu_cpu[i])continue;
-        (void)incoming->writePreemptRecord(preempt_setup_.pages.record_cpu[i]);
+        (void)incoming->writePreemptWptr(preempt_setup_.pages.record_cpu[i]);
         /* The page table the CP must run when it arrives: the waiting job's own VM (each process has one). Its ASID rides in
          * the TTBR0's top word, as NativeAdrenoVm::ttbr0() gives it. */
         const uint64_t ttbr0=first->vm?first->vm->ttbr0():table_vm_->ttbr0();
         (void)NativeAdrenoPreempt::writeSmmuInfo(preempt_setup_.pages.smmu_cpu[i],ttbr0,uint32_t(ttbr0>>48),0);
-        if(preempt_.trigger(i,false))return;
+        if(preempt_.trigger(i,false)) {ring(0)->setCurrent(false);ring(1)->setCurrent(false);return;}
+        /* The trigger itself refused (a register write failed): the second ring cannot be reached, so it is given up at once and the
+         * jobs already queued on it are replayed by the restart the hang check asks for. */
         preempt_.noteSkipped();
+        markPreemptDead(1);
         return;
     }
 }
@@ -229,7 +261,9 @@ bool NativeAdrenoSubmit::preemptIrq()
     if(!preemption() || !preempt_.inFlight())return false;
     if(!preempt_.complete())return false;
     NativeAdrenoRing *const now=ring(preempt_.loaded());
+    for(unsigned i=0;i<ring_count_;++i)ring(i)->setCurrent(false);
     if(now) {
+        now->setCurrent(true);
         if(now->restorePending()) {if(!now->restoreWptr())preempt_.noteRestoredWptr();}
         else {
             /* The ring that was not current appended its words without moving CP_RB_WPTR; the switch's arrival is the moment to
@@ -258,6 +292,7 @@ IOReturn NativeAdrenoSubmit::setPreemption(NativeAdrenoRing *high,NativeAdrenoRi
         (void)r->writePreemptRecord(setup.pages.record_cpu[i]);
     }
     rings_[0]=high;rings_[1]=low;ring_count_=2;
+    high->setCurrent(true);low->setCurrent(false);
     preempt_setup_=setup;
     const IOReturn attached_preempt=preempt_.attach(&setup.io,setup.pages,0,setup.now,setup.clock);
     if(attached_preempt) {ring_count_=1;rings_[1]=nullptr;return attached_preempt;}
@@ -283,6 +318,9 @@ IOReturn NativeAdrenoSubmit::release(Job &job)
             slot[0]=(uint64_t)job.fence|(uint64_t)job.count<<32|(uint64_t)stamped<<58;slot[1]=job.submit_us;
             slot[2]=start;slot[3]=end;slot[4]=(uint64_t)job.level|(uint64_t)(uint32_t)job.owner<<32;
             slot[5]=clock_now_?clock_now_(clock_cookie_):0;
+            slot[6]=(uint64_t)job.ring|(uint64_t)uint8_t(job.priority+1)<<4|(uint64_t)job.role<<8|(uint64_t)job.loaded<<16|
+                (uint64_t)job.flight<<20|(uint64_t)job.replays<<24;
+            slot[7]=job.replay_us;
             native_adreno_tl_count=n+1;
         }
     }
@@ -441,10 +479,14 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
         return status;
     }
     /* One numbering for both rings: a fence tells its own ring, and a switch's arrival retires the jobs queued behind it. */
-    const uint32_t number=(value=fence_issued_)+1;
+    /* The board's earlier submissions (the CP init and the probes) numbered themselves on the first ring: the next number is above
+     * every ring's newest, and above the last this object handed out. */
+    uint32_t base=fence_issued_;
+    for(unsigned i=0;i<ring_count_;++i)if((int32_t)(ring(i)->lastSubmitted()-base)>0)base=ring(i)->lastSubmitted();
+    const uint32_t number=(value=base)+1;
     status=preemption()?target->submitFramed(words,word_count,number,&value):target->submitFramed(words,word_count,&value);
     if(status) {
-        if(!value)fence_issued_=number-1;
+        if(!value)fence_issued_=base;
         /* A poisoned ring may already have consumed the WPTR write, so the
          * referenced buffers cannot be retired here. */
         if(target->poisoned()) {
@@ -460,6 +502,8 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
     for(size_t i=0;i<handle_count;++i)job->handles[i]=handles[i];
     job->count=handle_count;job->fence=value;job->queue=queue;job->active=true;job->vm_next=vm_->nextHandle();job->vm=vm;
     job->context=target->context();job->word_count=word_count;job->ring=uint8_t(index);
+    job->priority=int8_t(next_priority_);job->role=uint8_t(next_role_);
+    job->loaded=uint8_t(preemption()?preempt_.loaded():0);job->flight=preemption() && preempt_.inFlight()?1:0;
     if(preemption()) {fence_issued_=value;noteFence(value,uint8_t(index));}
     job->submit_us=clock && clock->now_us?clock->now_us(clock->cookie):0;
     if(clock && clock->now_us) {clock_now_=clock->now_us;clock_cookie_=clock->cookie;}
@@ -654,6 +698,8 @@ IOReturn NativeAdrenoSubmit::retireCompleted()
         if(status)return status;
         ++stats_.completed;
     }
+    /* A ring that went idle leaves the CP to the other ring's queued work (driveSwitch decides by priority). */
+    driveSwitch(nullptr);
     return kIOReturnSuccess;
 }
 bool NativeAdrenoSubmit::madeProgress()
@@ -676,6 +722,22 @@ IOReturn NativeAdrenoSubmit::hangCheck(bool *hung)
     const uint32_t last0=ring(0)->lastSubmitted(),last1=preemption()?ring(1)->lastSubmitted():0;
     const uint32_t last=(int32_t)(last1-last0)>0?last1:last0;
     if(!last)return kIOReturnSuccess;
+    /* A job on the second ring that the CP cannot reach: the ring was given up (dead), or it has waited so long that the switch is
+     * not coming. The first ring's progress hides this from the check below, so it is judged on its own. */
+    if(preemption()) {
+        const uint64_t now=clock_now_?clock_now_(clock_cookie_):0;
+        /* A busy high ring starves the low one by design (driveSwitch lets it through after PreemptAgingUs); only a low-ring job that waits
+         * with the high ring idle and no switch in flight is a CP that cannot be reached. */
+        const bool reachable=!preempt_.inFlight() && !pendingOn(0);
+        for(auto &job:jobs_)if(job.active && job.ring==1 && job.ring!=preempt_.loaded()) {
+            const bool aged=reachable && now && job.submit_us && now-job.submit_us>PreemptStrandedUs;
+            if(preempt_dead_ || aged) {
+                markPreemptDead(preempt_dead_?dead_reason_:3);
+                stranded_=true;*hung=true;++stats_.hangs;
+                return kIOReturnSuccess;
+            }
+        }
+    }
     NativeAdrenoRing *const r=ringOfFence(last)?ringOfFence(last):ring(0);
     uint32_t fence=0;
     if(r->observeFence(last,nullptr,0,&fence)==NativeAdrenoRingFencePoisoned)return poison();
@@ -694,21 +756,58 @@ IOReturn NativeAdrenoSubmit::recover(NativeAdrenoRestart restart,void *cookie,co
     const uint32_t last0=ring(0)->lastSubmitted(),last1=preemption()?ring(1)->lastSubmitted():0;
     const uint32_t last=(int32_t)(last1-last0)>0?last1:last0;
     uint32_t fence=0;
-    {const IOReturn fr=ring(0)->fenceValue(&fence);
-    native_adreno_recover_trace[2]=fence;native_adreno_recover_trace[3]=last;
-    if(fr || fence>last) {native_adreno_recover_trace[0]=1;native_adreno_recover_trace[1]=uint32_t(fr);return poison();}}
-    /* What already completed retires as usual. */
-    for(auto &job:jobs_)if(job.active && job.fence<=fence) {
-        IOReturn status=release(job);if(status)return status;
-        ++stats_.completed;
+    const bool stranded=stranded_;
+    stranded_=false;last_stranded_=stranded;
+    if(stranded) {
+        /* No job is to blame: the second ring's work never got a CP. What each ring finished retires by that ring's own fence, and the
+         * replay starts below the oldest job left, whichever ring it sat on. */
+        for(auto &job:jobs_)if(job.active) {
+            uint32_t done=0;
+            NativeAdrenoRing *const r=ringOfFence(job.fence)?ringOfFence(job.fence):ring(0);
+            if(!r->fenceValue(&done) && (int32_t)(done-job.fence)>=0) {
+                IOReturn status=release(job);if(status)return status;
+                ++stats_.completed;
+            }
+        }
+        bool any=false;uint32_t oldest=last;
+        for(auto &job:jobs_)if(job.active && (!any || (int32_t)(job.fence-oldest)<0)) {oldest=job.fence;any=true;}
+        fence=any?oldest-1:last;
+        ++rescues_;
+        native_adreno_recover_trace[2]=fence;native_adreno_recover_trace[3]=last;
+    } else if(preemption()) {
+        /* Two rings: a job is done when its own ring's fence says so (ring 0's fence alone knows nothing of what ring 1 finished, and
+         * would name a finished job as the hung one). The oldest job left is the one the CP was running, the others wait behind it. */
+        bool any=false;uint32_t oldest=last;
+        for(auto &job:jobs_)if(job.active) {
+            uint32_t done=0;
+            NativeAdrenoRing *const r=ringOfFence(job.fence)?ringOfFence(job.fence):ring(0);
+            if(!r->fenceValue(&done) && (int32_t)(done-job.fence)>=0) {
+                IOReturn status=release(job);if(status)return status;
+                ++stats_.completed;
+            } else if(!any || (int32_t)(job.fence-oldest)<0) {oldest=job.fence;any=true;}
+        }
+        fence=any?oldest-1:last;
+        native_adreno_recover_trace[2]=fence;native_adreno_recover_trace[3]=last;
+    } else {
+        const IOReturn fr=ring(0)->fenceValue(&fence);
+        native_adreno_recover_trace[2]=fence;native_adreno_recover_trace[3]=last;
+        if(fr || fence>last) {native_adreno_recover_trace[0]=1;native_adreno_recover_trace[1]=uint32_t(fr);return poison();}
+        /* What already completed retires as usual. */
+        for(auto &job:jobs_)if(job.active && job.fence<=fence) {
+            IOReturn status=release(job);if(status)return status;
+            ++stats_.completed;
+        }
     }
     const uint32_t hung=fence<last?fence+1:fence;
-    Job *guilty=fence<last?find(hung):nullptr;
+    Job *guilty=(!stranded && fence<last)?find(hung):nullptr;
     out->fence=hung;
     if(guilty) {
         NativeAdrenoVm *vm=guilty->vm?guilty->vm:vm_;
         vm->noteHang(vm!=vm_);out->guilty=vm;
     }
+    /* A hang inside a second-ring job is blamed on the second ring: it is given up (reason 4), the replay and everything after run on the first. */
+    if(guilty && guilty->ring==1)markPreemptDead(4);
+    recovery_info_[0]=guilty?uint32_t(guilty->ring):9;recovery_info_[1]=last0;recovery_info_[2]=last1;recovery_info_[3]=preemption()?preempt_.loaded():0;
     IOReturn status=restart(cookie,ring(0),hung);
     out->status=status;
     if(status) {native_adreno_recover_trace[0]=2;native_adreno_recover_trace[1]=uint32_t(status);return poison();}
@@ -726,7 +825,9 @@ IOReturn NativeAdrenoSubmit::recover(NativeAdrenoRestart restart,void *cookie,co
      * came from (the words are ring-agnostic and their fence numbers are kept, so each waiter still finds its value). */
     if(preemption()) {
         preempt_.restart(0);
+        ring(0)->setCurrent(true);
         (void)ring(1)->restartSecondary(hung);
+        ring(1)->setCurrent(false);
     }
     uint32_t nop=0;
     if(AdrenoPM4Type7(0x10,0,&nop)!=AdrenoPM4Success) {native_adreno_recover_trace[0]=4;return poison();}   /* CP_NOP */
@@ -741,6 +842,10 @@ IOReturn NativeAdrenoSubmit::recover(NativeAdrenoRestart restart,void *cookie,co
         status=preemption()?ring(0)->submitFramed(run?job->words:&nop,run?job->word_count:1,next,&value):
             ring(0)->submitFramed(run?job->words:&nop,run?job->word_count:1,&value);
         if(status || value!=next) {native_adreno_recover_trace[0]=6;native_adreno_recover_trace[1]=status?uint32_t(status):value;return poison();}
+        if(job) {
+            if(job->replays<255)++job->replays;
+            job->replay_us=clock && clock->now_us?clock->now_us(clock->cookie):0;
+        }
         if(job && preemption()) {job->ring=0;noteFence(next,0);}
         ++out->replayed;
     }

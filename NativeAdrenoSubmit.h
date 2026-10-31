@@ -54,6 +54,7 @@ public:
         NativeAdrenoPreemptRings pages{};
         uint64_t (*now)(void *)=nullptr;
         void *clock=nullptr;
+        unsigned mode=1;   /* 1: only the low and disabled queues (priority 2, 3) take the second ring; 2: the normal ones (1) too */
     };
 private:
     struct Job {
@@ -71,6 +72,11 @@ private:
         size_t word_count=0;          /* its ring words (the IB packets), kept to replay it after a GPU restart */
         uint32_t words[NativeAdrenoSubmitMaxBuffers*4]{};
         uint8_t ring=0;               /* the ring it went to (0 high, 1 low: NativeAdrenoSubmit's two rings) */
+        int8_t priority=-1;           /* the Metal GPU priority its queue gave (-1: none) and the submitting task's GPU role (task_get_gpu_role) */
+        uint8_t role=0;
+        uint8_t loaded=0,flight=0;    /* the ring the CP ran when it was submitted, and whether a switch was in flight then */
+        uint8_t replays=0;            /* how many GPU restarts replayed it */
+        uint64_t replay_us=0;         /* when it was last given to the ring again (0: never) */
     };
     /* The jobs, grown on demand; a job never moves. Iterates as Job &. */
     struct JobList {
@@ -91,8 +97,8 @@ private:
     IOReturn (*write_table_)(void *,uint64_t ttbr0)=nullptr;
     IOReturn useVm(NativeAdrenoVm *,const NativeAdrenoRingClock *);
     NativeAdrenoRing *ring_=nullptr;
-    /* Two rings and the CP's context switch between them (NativeAdrenoPreempt): ring 0 serves the queues Metal marks high (the
-     * render server's), ring 1 everything else. A submission to the ring the CP does not run is queued behind, and the switch is
+    /* Two rings and the CP's context switch between them (NativeAdrenoPreempt): ring 0 serves every queue but the low and
+     * background ones, which go to ring 1. A submission to the ring the CP does not run is queued behind, and the switch is
      * triggered as soon as its buffers do not overlap the running ring's. Off unless the board turns it on (sheng-gpu-preempt=1). */
     NativeAdrenoRing *rings_[2]={nullptr,nullptr};
     unsigned ring_count_=0;
@@ -105,9 +111,21 @@ private:
     uint32_t fence_issued_=0;
     PreemptSetup preempt_setup_{};
     int32_t next_priority_=-1;    /* the Metal GPU priority of the next submission (-1: not given, the middle ring) */
+    int32_t next_role_=0;         /* the GPU role of the task submitting next (only logged) */
+    bool last_stranded_=false;
+    uint32_t recovery_info_[4]={};   /* the last recovery: the hung job's ring (9: none), each ring's newest fence, the ring the CP ran */
+    /* A switch that cannot be made (the trigger refused, or the CP did not finish one in time) leaves the second ring's jobs without a
+     * CP to run them. The ring is then given up for good (preempt_dead_, with the reason) and the GPU restart replays what it holds on
+     * the first ring (stranded_: recover() starts from the oldest job that never ran). */
+    enum : uint32_t {PreemptSwitchTimeoutUs=30000,PreemptStrandedUs=2000000,PreemptAgingUs=250000};   /* a switch not done in 30 ms; a ring-1 job unreached for 2 s */
+    bool preempt_dead_=false,stranded_=false;
+    uint32_t dead_reason_=0,rescues_=0;
+    void markPreemptDead(uint32_t reason) {if(!preempt_dead_) {preempt_dead_=true;dead_reason_=reason;}}
     NativeAdrenoRing *ringOfFence(uint32_t fence) const;
     unsigned ringForPriority() const;
     bool ringDisjoint(unsigned ring,const uint64_t *handles,size_t count) const;
+    /* The oldest job on `index` that the ring's CP has not finished (its fence beyond what that ring last wrote); null when none. */
+    const Job *pendingOn(unsigned index);
     void noteFence(uint32_t fence,uint8_t ring);
     /* The ring a job ran on (the first ring when there is one only). Everything that reads or writes that ring's registers goes
      * through it. */
@@ -131,8 +149,12 @@ public:
     /* The process the next submission comes from, for the timeline (the user client sets it before each submit). */
     void nextOwner(int32_t pid) {next_owner_=pid;}
     /* The Metal GPU priority of the next submission's queue (MTLGPUPriority: 0 high, 1 normal, 2 low, 3 disabled, 4 normal-high,
-     * 5 real-time; -1 not given). High, normal-high and real-time go to ring 0, the rest to ring 1. */
+     * 5 real-time; -1 not given). Only low and disabled (2, 3) go to ring 1; the rest, the unspecified included, stay on ring 0. */
     void nextPriority(int32_t priority) {next_priority_=priority>=0 && priority<=5?priority:-1;}
+    void nextRole(int32_t role) {next_role_=role;}
+    bool lastRecoveryStranded() const {return last_stranded_;}
+    uint32_t recoveryInfo(unsigned i) const {return i<4?recovery_info_[i]:0;}
+    uint32_t deadReason() const {return preempt_dead_?dead_reason_:0;}
     /* The second ring and the switch between them. Both rings must be attached, their records and SMMU info pages mapped; the
      * caller keeps those buffers alive. `on` false keeps the second ring out of use (the first ring alone, as before). The rings
      * must have been given their own preemption state (NativeAdrenoRing::setPreempt). */
@@ -142,6 +164,20 @@ public:
     /* The interrupt's side of a switch: the ring the CP moved to is the one whose write pointer is given again. Returns whether a
      * switch completed. Called from the GPU interrupt (native_adreno_preempt_irq). */
     bool preemptIrq();
+    /* The switch counters, the ring the CP runs, whether a switch is in flight and the control register as the hardware holds it. */
+    /* A word of ring `index`'s preemption record as the CPU sees it now (the CP saves the read pointer, info and errno there). */
+    uint32_t recordWord(unsigned index,uint32_t byte_offset) const
+    {
+        return index<NativeAdrenoPreemptRingCount?NativeAdrenoPreempt::recordWord(preempt_setup_.pages.record_cpu[index],byte_offset):0;
+    }
+    bool preemptStats(NativeAdrenoPreemptStats *stats,uint32_t *loaded,bool *in_flight,uint32_t *cntl,uint32_t *dead=nullptr,uint32_t *rescues=nullptr) const
+    {
+        if(!preemption())return false;
+        if(dead)*dead=preempt_dead_?dead_reason_:0;
+        if(rescues)*rescues=rescues_;
+        *stats=preempt_.stats();*loaded=preempt_.loaded();*in_flight=preempt_.inFlight();*cntl=preempt_.readCntl();
+        return true;
+    }
     NativeAdrenoSubmit()=default;
     ~NativeAdrenoSubmit()=default;
     NativeAdrenoSubmit(const NativeAdrenoSubmit &)=delete;

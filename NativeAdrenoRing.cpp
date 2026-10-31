@@ -161,8 +161,8 @@ IOReturn NativeAdrenoRing::stallState(uint32_t *out)
 IOReturn NativeAdrenoRing::kick()
 {
     if(!attached_ || poisoned_)return kIOReturnNotReady;
-    /* A secondary ring's write pointer is given by the switch that brings the CP to it, never by a register write here. */
-    if(secondary_) {restore_wptr_=true;return kIOReturnSuccess;}
+    /* A ring the CP does not run (or while a switch is in flight) gets its write pointer from the switch's arrival, never from a register write here. */
+    if(!current_) {restore_wptr_=true;return kIOReturnSuccess;}
     if(io_.barrier(io_.cookie))return poison();
     return writeWptr(next_);
 }
@@ -195,7 +195,8 @@ static size_t stamp(uint32_t *words,size_t at,uint64_t fence_iova,uint32_t seqno
 /* Thread selection and IFPC disable before the user buffers, as a7xx_submit() does; the first submission after
  * requestContextReset() also carries the context entry a6xx_set_pagetable() emits when a new context first submits.
  * Every prologue ends its BR-only part with the GPU cache flush and invalidate described at RingCacheFlush7. */
-IOReturn NativeAdrenoRing::emitPrologue(uint32_t at,bool reset,bool table,uint32_t *end)
+/* `number` is the fence this submission ends with: the start stamp goes to that fence's slot, which is not seqno_+1 once the two rings share one numbering. */
+IOReturn NativeAdrenoRing::emitPrologue(uint32_t at,bool reset,bool table,uint32_t *end,uint32_t number)
 {
     const uint32_t mask=(uint32_t)(ring_bytes_/4-1);
     uint32_t words[RingPrologueWords+RingResetWords+RingTableWords+RingStampWords+RingPseudoWords]={0};
@@ -227,7 +228,7 @@ IOReturn NativeAdrenoRing::emitPrologue(uint32_t at,bool reset,bool table,uint32
     if(n)n=packet(words,n,RingFenceOpcode,&flush,1);
     if(n)n=packet(words,n,RingFenceOpcode,&invalidate7,1);
     if(n)n=packet(words,n,RingWaitForIdle,nullptr,0);
-    if(n && stamps_)n=stamp(words,n,fence_iova_,seqno_+1,false);
+    if(n && stamps_)n=stamp(words,n,fence_iova_,number,false);
     if(n && preempt_) {
         const uint32_t pseudo[12]={RingPseudoSmmuInfo,0,0,RingPseudoNonSecureSave,(uint32_t)record_iova_,(uint32_t)(record_iova_>>32),
             RingPseudoNonPrivSave,0,0,RingPseudoCounter,0,0};
@@ -316,20 +317,21 @@ IOReturn NativeAdrenoRing::attach(const NativeAdrenoRingIo *io,const NativeAdren
 /* A second ring of the same GPU: the CP has one ring register set, so this one programs none of it. Its base, read-pointer shadow
  * and control word reach the CP through its preemption record on each switch (a6xx_preempt_trigger writes the record before the
  * control word). The read pointer is the record's to report, so the ring starts at its own index 0. */
-IOReturn NativeAdrenoRing::attachSecondary(void *ring,size_t ring_bytes,uint64_t ring_iova,void *fence,size_t fence_bytes,uint64_t fence_iova)
+IOReturn NativeAdrenoRing::attachSecondary(const NativeAdrenoRingIo *io,const NativeAdrenoRingCache *cache,
+    void *ring,size_t ring_bytes,uint64_t ring_iova,void *fence,size_t fence_bytes,uint64_t fence_iova)
 {
     if(attached_ || poisoned_ || ring_ || fence_)return kIOReturnBusy;
-    if(!ring || !fence || ring_bytes<8192 || ring_bytes>(1u<<20) || (ring_bytes&(ring_bytes-1)) ||
+    if(!io || !io->write32 || !io->read32 || !io->barrier || !cache || !cache->publish || !cache->acquire || !ring || !fence || ring_bytes<8192 || ring_bytes>(1u<<20) || (ring_bytes&(ring_bytes-1)) ||
         ((ring_iova|ring_bytes)&(ring_bytes-1)) || (ring_iova&4095) ||
         fence_bytes<64 || (fence_iova&7) || fence_bytes>=(1u<<24))return kIOReturnBadArgument;
-    ring_=static_cast<volatile uint32_t *>(ring);
+    io_=*io;cache_=*cache;ring_=static_cast<volatile uint32_t *>(ring);
     ring_bytes_=ring_bytes;ring_iova_=ring_iova;
     fence_=static_cast<volatile uint32_t *>(fence);fence_bytes_=fence_bytes;fence_iova_=fence_iova;
     for(size_t i=0;i<ring_bytes_/4;++i)ring_[i]=0;
     for(size_t i=0;i<fence_bytes_/4;++i)fence_[i]=0;
     control_=(uint32_t)(ilog2(ring_bytes_/8)&0x3f)|(ilog2(RingBlockBytes/8)<<8);
     next_=0;rptr_shadow_=0;seqno_=0;completed_=0;submissions_=0;
-    secondary_=true;attached_=true;
+    secondary_=true;current_=false;attached_=true;
     return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoRing::setPreempt(uint64_t record,uint64_t smmu_info,uint64_t bv_rptr_addr)
@@ -345,6 +347,11 @@ IOReturn NativeAdrenoRing::writePreemptRecord(uint8_t *record) const
     if(!record)return kIOReturnBadArgument;
     if(!NativeAdrenoPreempt::writeRecord(record,ring_iova_,fence_iova_,bv_rptr_iova_,control_,next_))return kIOReturnBadArgument;
     return kIOReturnSuccess;
+}
+IOReturn NativeAdrenoRing::writePreemptWptr(uint8_t *record) const
+{
+    if(!record)return kIOReturnBadArgument;
+    return NativeAdrenoPreempt::setRecordWptr(record,next_)?kIOReturnSuccess:kIOReturnBadArgument;
 }
 IOReturn NativeAdrenoRing::restoreWptr()
 {
@@ -371,7 +378,8 @@ IOReturn NativeAdrenoRing::program()
 IOReturn NativeAdrenoRing::restart(uint32_t completed)
 {
     if(!attached_)return kIOReturnNotReady;
-    if(completed>seqno_)return kIOReturnBadArgument;
+    /* Not checked against this ring's own last number: the two rings share one number space, so the hung or completed fence the caller
+     * restarts at may be one the other ring issued (untagged-cbea3217c: the hung job 71 sat on ring 1, ring 0 had issued only 70). */
     poisoned_=false;
     /* msm_rbmemptrs: +0 rptr, +4 fence, +8 bv_rptr, +12 bv_fence. */
     for(size_t i=0;i<fence_bytes_/4;++i)fence_[i]=0;
@@ -387,7 +395,6 @@ IOReturn NativeAdrenoRing::restart(uint32_t completed)
 IOReturn NativeAdrenoRing::restartSecondary(uint32_t completed)
 {
     if(!attached_ || !secondary_)return kIOReturnNotReady;
-    if(completed>seqno_)return kIOReturnBadArgument;
     poisoned_=false;
     for(size_t i=0;i<fence_bytes_/4;++i)fence_[i]=0;
     fence_[1]=completed;fence_[RingBvFenceOffset/4]=completed;
@@ -500,13 +507,13 @@ IOReturn NativeAdrenoRing::submit(const uint32_t *words,size_t word_count,uint32
 IOReturn NativeAdrenoRing::submitFramed(const uint32_t *words,size_t word_count,uint32_t *fence)
 {
     if(!fence)return kIOReturnBadArgument;
-    return submitWords(words,word_count,seqno_+1,true,!secondary_,fence);
+    return submitWords(words,word_count,seqno_+1,true,current_,fence);
 }
 IOReturn NativeAdrenoRing::submitFramed(const uint32_t *words,size_t word_count,uint32_t number,uint32_t *issued)
 {
     if(!issued)return kIOReturnBadArgument;*issued=0;
     if(!number || (int32_t)(number-seqno_)<=0)return kIOReturnBadArgument;
-    return submitWords(words,word_count,number,true,!secondary_,issued);
+    return submitWords(words,word_count,number,true,current_,issued);
 }
 IOReturn NativeAdrenoRing::submitWords(const uint32_t *words,size_t word_count,uint32_t number,bool framed,bool give_wptr,uint32_t *fence)
 {
@@ -525,13 +532,15 @@ IOReturn NativeAdrenoRing::submitWords(const uint32_t *words,size_t word_count,u
     if(word_count+extra+8>size_words-used)return kIOReturnNoResources;
     uint32_t at=next_;
     if(framed) {
-        status=emitPrologue(at,reset,table,&at);
+        status=emitPrologue(at,reset,table,&at,number);
         if(status)return status;
     }
     for(size_t i=0;i<word_count;++i)ring_[(at+i)&mask]=words[i];
     at=(at+(uint32_t)word_count)&mask;
     uint32_t end=0;
-    status=framed?emitFramedFence(at,number,&end,give_wptr?preempt_:false):emitFence(at,number,&end);
+    /* Every framed submission of a ring with a preemption record ends with the yield: the second ring's too, or the CP never
+     * leaves it (the switch back stays pending with STOP set). */
+    status=framed?emitFramedFence(at,number,&end,preempt_):emitFence(at,number,&end);
     if(status)return status;
     /* Whole-ring publication is deliberate: a submission may wrap, and one
      * clean of the owned pool is cheaper than a split range proof. */
