@@ -30,6 +30,7 @@ enum {
     NativeAdrenoMethodGetDeviceInfo = 15,
     NativeAdrenoMethodBoImport = 16,
     NativeAdrenoMethodSetPriority = 17,
+    NativeAdrenoMethodNote = 18,
     NativeAdrenoAbiMetadataBytes = 64
 };
 struct NativeAdrenoAbiParams {
@@ -121,6 +122,15 @@ struct NativeAdrenoAbiBoCpuUnmap {
 struct NativeAdrenoAbiPriority {
     uint32_t foreground;          /* 0..5, 3 refused */
     uint32_t background;          /* 0..5 */
+};
+/* A note a process leaves in the kernel's log (the board's export writes it as a row of kernel.rings.txt), for what only the process knows
+ * and has no file of its own to put it in (a sandboxed extension): its slow render passes and the pipelines it made or was refused.
+ * kind 1 pass, 2 pipeline; the words are the kind's record (NativeAdrenoNotePass, NativeAdrenoNotePipeline in the frontend). */
+enum { NativeAdrenoNoteWords = 30, NativeAdrenoNotePass = 1, NativeAdrenoNotePipeline = 2 };
+struct NativeAdrenoAbiNote {
+    uint32_t kind;
+    uint32_t count;               /* words used, <= NativeAdrenoNoteWords */
+    uint32_t words[NativeAdrenoNoteWords];
 };
 struct NativeAdrenoAbiQueue {
     uint64_t queue;               /* zero for create, an open id for close */
