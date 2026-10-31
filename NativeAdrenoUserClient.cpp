@@ -400,6 +400,7 @@ IOReturn NativeAdrenoUserClient::submit(const NativeAdrenoAbiSubmit *request,
     uint32_t fence=0;
     used_=true;
     ring_->useContext(context_);
+    submit_->nextOwner(proc_selfpid());
     const IOReturn status=submit_->submit(vm_,buffers,request->buffer_count,
         queue_base_+request->queue,&fence,clock);
     if(status)return status;
