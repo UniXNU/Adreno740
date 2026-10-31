@@ -6,8 +6,10 @@
 #include <kern/task.h>
 #include "AdrenoPM4.h"
 
-static const uint64_t kIovas[GpuBufferCount]={GpuSqeIova,GpuRingIova,GpuMemptrsIova,GpuPwrupIova,GpuScratchIova};
-static const size_t kBytes[GpuBufferCount]={GpuSqeBytes,GpuRingBytes,GpuPageBytes,GpuPageBytes,GpuPageBytes};
+static const uint64_t kIovas[GpuBufferCount]={GpuSqeIova,GpuRingIova,GpuMemptrsIova,GpuPwrupIova,GpuScratchIova,
+    GpuPreemptRecordIova,GpuPreemptRecord1Iova,GpuPreemptSmmuIova,GpuPreemptSmmu1Iova,GpuRing1Iova,GpuMemptrs1Iova};
+static const size_t kBytes[GpuBufferCount]={GpuSqeBytes,GpuRingBytes,GpuPageBytes,GpuPageBytes,GpuPageBytes,
+    GpuPreemptRecordBytes,GpuPreemptRecordBytes,GpuPageBytes,GpuPageBytes,GpuRingBytes,GpuPageBytes};
 IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,unsigned asid,const unsigned slots[2],
     const uint16_t sids[2],void (*progress)(uint32_t),NativeAdrenoGmuContextReport *report)
 {
@@ -239,7 +241,7 @@ extern "C" IOReturn NativeAdrenoGpuContextBringup(volatile uint8_t *smmu,size_t 
     const uint16_t sids[2]={uint16_t(sid0),uint16_t(sid1)};
     return board_gpu_context->bringUp(&io,bank,asid,slots,sids,progress,report);
 }
-extern "C" IOReturn NativeAdrenoGpuContextBuffers(NativeAdrenoGpuBuffer out[5])
+extern "C" IOReturn NativeAdrenoGpuContextBuffers(NativeAdrenoGpuBuffer out[GpuBufferCount])
 {
     if(!out)return kIOReturnBadArgument;
     for(unsigned i=0;i<GpuBufferCount;++i)out[i]={};

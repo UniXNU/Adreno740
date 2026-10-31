@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 #include "NativeAdrenoUserClient.h"
+#include <kern/task.h>
+#include <sys/resource_private.h>   /* PRIO_DARWIN_GPU_*: the process's GPU role, set by the system */
 extern "C" volatile uint32_t native_adreno_trace_stage;
 /* 0 keeps user BOs cacheable and maintained before every submission (int-070..097); the board sets it from the sheng-gpu-wc boot argument. */
 /* sheng-gpu-owned-coherent=1: the GPU's own BOs use the IO-coherent path (CPU write-back view, GPU write-back inner-shareable mapping) instead of
@@ -372,6 +374,24 @@ IOReturn NativeAdrenoUserClient::freeBo(const NativeAdrenoAbiBoFree *request)
     clear(*entry);
     return kIOReturnSuccess;
 }
+/* The GPU priority this process's next submission takes: its queues' foreground value while it renders visible UI (any GPU role above
+ * background), their background value otherwise. A process that never told us keeps the daemon's default (no ring choice). */
+int32_t NativeAdrenoUserClient::submitPriority() const
+{
+    if(priority_foreground_<0 && priority_background_<0)return -1;
+    const int32_t role=task_get_gpu_role(current_task());
+    const bool background=role==PRIO_DARWIN_GPU_BACKGROUND || role==PRIO_DARWIN_GPU_UTILITY;
+    return background?(priority_background_>=0?priority_background_:priority_foreground_)
+                     :(priority_foreground_>=0?priority_foreground_:priority_background_);
+}
+IOReturn NativeAdrenoUserClient::setPriority(uint32_t foreground,uint32_t background)
+{
+    if(!open_)return kIOReturnNotReady;
+    if(foreground>5 || background>5 || foreground==3)return kIOReturnBadArgument;
+    priority_foreground_=int32_t(foreground);
+    priority_background_=int32_t(background);
+    return kIOReturnSuccess;
+}
 IOReturn NativeAdrenoUserClient::submit(const NativeAdrenoAbiSubmit *request,
     NativeAdrenoAbiSubmitReply *reply,const NativeAdrenoRingClock *clock)
 {
@@ -401,6 +421,7 @@ IOReturn NativeAdrenoUserClient::submit(const NativeAdrenoAbiSubmit *request,
     used_=true;
     ring_->useContext(context_);
     submit_->nextOwner(proc_selfpid());
+    submit_->nextPriority(submitPriority());
     const IOReturn status=submit_->submit(vm_,buffers,request->buffer_count,
         queue_base_+request->queue,&fence,clock);
     if(status)return status;

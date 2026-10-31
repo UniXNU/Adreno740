@@ -29,6 +29,7 @@ enum {
     NativeAdrenoMethodBoCpuUnmap = 14,
     NativeAdrenoMethodGetDeviceInfo = 15,
     NativeAdrenoMethodBoImport = 16,
+    NativeAdrenoMethodSetPriority = 17,
     NativeAdrenoAbiMetadataBytes = 64
 };
 struct NativeAdrenoAbiParams {
@@ -113,6 +114,13 @@ struct NativeAdrenoAbiBoCpuUnmap {
     uint64_t handle;
     uint32_t token;               /* exactly the token returned by map */
     uint32_t reserved;            /* zero */
+};
+/* The GPU priorities the process's Metal queues asked for, in Metal's numbering (MTLGPUPriority: 0 high, 1 normal, 2 low, 3 disabled,
+ * 4 normal-high, 5 real-time; the strongest of its queues): foreground while the process renders visible UI, background otherwise (its
+ * GPU role, task_get_gpu_role). A new connection has normal and disabled, a new Metal queue's values. */
+struct NativeAdrenoAbiPriority {
+    uint32_t foreground;          /* 0..5, 3 refused */
+    uint32_t background;          /* 0..5 */
 };
 struct NativeAdrenoAbiQueue {
     uint64_t queue;               /* zero for create, an open id for close */

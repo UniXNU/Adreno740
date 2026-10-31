@@ -63,13 +63,23 @@ class NativeAdrenoRing final {
     /* Timeline stamps: a framed submission reads the CP's always-on counter (19.2 MHz) into the fence page before its user buffers and after
      * them, as a6xx_submit() does for its stats (CP_REG_TO_MEM, REG 0x0980, 64 bit). Slot fence % 64 at +512, 16 bytes: start, end. */
     bool stamps_=false;
+    /* CP preemption between rings (NativeAdrenoPreempt): every framed submission ends by yielding the floor, and the prologue
+     * names the ring's preemption record with CP_SET_PSEUDO_REG so the CP can save this ring's state into it. A ring that is not
+     * the one the CP runs appends its words without moving CP_RB_WPTR: the switch writes it after the CP arrives (msm's
+     * ring->restore_wptr), which restoreWptr() does. secondary_: this ring never programs CP_RB_* (the CP has one ring register
+     * set; the second ring's base, read-pointer shadow and control word reach it through its preemption record). */
+    bool preempt_=false,secondary_=false,restore_wptr_=false;
+    uint64_t record_iova_=0,smmu_iova_=0,bv_rptr_iova_=0;
+    uint32_t control_=0;
     IOReturn poison();
     IOReturn writeWptr(uint32_t value);
     IOReturn readRptr(uint32_t *);
     IOReturn emitPrologue(uint32_t at,bool reset,bool table,uint32_t *end);
     IOReturn emitFence(uint32_t at,uint32_t seqno,uint32_t *end);
     IOReturn emitFramedFence(uint32_t at,uint32_t seqno,uint32_t *end);
-    IOReturn submitWords(const uint32_t *words,size_t word_count,uint32_t *fence,bool framed);
+    IOReturn emitFramedFence(uint32_t at,uint32_t seqno,uint32_t *end,bool yield);
+    /* The one submission path: `number` is the fence this submission issues (the ring's next, or the caller's). */
+    IOReturn submitWords(const uint32_t *words,size_t word_count,uint32_t number,bool framed,bool give_wptr,uint32_t *issued);
     IOReturn program();
 public:
     NativeAdrenoRing()=default;
@@ -88,11 +98,39 @@ public:
     IOReturn detach();
     /* Emit an entire command stream followed by the timestamp fence and commit
      * it with one WPTR update. Returns a nonzero fence value on success. The
-     * words are copied; the caller's buffer is never retained. */
+     * words are copied; the caller's buffer is never retained. A secondary ring
+     * (attachSecondary) never moves CP_RB_WPTR: its fence is written when the CP
+     * is switched to it and restoreWptr() gives the pointer. */
+    /* A second ring of the same GPU (NativeAdrenoPreempt): its memory is mapped and its read pointer read, but no CP_RB_* register
+     * is written, because the CP has one set and learns this ring from its preemption record on each switch. */
+    IOReturn attachSecondary(void *ring,size_t ring_bytes,uint64_t ring_iova,void *fence,size_t fence_bytes,uint64_t fence_iova);
+    /* CP preemption for this ring: the GPU addresses of its preemption record (NativeAdrenoPreempt::writeRecord) and of the
+     * a7xx_cp_smmu_info page its switch reads, and the read-pointer shadow of the BV thread. A ring without it never yields and
+     * never carries the record packet, as before. */
+    IOReturn setPreempt(uint64_t record,uint64_t smmu_info,uint64_t bv_rptr_addr);
+    bool preemption() const {return preempt_;}
+    /* The write pointer that waits for a switch (a ring that is not the CP's own appends without moving CP_RB_WPTR). */
+    bool restorePending() const {return restore_wptr_;}
+    /* Gives the waiting write pointer again; after a switch into this ring, and after a restart. */
+    IOReturn restoreWptr();
+    /* Fills this ring's preemption record (msm's a6xx_preempt_record): its base, its read-pointer shadow, its BV shadow, its CP_RB_CNTL
+     * and the write pointer the CP resumes at. */
+    IOReturn writePreemptRecord(uint8_t *record) const;
+    /* The register values the record repeats, for the caller's own record writes. */
+    uint32_t controlValue() const {return control_;}
+    uint64_t ringIova() const {return ring_iova_;}
+    uint64_t fenceIova() const {return fence_iova_;}
+    uint64_t bvRptrIova() const {return fence_iova_+8;}
+    uint64_t recordIova() const {return record_iova_;}
+    uint64_t smmuInfoIova() const {return smmu_iova_;}
     IOReturn submit(const uint32_t *words,size_t word_count,uint32_t *fence);
     /* User command buffers: the A7XX BR/BV thread framing of a7xx_submit() around the words (CP init and the kernel's own
      * bring-up packets keep the plain submit() above, as Linux sends them outside a7xx_submit()). */
     IOReturn submitFramed(const uint32_t *words,size_t word_count,uint32_t *fence);
+    /* The same with the fence number chosen by the caller, for rings that share one numbering (NativeAdrenoSubmit's queues):
+     * `fence` must rise past every value this ring has issued, and becomes the ring's newest. The value the ring used is in
+     * `issued` (0 where it refused). */
+    IOReturn submitFramed(const uint32_t *words,size_t word_count,uint32_t fence,uint32_t *issued);
     /* The next framed submission starts with the A7XX context entry of a6xx_set_pagetable() (BR/BV counters, on-chip
      * timestamps and resource table cleared between thread syncs); a new user client requests it, as Linux does per context. */
     void requestContextReset() {reset_pending_=true;}
@@ -117,6 +155,9 @@ public:
      * next submission gets fence completed + 1 and starts with a context entry; no table switch is pending (the caller installs one).
      * Clears poison. The CP must be halted or reset. */
     IOReturn restart(uint32_t completed);
+    /* The same for a secondary ring, after the GPU restart programmed the first one: no register is written, the ring is emptied and
+     * its numbering continues at `completed`; its write pointer waits for the switch that brings the CP back. */
+    IOReturn restartSecondary(uint32_t completed);
     /* The fence value the CP last wrote, read even when the ring is poisoned (the recovery's starting point). */
     IOReturn fenceValue(uint32_t *value);
     /* Words without a timestamp fence, for the restart's CP init and secure-mode packets (a7xx_cp_init and a6xx_hw_init send theirs
