@@ -55,6 +55,7 @@ class NativeAdrenoSubmit final {
         uint32_t context=0;           /* the ring context it ran in (NativeAdrenoRing::useContext) */
         uint64_t submit_us=0;         /* the clock when the write pointer moved (0: no clock), and the GPU level then (native_gpu_dcvs) */
         uint32_t level=0;
+        int32_t owner=0;              /* the process that submitted it (nextOwner) */
         size_t word_count=0;          /* its ring words (the IB packets), kept to replay it after a GPU restart */
         uint32_t words[NativeAdrenoSubmitMaxBuffers*4]{};
     };
@@ -88,7 +89,12 @@ class NativeAdrenoSubmit final {
     Job *free();
     IOReturn release(Job &);
     IOReturn poison();
+    int32_t next_owner_=0;
+    /* The clock of the last submission, for the time a job is seen retired (release has no clock of its own). */
+    uint64_t (*clock_now_)(void *)=nullptr;void *clock_cookie_=nullptr;
 public:
+    /* The process the next submission comes from, for the timeline (the user client sets it before each submit). */
+    void nextOwner(int32_t pid) {next_owner_=pid;}
     NativeAdrenoSubmit()=default;
     ~NativeAdrenoSubmit()=default;
     NativeAdrenoSubmit(const NativeAdrenoSubmit &)=delete;
