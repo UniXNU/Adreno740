@@ -139,7 +139,12 @@ static uint64_t clientWindowBytes(uint32_t input_bits)
 extern "C" {volatile uint32_t native_adreno_cp_aperture[4];
 /* The CP switch check: the bank's image (NativeAdrenoGpuContext::observeContext) before the switch [0..7] and after it [8..15], and the
  * kit status of each [16], [17]; a fault the switch left latched: FAR lo, hi, FSYNR0 [18..20] and the status after clearing it [21]. */
-volatile uint32_t native_adreno_cp_image[22];}
+volatile uint32_t native_adreno_cp_image[22];
+/* The newest 8 GPU restarts: [0] sequence, [1..2] time (us), [3] the fence it hung on, [4] status, [5] jobs replayed, [6] stranded << 0 | guilty << 1,
+ * [7] why the second ring was given up (0 not). */
+volatile uint32_t native_adreno_recover_log[8][12];volatile uint32_t native_adreno_recover_log_count;
+/* checkCpSwitch's step results: createVm, probeBuffer, submit, waitAll, readTtbr0 (each 0 when it passed, ffffffff when not reached). */
+volatile uint32_t native_adreno_cp_check[6]={0xffffffffu,0xffffffffu,0xffffffffu,0xffffffffu,0xffffffffu,0xffffffffu};}
 /* Table switching (NativeAdrenoSubmit): 2 the CP switches in the ring (the default once the board opened the CP's SMMU aperture), 1 the
  * CPU writes TTBR0 with the GPU idle. sheng-gpu-ttbr=1 or 2 forces one. */
 static unsigned tableMode()
@@ -215,6 +220,14 @@ static void nativeAdrenoHangcheck(void *,wait_result_t)
                 if(status)native_adreno_recovery[2]=native_adreno_recovery[2]+1;
                 else native_adreno_recovery[1]=native_adreno_recovery[1]+1;
                 /* Only a GPU that did not come back is everyone's loss; after a restart every client goes on, as Metal's do. */
+                {
+                    const uint32_t n=native_adreno_recover_log_count;volatile uint32_t *row=native_adreno_recover_log[n&7];
+                    const uint64_t now=g.clock.now_us?g.clock.now_us(g.clock.cookie):0;
+                    row[0]=n+1;row[1]=uint32_t(now);row[2]=uint32_t(now>>32);row[3]=result.fence;row[4]=uint32_t(status?status:result.status);
+                    row[5]=result.replayed;row[6]=(g.submit->lastRecoveryStranded()?1u:0u)|(result.guilty?2u:0u);row[7]=g.submit->deadReason();
+                    for(unsigned i=0;i<4;++i)row[8+i]=g.submit->recoveryInfo(i);
+                    native_adreno_recover_log_count=n+1;
+                }
                 if(status)g.status.noteFault();
                 if(!status)g.status.noteSuspend();
             }
@@ -700,6 +713,24 @@ IOReturn AGXDeviceUserClient::run(uint32_t method,const void *input,size_t input
     }
     return status;
 }
+/* The processes' notes (NativeAdrenoMethodNote): rows of [words used, pid, the record's words], 512 of each kind, allocated at the first
+ * note (the kernel's data segment has no room for them as arrays). The board's export reads the two pointers. */
+enum { NativeAdrenoNoteRows = 512, NativeAdrenoNoteRowWords = 2+NativeAdrenoNoteWords };
+extern "C" {volatile uint32_t *native_adreno_pass_log=nullptr;volatile uint32_t native_adreno_pass_count;
+volatile uint32_t *native_adreno_pipe_log=nullptr;volatile uint32_t native_adreno_pipe_count;}
+static volatile uint32_t *noteRows(volatile uint32_t **slot)
+{
+    volatile uint32_t *rows=*slot;
+    if(rows)return rows;
+    uint32_t *fresh=static_cast<uint32_t *>(IOMallocZero(NativeAdrenoNoteRows*NativeAdrenoNoteRowWords*sizeof(uint32_t)));
+    if(!fresh)return nullptr;
+    volatile uint32_t *expected=nullptr;
+    if(!__atomic_compare_exchange_n(slot,&expected,fresh,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) {
+        IOFree(fresh,NativeAdrenoNoteRows*NativeAdrenoNoteRowWords*sizeof(uint32_t));
+        return expected;
+    }
+    return fresh;
+}
 IOReturn AGXDeviceUserClient::runTimed(uint32_t method,const void *input,size_t input_size,void *output,size_t output_size,uint64_t *lockWait)
 {
     if(method>=NativeAdrenoHandoffBase && method<=NativeAdrenoHandoffLast)
@@ -729,6 +760,23 @@ IOReturn AGXDeviceUserClient::runTimed(uint32_t method,const void *input,size_t 
         IOLockUnlock(g.lock);
         if(leases>1)native_adreno_view_kept=native_adreno_view_kept+1;
         else dropViews(token);
+    }
+    if(method==NativeAdrenoMethodNote) {
+        /* Rows for the board's export (BootDiagExport.c, rows G and L): kind, the caller's pid and the record's words. A slot is claimed with
+         * one atomic add, so processes noting at once never share a row; a reader that laps a writer sees one torn row at worst. */
+        if(!input || input_size!=sizeof(NativeAdrenoAbiNote) || output_size)return kIOReturnBadArgument;
+        NativeAdrenoAbiNote note{};
+        memcpy(&note,input,sizeof(note));
+        if((note.kind!=NativeAdrenoNotePass && note.kind!=NativeAdrenoNotePipeline) || note.count>NativeAdrenoNoteWords)return kIOReturnBadArgument;
+        const bool pass=note.kind==NativeAdrenoNotePass;
+        volatile uint32_t *count=pass?&native_adreno_pass_count:&native_adreno_pipe_count;
+        volatile uint32_t *rows=noteRows(pass?&native_adreno_pass_log:&native_adreno_pipe_log);
+        if(!rows)return kIOReturnNoMemory;
+        const uint32_t n=__atomic_fetch_add(count,1,__ATOMIC_RELAXED);
+        volatile uint32_t *row=rows+(n%NativeAdrenoNoteRows)*NativeAdrenoNoteRowWords;
+        row[0]=note.count;row[1]=uint32_t(proc_selfpid());
+        for(uint32_t i=0;i<NativeAdrenoNoteWords;++i)row[2+i]=i<note.count?note.words[i]:0;
+        return kIOReturnSuccess;
     }
     if(method==NativeAdrenoMethodSetPriority) {
         /* The GPU priorities this process's Metal queues asked for (MTLGPUPriority numbering): the frontend reports its queues'
@@ -795,7 +843,8 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector,IOExternalMethodA
         {&action,0,sizeof(NativeAdrenoAbiBoCpuUnmap),0,0},
         {&action,0,0,0,sizeof(NativeAdrenoAbiDeviceInfo)},
         {&action,0,sizeof(NativeAdrenoAbiBoImport),0,sizeof(NativeAdrenoAbiBoAllocReply)},
-        {&action,0,sizeof(NativeAdrenoAbiPriority),0,0}};
+        {&action,0,sizeof(NativeAdrenoAbiPriority),0,0},
+        {&action,0,sizeof(NativeAdrenoAbiNote),0,0}};
     native_adreno_metal_diag.ext_entries=native_adreno_metal_diag.ext_entries+1;
     if(selector<256)native_adreno_metal_diag.sel_bits[selector>>5]|=1u<<(selector&31);
     /* Tunnel. The sandbox resolves a filter policy for this class at open time and then admits only the selectors its profile lists,
@@ -1000,14 +1049,29 @@ static IOReturn checkCpSwitch()
     native_adreno_cp_image[16]=kit;for(unsigned i=0;i<8;++i)native_adreno_cp_image[i]=image[i];
     NativeAdrenoProcessVm *space=nullptr;
     IOReturn status=g.context->createVm(&space);
+    native_adreno_cp_check[0]=uint32_t(status);
     if(status)return status;
     NativeAdrenoSubmitBuffer ib{};
     status=g.context->probeBuffer(space,&ib.handle,&ib.iova,&ib.bytes);
+    native_adreno_cp_check[1]=uint32_t(status);
     uint32_t fence=0;
-    if(!status)status=g.submit->submit(space->vm(),&ib,1,0,&fence,&g.clock);
-    if(!status)status=g.submit->waitAll(&g.clock,2000000);
+    /* The proof is of the first ring's CP switch, as before there were two rings. */
+    g.submit->nextPriority(0);
+    if(!status) {
+        status=g.submit->submit(space->vm(),&ib,1,0,&fence,&g.clock);
+        native_adreno_cp_check[2]=uint32_t(status);
+        native_adreno_cp_check[5]=fence;
+    }
+    g.submit->nextPriority(-1);
+    if(!status) {
+        status=g.submit->waitAll(&g.clock,2000000);
+        native_adreno_cp_check[3]=uint32_t(status);
+    }
     uint64_t seen=0;
-    if(!status)status=g.context->readTtbr0(&seen);
+    if(!status) {
+        status=g.context->readTtbr0(&seen);
+        native_adreno_cp_check[4]=uint32_t(status);
+    }
     if(!status && seen!=space->vm()->ttbr0())status=kIOReturnUnsupported;
     IOReturn freed=g.submit->forgetVm(space->vm(),&g.clock,2000000);
     if(!freed)freed=g.context->destroyVm(space);
@@ -1030,6 +1094,33 @@ static IOReturn checkCpSwitch()
 }
 /* The GPU interrupt's side of a preemption switch (GpuPowerProbe.cpp's handler calls it): the CP moved to the other ring, whose
  * write pointer is given again. False when no switch was in flight. */
+/* For the boot log: out[0..6] the switch counters (triggers, completed, skipped, faulted, disjoint skips, wptr restores, last us),
+ * out[7] the ring the CP runs, out[8] a switch in flight, out[9] CP_CONTEXT_SWITCH_CNTL read now, out[10..15] checkCpSwitch's steps, out[16] why the second ring was given up (0 not; 1 the trigger refused, 2 a switch
+ * did not finish, 3 a job there waited too long), out[17] restarts that replayed its jobs, out[18..25] ring 0's then ring 1's record words (rptr, wptr, errno, info). False
+ * when preemption is off or the lock is busy. */
+extern "C" bool native_adreno_preempt_stats(uint32_t *out)
+{
+    if(!out)return false;
+    for(unsigned i=0;i<6;++i)out[10+i]=native_adreno_cp_check[i];
+    if(!g.published || !g.submit || !IOLockTryLock(g.lock))return false;
+    NativeAdrenoPreemptStats st{};uint32_t loaded=0,cntl=0,dead=0,rescues=0;bool flight=false;
+    const bool on=g.submit->preemptStats(&st,&loaded,&flight,&cntl,&dead,&rescues);
+    IOLockUnlock(g.lock);
+    if(!on)return false;
+    out[0]=st.triggers;out[1]=st.completed;out[2]=st.skipped;out[3]=st.faulted;out[4]=st.disjoint_skips;out[5]=st.restored_wptr;
+    out[6]=st.last_us;out[7]=loaded;out[8]=flight;out[9]=cntl;out[16]=dead;out[17]=rescues;
+    /* each record as the CPU sees it: read pointer, write pointer, errno, info (the CP's words are only as fresh as the mapping) */
+    for(unsigned r=0;r<2;++r) {
+        out[18+r*4]=g.submit->recordWord(r,20);out[19+r*4]=g.submit->recordWord(r,24);
+        out[20+r*4]=g.submit->recordWord(r,8);out[21+r*4]=g.submit->recordWord(r,4);
+    }
+    return true;
+}
+/* The board's submission clock in us, for the logs written outside the submit path (0 before the GPU is published). */
+extern "C" uint64_t native_adreno_now_us(void)
+{
+    return g.published && g.clock.now_us?g.clock.now_us(g.clock.cookie):0;
+}
 extern "C" bool native_adreno_preempt_irq()
 {
     if(!g.published || !g.submit)return false;
