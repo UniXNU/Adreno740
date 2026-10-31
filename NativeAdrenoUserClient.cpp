@@ -376,6 +376,11 @@ IOReturn NativeAdrenoUserClient::freeBo(const NativeAdrenoAbiBoFree *request)
 }
 /* The GPU priority this process's next submission takes: its queues' foreground value while it renders visible UI (any GPU role above
  * background), their background value otherwise. A process that never told us keeps the daemon's default (no ring choice). */
+/* Which processes told the driver what (the newest 32): pid, foreground priority, background priority, the GPU role then, the time (ms of
+ * the submission clock when the board gave one, else 0) and how many times this connection had told it before (0 the runtime's first call
+ * at device open, later ones the process's own setGPUPriority:/setBackgroundGPUPriority: through the frontend). */
+extern "C" {volatile uint32_t native_adreno_prio_log[32][6];volatile uint32_t native_adreno_prio_count;}
+extern "C" uint64_t native_adreno_now_us(void) __attribute__((weak));
 int32_t NativeAdrenoUserClient::submitPriority() const
 {
     if(priority_foreground_<0 && priority_background_<0)return -1;
@@ -390,6 +395,14 @@ IOReturn NativeAdrenoUserClient::setPriority(uint32_t foreground,uint32_t backgr
     if(foreground>5 || background>5 || foreground==3)return kIOReturnBadArgument;
     priority_foreground_=int32_t(foreground);
     priority_background_=int32_t(background);
+    {
+        const uint32_t n=native_adreno_prio_count;
+        volatile uint32_t *row=native_adreno_prio_log[n&31];
+        row[0]=uint32_t(proc_selfpid());row[1]=foreground;row[2]=background;row[3]=uint32_t(task_get_gpu_role(current_task()));
+        row[4]=&native_adreno_now_us?uint32_t(native_adreno_now_us()/1000):0;row[5]=priority_told_;
+        native_adreno_prio_count=n+1;
+        if(priority_told_<0xffffffffu)++priority_told_;
+    }
     return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoUserClient::submit(const NativeAdrenoAbiSubmit *request,
@@ -422,6 +435,7 @@ IOReturn NativeAdrenoUserClient::submit(const NativeAdrenoAbiSubmit *request,
     ring_->useContext(context_);
     submit_->nextOwner(proc_selfpid());
     submit_->nextPriority(submitPriority());
+    submit_->nextRole(task_get_gpu_role(current_task()));
     const IOReturn status=submit_->submit(vm_,buffers,request->buffer_count,
         queue_base_+request->queue,&fence,clock);
     if(status)return status;
