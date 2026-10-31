@@ -66,6 +66,9 @@ class NativeAdrenoUserClient final {
      * range 0). Before either, queue_base_ is only the default 0, which a scoped client may own, so a check of "this client's own range" would
      * test someone else's jobs. */
     bool scoped_=false,used_=false;
+    /* The GPU priorities this process's Metal queues asked for (NativeAdrenoAbiPriority, -1 until one is), and the one a submission
+     * takes: the foreground value while the process renders visible UI and the background one otherwise (the process's GPU role). */
+    int32_t priority_foreground_=-1,priority_background_=-1;
     NativeAdrenoSubmitBuffer submit_buffers_[NativeAdrenoAbiMaxBuffers]{};   /* submit()'s list: too large for the kernel stack */
     NativeAdrenoAbiSubmit submit_request_{};   /* the submit request as copied in, for the same reason */
     uint64_t window_start_=0,window_bytes_=0,window_peak_=0;
@@ -77,6 +80,11 @@ class NativeAdrenoUserClient final {
     void clear(Entry &);
     void publish(Entry &);
 public:
+    /* The GPU priorities this process's Metal queues asked for: the next submission's ring (0 high, 1 low). */
+    IOReturn setPriority(uint32_t foreground,uint32_t background);
+    /* The priority the next submission takes: the foreground value while this process renders visible UI, the background one otherwise
+     * (-1 before any was given). */
+    int32_t submitPriority() const;
     NativeAdrenoUserClient()=default;
     ~NativeAdrenoUserClient()=default;
     NativeAdrenoUserClient(const NativeAdrenoUserClient &)=delete;

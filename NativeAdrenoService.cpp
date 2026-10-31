@@ -48,6 +48,7 @@ extern "C" const uint64_t native_adreno_sqe_firmware_image_size __attribute__((w
 #include "NativeAdrenoUserClient.h"
 /* Physical address of the fence page (the CP writes its timestamps there): the board log reads it from DRAM and through the CPU cache. */
 extern "C" {volatile uint64_t native_adreno_fence_phys=0;}
+extern "C" volatile uint32_t native_adreno_diag;   /* NativeAdrenoSubmit.cpp */
 
 class NativeAdrenoGpuClient;
 static IOUserClient *createGpuClient(task_t,void *,UInt32,OSDictionary *,NativeAdrenoUserClient *);
@@ -447,8 +448,12 @@ bool NativeAdrenoGpuService::start(IOService *provider)
                                             NativeAdrenoRingCache cache{&ring_cache_,ring_publish,fence_acquire};
                                             ring_status=ring_.attach(&ring_io,&cache,ring_mem_.mapping(),
                                                 ring_bytes,ring_iova,fence_mem_.mapping(),fence_bytes,fence_iova);
-                                            /* sheng-gpu-timeline (default 1): framed submissions stamp the CP's always-on counter before and after their buffers. */
-                                            {unsigned timeline=0;const bool given=PE_parse_boot_argn("sheng-gpu-timeline",&timeline,sizeof(timeline));ring_.setTimeline(!given || timeline!=0);}   /* the argument only turns it off */
+                                            /* With the diagnostics (sheng-diag=1) framed submissions stamp the CP's always-on counter before and after their
+                                             * buffers; sheng-gpu-timeline=0 or 1 overrides that. */
+                                            {unsigned timeline=0,diag=0;PE_parse_boot_argn("sheng-diag",&diag,sizeof(diag));
+                                             native_adreno_diag=diag==1;
+                                             if(!PE_parse_boot_argn("sheng-gpu-timeline",&timeline,sizeof(timeline)))timeline=diag==1;
+                                             ring_.setTimeline(timeline!=0);}
                                             if(!ring_status && sqe_bytes) {
                                                 memcpy(sqe_mem_.mapping(),native_adreno_sqe_firmware_image,
                                                     size_t(native_adreno_sqe_firmware_image_size));

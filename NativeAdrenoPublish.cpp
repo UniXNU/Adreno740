@@ -730,6 +730,23 @@ IOReturn AGXDeviceUserClient::runTimed(uint32_t method,const void *input,size_t 
         if(leases>1)native_adreno_view_kept=native_adreno_view_kept+1;
         else dropViews(token);
     }
+    if(method==NativeAdrenoMethodSetPriority) {
+        /* The GPU priorities this process's Metal queues asked for (MTLGPUPriority numbering): the frontend reports its queues'
+         * strongest to its device, which forwards it here once. The switch between the two rings takes the foreground value while
+         * the process renders visible UI and the background one otherwise (the process's GPU role, task_get_gpu_role). */
+        if(!input || input_size!=sizeof(NativeAdrenoAbiPriority) || output_size)return kIOReturnBadArgument;
+        NativeAdrenoAbiPriority request{};
+        memcpy(&request,input,sizeof(request));
+        if(request.foreground>5 || request.background>5)return kIOReturnBadArgument;
+        lockTimed(lockWait);
+        const IOReturn status=live_?core_->setPriority(request.foreground,request.background):kIOReturnNotReady;
+        unlockTimed(lockWait);
+        native_adreno_metal_diag.inflight=0;
+        native_adreno_metal_diag.calls=native_adreno_metal_diag.calls+1;
+        native_adreno_metal_diag.last_selector=method;
+        native_adreno_metal_diag.last_status=uint32_t(status);
+        return status;
+    }
     if(method==NativeAdrenoMethodBoImport) {
         /* The pages belong to the task making this call (an external method runs in the caller's context). */
         if(!input || input_size!=sizeof(NativeAdrenoAbiBoImport) || !output || output_size!=sizeof(NativeAdrenoAbiBoAllocReply))
@@ -777,7 +794,8 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector,IOExternalMethodA
         {&action,0,sizeof(NativeAdrenoAbiBoCpuMap),0,sizeof(NativeAdrenoAbiBoCpuMapReply)},
         {&action,0,sizeof(NativeAdrenoAbiBoCpuUnmap),0,0},
         {&action,0,0,0,sizeof(NativeAdrenoAbiDeviceInfo)},
-        {&action,0,sizeof(NativeAdrenoAbiBoImport),0,sizeof(NativeAdrenoAbiBoAllocReply)}};
+        {&action,0,sizeof(NativeAdrenoAbiBoImport),0,sizeof(NativeAdrenoAbiBoAllocReply)},
+        {&action,0,sizeof(NativeAdrenoAbiPriority),0,0}};
     native_adreno_metal_diag.ext_entries=native_adreno_metal_diag.ext_entries+1;
     if(selector<256)native_adreno_metal_diag.sel_bits[selector>>5]|=1u<<(selector&31);
     /* Tunnel. The sandbox resolves a filter policy for this class at open time and then admits only the selectors its profile lists,
@@ -1009,6 +1027,19 @@ static IOReturn checkCpSwitch()
     }
     if(!status && !freed && observed)status=kIOReturnNotPermitted;
     return status?status:freed;
+}
+/* The GPU interrupt's side of a preemption switch (GpuPowerProbe.cpp's handler calls it): the CP moved to the other ring, whose
+ * write pointer is given again. False when no switch was in flight. */
+extern "C" bool native_adreno_preempt_irq()
+{
+    if(!g.published || !g.submit)return false;
+    /* The interrupt's handler may run where a thread holds the lock: the switch's completion is taken here when the lock is free,
+     * and otherwise by the next submission's or retirement's pass (NativeAdrenoSubmit::driveSwitch completes a switch in flight
+     * before it starts another), so nothing waits on the lock from this path. */
+    if(!IOLockTryLock(g.lock))return false;
+    const bool done=g.submit->preemptIrq();
+    IOLockUnlock(g.lock);
+    return done;
 }
 /* For the display's direct scanout (NativeLegacyDisplay): the newest fence handed out and the newest one the CP has written. The compositor
  * submits a frame's swap when its command buffer is scheduled, not when the GPU finished it; a display that reads the surface itself waits

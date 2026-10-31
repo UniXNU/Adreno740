@@ -16,11 +16,23 @@
 enum : uint64_t {
     GpuSqeIova=0x100000, GpuRingIova=0x200000, GpuMemptrsIova=0x300000, GpuPwrupIova=0x301000,
     GpuScratchIova=0x302000,
+    /* The two rings' CP preemption state (NativeAdrenoPreempt): a record per ring of PREEMPT_RECORD_SIZE (4192 KiB, what the CP
+     * writes its save area into; msm's PREEMPT_RECORD_SIZE) and the a7xx_cp_smmu_info page its switch reads, then the second
+     * ring and its memptrs. */
+    GpuPreemptRecordIova=0x10000000, GpuPreemptRecord1Iova=0x10000000+0x418000,
+    GpuPreemptSmmuIova=0x20000000, GpuPreemptSmmu1Iova=0x20001000,
+    GpuRing1Iova=0x30000000, GpuMemptrs1Iova=0x30008000,
     /* Where every process's own buffers start, as msm's per-process VM (adreno_gpu.h ADRENO_VM_START), above the kernel buffers and
      * the GMEM window; the window ends at 2^ias (adreno_private_vm_size: BIT(ias) - ADRENO_VM_START). */
     GpuClientVaStart=0x100000000
 };
-enum : size_t {GpuSqeBytes=0x13000, GpuRingBytes=0x8000, GpuPageBytes=0x1000, GpuBufferCount=5};
+enum : size_t {
+    GpuSqeBytes=0x13000, GpuRingBytes=0x8000, GpuPageBytes=0x1000,
+    /* PREEMPT_RECORD_SIZE(adreno_gpu) = info->preempt_record_size, 4192 KiB where the catalog has none (a6xx_gpu.h); the CP stores
+     * its save area in it, so the size is the firmware's, not ours. */
+    GpuPreemptRecordBytes=4192*1024,
+    GpuBufferCount=11
+};
 struct NativeAdrenoGpuBuffer {uint64_t physical,bytes,iova;};
 /* One GPU process's own address space: a table of the kernel table's shape (the same 0..2^ias aperture and attributes) under its
  * own ASID, switched into the bank's TTBR0 while the GPU runs that process's work (NativeAdrenoSubmit table switching). The kernel
@@ -95,7 +107,7 @@ extern "C" IOReturn NativeAdrenoGpuContextBringup(volatile uint8_t *smmu,size_t 
     unsigned slot0,unsigned sid0,unsigned slot1,unsigned sid1,void (*progress)(uint32_t),
     NativeAdrenoGmuContextReport *report);
 /* sqe, ring, memptrs, pwrup, scratch: physical base, size and GPU address, only after Ready. */
-extern "C" IOReturn NativeAdrenoGpuContextBuffers(NativeAdrenoGpuBuffer out[5]);
+extern "C" IOReturn NativeAdrenoGpuContextBuffers(NativeAdrenoGpuBuffer out[GpuBufferCount]);
 /* The GPU address size (ias) of the ready GPU context, 0 before Ready. */
 extern "C" unsigned NativeAdrenoGpuContextInputBits();
 /* The live VM of the ready GPU context (null before Ready), for the user-client core. */

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 #ifndef NATIVE_ADRENO_SUBMIT_H
 #define NATIVE_ADRENO_SUBMIT_H
+#include "NativeAdrenoPreempt.h"
 #include "NativeAdrenoRing.h"
 #include "NativeAdrenoVm.h"
 
@@ -44,6 +45,17 @@ struct NativeAdrenoSubmitStats {
  * A failed ring commit that poisons the ring keeps every reference and the
  * submit object unusable; only an independent reset may reclaim them. */
 class NativeAdrenoSubmit final {
+public:
+    /* Everything the switch needs beyond the rings: the GPU's register window for the trigger registers, the GPU addresses of
+     * each ring's preemption record and SMMU info page, and the CPU mappings of those pages (the board's buffers), which are
+     * rewritten before each switch: the incoming ring's record carries the write pointer the CP resumes at. */
+    struct PreemptSetup {
+        NativeAdrenoPreemptIo io{};
+        NativeAdrenoPreemptRings pages{};
+        uint64_t (*now)(void *)=nullptr;
+        void *clock=nullptr;
+    };
+private:
     struct Job {
         uint32_t fence=0;
         size_t count=0;
@@ -58,6 +70,7 @@ class NativeAdrenoSubmit final {
         int32_t owner=0;              /* the process that submitted it (nextOwner) */
         size_t word_count=0;          /* its ring words (the IB packets), kept to replay it after a GPU restart */
         uint32_t words[NativeAdrenoSubmitMaxBuffers*4]{};
+        uint8_t ring=0;               /* the ring it went to (0 high, 1 low: NativeAdrenoSubmit's two rings) */
     };
     /* The jobs, grown on demand; a job never moves. Iterates as Job &. */
     struct JobList {
@@ -78,6 +91,28 @@ class NativeAdrenoSubmit final {
     IOReturn (*write_table_)(void *,uint64_t ttbr0)=nullptr;
     IOReturn useVm(NativeAdrenoVm *,const NativeAdrenoRingClock *);
     NativeAdrenoRing *ring_=nullptr;
+    /* Two rings and the CP's context switch between them (NativeAdrenoPreempt): ring 0 serves the queues Metal marks high (the
+     * render server's), ring 1 everything else. A submission to the ring the CP does not run is queued behind, and the switch is
+     * triggered as soon as its buffers do not overlap the running ring's. Off unless the board turns it on (sheng-gpu-preempt=1). */
+    NativeAdrenoRing *rings_[2]={nullptr,nullptr};
+    unsigned ring_count_=0;
+    NativeAdrenoPreempt preempt_{};
+    bool preempt_on_=false;
+    /* Which ring issued each fence (the two rings share one numbering): fence & (FenceMap-1) -> ring, tag -> its fence. */
+    enum : uint32_t {FenceMap=8192};
+    uint32_t *fence_tag_=nullptr;
+    uint8_t *fence_ring_=nullptr;
+    uint32_t fence_issued_=0;
+    PreemptSetup preempt_setup_{};
+    int32_t next_priority_=-1;    /* the Metal GPU priority of the next submission (-1: not given, the middle ring) */
+    NativeAdrenoRing *ringOfFence(uint32_t fence) const;
+    unsigned ringForPriority() const;
+    bool ringDisjoint(unsigned ring,const uint64_t *handles,size_t count) const;
+    void noteFence(uint32_t fence,uint8_t ring);
+    /* The ring a job ran on (the first ring when there is one only). Everything that reads or writes that ring's registers goes
+     * through it. */
+    NativeAdrenoRing *ring(unsigned index=0) {return index<ring_count_?rings_[index]:ring_;}
+    void driveSwitch(const NativeAdrenoRingClock *clock);
     NativeAdrenoSubmitStats stats_{};
     void noteStall(uint32_t observed,const NativeAdrenoRingClock *clock);   /* the CP's state for a fence that stopped advancing (native_adreno_stall) */
     bool attached_=false,poisoned_=false;
@@ -95,6 +130,18 @@ class NativeAdrenoSubmit final {
 public:
     /* The process the next submission comes from, for the timeline (the user client sets it before each submit). */
     void nextOwner(int32_t pid) {next_owner_=pid;}
+    /* The Metal GPU priority of the next submission's queue (MTLGPUPriority: 0 high, 1 normal, 2 low, 3 disabled, 4 normal-high,
+     * 5 real-time; -1 not given). High, normal-high and real-time go to ring 0, the rest to ring 1. */
+    void nextPriority(int32_t priority) {next_priority_=priority>=0 && priority<=5?priority:-1;}
+    /* The second ring and the switch between them. Both rings must be attached, their records and SMMU info pages mapped; the
+     * caller keeps those buffers alive. `on` false keeps the second ring out of use (the first ring alone, as before). The rings
+     * must have been given their own preemption state (NativeAdrenoRing::setPreempt). */
+    IOReturn setPreemption(NativeAdrenoRing *high,NativeAdrenoRing *low,const PreemptSetup &setup,bool on);
+    bool preemption() const {return preempt_on_ && ring_count_>1;}
+    NativeAdrenoPreemptStats preemptStats() const {return preempt_.stats();}
+    /* The interrupt's side of a switch: the ring the CP moved to is the one whose write pointer is given again. Returns whether a
+     * switch completed. Called from the GPU interrupt (native_adreno_preempt_irq). */
+    bool preemptIrq();
     NativeAdrenoSubmit()=default;
     ~NativeAdrenoSubmit()=default;
     NativeAdrenoSubmit(const NativeAdrenoSubmit &)=delete;
