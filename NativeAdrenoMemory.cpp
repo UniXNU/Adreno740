@@ -361,6 +361,14 @@ IOReturn NativeAdrenoMemory::release()
     mapping_=nullptr;spans_=nullptr;bytes_=span_count_=span_capacity_=0;read_only_=false;owner_uncached_=false;
     return kIOReturnSuccess;
 }
+IOReturn NativeAdrenoMemory::releaseSystemInto(NativeAdrenoSystemPages *out)
+{
+    if(!out || out->descriptor || !system_ || !descriptor_ || !prepared_ || imported_ || device_references_ || quarantined_)return release();
+    /* The GPU no longer maps the pages (the free unmapped them first) and every client view holds the descriptor itself. */
+    out->descriptor=descriptor_;out->bytes=bytes_;out->write_combined=write_combined_;out->cleaned=false;
+    descriptor_=nullptr;prepared_=false;
+    return release();
+}
 IOReturn NativeAdrenoMemory::holdForDevice()
 {
     if(!backed() || !prepared_ || !span_count_ || quarantined_)return kIOReturnNotReady;

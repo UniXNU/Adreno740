@@ -114,6 +114,9 @@ public:
     /* Refuses device references/quarantine; only clears ownership after real
      * descriptor complete() succeeds. No automatic reset or resource recycling. */
     IOReturn release();
+    /* release() for a BO of system memory whose pages may go after the driver's lock: its descriptor (still wired) is handed to out,
+     * for discardSystem to unwire and free once the lock is let go. Any other BO, or an out that holds pages, is released here. */
+    IOReturn releaseSystemInto(struct NativeAdrenoSystemPages *out);
     IOReturn holdForDevice();
     IOReturn retireAfterQuiescence();
     void quarantine() {quarantined_=true;}

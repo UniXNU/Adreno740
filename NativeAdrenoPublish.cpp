@@ -100,6 +100,8 @@ struct NativeAdrenoBoTrace {uint64_t entered;uint32_t kib,flags,limit_us,create_
     int32_t status;uint32_t reserved;};
 static_assert(sizeof(NativeAdrenoBoTrace)==56,"bo trace");
 extern "C" {void (*native_adreno_bo_hook)(const NativeAdrenoBoTrace *);}
+/* BoFrees whose pages were unwired and freed after the lock (the BoFree row of the boot log). */
+extern "C" {volatile uint32_t native_adreno_freed_outside;}
 extern "C" volatile uint32_t native_adreno_bo_memory[8];   /* NativeAdrenoMemory.cpp: [1] counts the spans of system BOs */
 
 /* The two sandbox gates IOServiceOpen applies after newUserClient (XNU IOUserClient.cpp is_io_service_open_extended): the MACF open check on
@@ -641,12 +643,17 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
             offered=pages.descriptor!=nullptr;made=pages.made;wired=pages.wired;cleaned=pages.cleaned;
             prepared=mach_absolute_time();
         }
+        /* i e38a0b1eb: a BoFree held the lock up to 38 ms, unwiring and freeing a large BO's pages; they now go after the lock. */
+        NativeAdrenoSystemPages freed{};
+        const bool freeing=method==NativeAdrenoMethodBoFree;
         lockTimed(lockWait);
         locked=mach_absolute_time();
         spans=native_adreno_bo_memory[1];
         if(connection->live_)connection->core_->offerSystemPages(pages.descriptor?&pages:nullptr);
+        if(connection->live_ && freeing)connection->core_->collectFreedPages(&freed);
         status=connection->live_?connection->core_->dispatch(method,input,input_size,output,output_size,&g.clock):kIOReturnNotReady;
         if(connection->live_)connection->core_->offerSystemPages(nullptr);
+        if(connection->live_ && freeing)connection->core_->collectFreedPages(nullptr);
         if(method==NativeAdrenoMethodBoMap && !status && connection->live_ && !connection->kernel_)
             if(NativeAdrenoClientRecord *record=clientRecord(connection->name_))
                 if(connection->core_->windowPeak()>>20>record->peak_mib)record->peak_mib=uint32_t(connection->core_->windowPeak()>>20);
@@ -655,6 +662,7 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
         unlockTimed(lockWait);
         const bool taken=offered && !pages.descriptor;
         NativeAdrenoMemory::discardSystem(&pages);
+        if(freed.descriptor) {native_adreno_freed_outside=native_adreno_freed_outside+1;NativeAdrenoMemory::discardSystem(&freed);}
         if(alloc && request.bytes>=(UINT64_C(256)<<10))
             if(void (*hook)(const NativeAdrenoBoTrace *)=native_adreno_bo_hook) {
                 NativeAdrenoBoTrace trace{};
