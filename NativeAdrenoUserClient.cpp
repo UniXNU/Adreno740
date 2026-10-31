@@ -362,7 +362,7 @@ IOReturn NativeAdrenoUserClient::freeBo(const NativeAdrenoAbiBoFree *request)
         entry->mapped_state=false;entry->mapped=0;entry->iova=0;
     }
     const size_t bytes=entry->memory.bytes();
-    const IOReturn release=entry->memory.release();
+    const IOReturn release=freed_pages_?entry->memory.releaseSystemInto(freed_pages_):entry->memory.release();
     if(release) {noteFreeRefused(entry->imported,entry->handle,release);return release;}
     if(!entry->imported) {
         owned_bytes_-=bytes<owned_bytes_?bytes:owned_bytes_;

@@ -71,7 +71,7 @@ class NativeAdrenoUserClient final {
     uint64_t window_start_=0,window_bytes_=0,window_peak_=0;
     uint64_t next_handle_=1;
     bool open_=false;
-    NativeAdrenoSystemPages *offered_pages_=nullptr;
+    NativeAdrenoSystemPages *offered_pages_=nullptr,*freed_pages_=nullptr;
     Entry *find(uint64_t);
     Entry *free();
     void clear(Entry &);
@@ -108,6 +108,9 @@ public:
     /* BoAlloc's system pages prepared before the driver's lock (NativeAdrenoMemory::prepareSystem), offered to the next allocBo under the
      * lock and withdrawn after it (null: none); allocBo takes them when they fit its request. */
     void offerSystemPages(NativeAdrenoSystemPages *pages) {offered_pages_=pages;}
+    /* Where the next freeBo under the lock leaves a system BO's pages (NativeAdrenoMemory::releaseSystemInto), for the caller to unwire
+     * and free once the lock is let go (null: freed under it). */
+    void collectFreedPages(NativeAdrenoSystemPages *pages) {freed_pages_=pages;}
     /* What prepareSystem needs before the lock: whether this client's BOs are write-combined, and its largest BO. */
     static bool systemWriteCombined();
     uint64_t boLimit() const {return maxBoBytes();}
