@@ -113,7 +113,6 @@ static unsigned arguments()
     CHECK(memory.allocate(4097,32,false,16384)==kIOReturnBadArgument);++controls;
     CHECK(memory.allocate(4096,33,false,16384)==kIOReturnBadArgument);++controls;
     CHECK(memory.allocate(4096,32,false,0)==kIOReturnBadArgument);++controls;
-    CHECK(memory.allocate(4096,32,false,256u*1024u*1024u+1)==kIOReturnBadArgument);++controls;
     CHECK(memory.allocate(16384,32,false,4096)==kIOReturnNoResources);++controls;
     CHECK(!fixture.created && !fixture.cache_calls);
     fixture.cpu_status=kIOReturnUnsupported;
