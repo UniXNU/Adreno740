@@ -1137,11 +1137,10 @@ extern "C" bool native_adreno_preempt_irq()
  * for the fences handed out before the swap arrived. False before the GPU is published. */
 extern "C" bool native_adreno_fences(uint32_t *submitted,uint32_t *retired)
 {
-    if(!g.published || !g.ring || !submitted || !retired)return false;
-    uint32_t value=0;
-    if(g.ring->fenceValue(&value))return false;
-    *submitted=g.ring->lastSubmitted();*retired=value;
-    return true;
+    if(!g.published || !g.submit || !submitted || !retired)return false;
+    if(!IOLockTryLock(g.lock))return false;
+    const bool known=g.submit->fenceProgress(submitted,retired);
+    IOLockUnlock(g.lock);return known;
 }
 /* Publishes the service once. Everything passed in must outlive the system (the board probe keeps them in statics) and
  * the VM, submit object and ring must already be attached to the live GPU context. The core must not be open. */

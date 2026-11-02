@@ -116,12 +116,14 @@ private:
     /* A switch that cannot be made (the trigger refused, or the CP did not finish one in time) leaves the second ring's jobs without a
      * CP to run them. The ring is then given up for good (preempt_dead_, with the reason) and the GPU restart replays what it holds on
      * the first ring (stranded_: recover() starts from the oldest job that never ran). */
-    enum : uint32_t {PreemptSwitchTimeoutUs=1000000,PreemptStrandedUs=2000000,PreemptAgingUs=250000};   /* switch watchdog 1 s; a ring-1 job unreached for 2 s */
-    bool preempt_dead_=false,stranded_=false;
+    enum : uint32_t {PreemptSwitchTimeoutUs=1000000,PreemptStrandedUs=2000000,PreemptAgingUs=250000,PreemptAgingSliceUs=2000};   /* switch watchdog 1 s; a ring-1 job unreached for 2 s */
+    bool preempt_dead_=false,stranded_=false,aging_grant_=false;
+    uint64_t low_service_us_=0,low_slice_until_=0;
     uint32_t dead_reason_=0,rescues_=0;
     void markPreemptDead(uint32_t reason) {if(!preempt_dead_) {preempt_dead_=true;dead_reason_=reason;}}
     NativeAdrenoRing *ringOfFence(uint32_t fence) const;
     unsigned ringForPriority() const;
+    bool completeSwitch();
     /* The oldest job on `index` that the ring's CP has not finished (its fence beyond what that ring last wrote); null when none. */
     const Job *pendingOn(unsigned index);
     void noteFence(uint32_t fence,uint8_t ring);
@@ -162,6 +164,8 @@ public:
     /* The interrupt's side of a switch: the ring the CP moved to is the one whose write pointer is given again. Returns whether a
      * switch completed. Called from the GPU interrupt (native_adreno_preempt_irq). */
     bool preemptIrq();
+    /* Global completed prefix for scanout: later completions on another ring cannot skip pending work. */
+    bool fenceProgress(uint32_t *submitted,uint32_t *retired);
     /* The switch counters, the ring the CP runs, whether a switch is in flight and the control register as the hardware holds it. */
     /* A word of ring `index`'s preemption record as the CPU sees it now (the CP saves the read pointer, info and errno there). */
     uint32_t recordWord(unsigned index,uint32_t byte_offset) const

@@ -201,7 +201,7 @@ void NativeAdrenoSubmit::driveSwitch(const NativeAdrenoRingClock *clock)
     if(!preemption())return;
     /* A switch the interrupt saw finish (or that finished while its handler could not take the lock) is taken first. */
     if(preempt_.inFlight()) {
-        if(!preemptIrq()) {
+        if(!completeSwitch()) {
             /* The CP never finished a switch: no more are tried (the restart in recover() brings the CP back). */
             if(preempt_.timedOut(PreemptSwitchTimeoutUs)) {
                 uint32_t progress[6]={};
@@ -214,6 +214,8 @@ void NativeAdrenoSubmit::driveSwitch(const NativeAdrenoRingClock *clock)
     }
     if(preempt_dead_)return;
     const uint32_t loaded=preempt_.loaded();
+    const uint64_t now=clock_now_?clock_now_(clock_cookie_):0;
+    if(loaded==1 && now && now<low_slice_until_ && pendingOn(1))return;
     /* Ring 0 is the high ring: while it has work the CP does not leave it for the low ring, and it takes the CP back from the low ring as
      * soon as it has some. The low ring's work still gets the GPU when the high ring is idle, and after it has waited PreemptAgingUs. */
     const Job *const high=pendingOn(0);
@@ -223,8 +225,8 @@ void NativeAdrenoSubmit::driveSwitch(const NativeAdrenoRingClock *clock)
         const Job *const first=pendingOn(i);
         if(!first)continue;
         if(i!=0 && high) {
-            const uint64_t now=clock_now_?clock_now_(clock_cookie_):0;
-            if(!(now && first->submit_us && now-first->submit_us>PreemptAgingUs))continue;
+            const uint64_t since=first->submit_us>low_service_us_?first->submit_us:low_service_us_;
+            if(!(now && since && now-since>PreemptAgingUs))continue;
         }
         /* The incoming ring's preemption record keeps what it was given at setup and what the CP saved into it when it switched the
          * ring out (read pointer, info, errno); only the write pointer the CP resumes at is given again before every switch. */
@@ -235,7 +237,7 @@ void NativeAdrenoSubmit::driveSwitch(const NativeAdrenoRingClock *clock)
         uint64_t ttbr0=0;
         if(incoming->executedTable(&ttbr0)) {markPreemptDead(5);return;}
         (void)NativeAdrenoPreempt::writeSmmuInfo(preempt_setup_.pages.smmu_cpu[i],ttbr0,uint32_t(ttbr0>>48),0);
-        if(preempt_.trigger(i,true)) {ring(0)->setCurrent(false);ring(1)->setCurrent(false);return;}
+        if(preempt_.trigger(i,true)) {aging_grant_=i==1 && high;ring(0)->setCurrent(false);ring(1)->setCurrent(false);return;}
         /* The trigger itself refused (a register write failed): the second ring cannot be reached, so it is given up at once and the
          * jobs already queued on it are replayed by the restart the hang check asks for. */
         preempt_.noteSkipped();
@@ -244,7 +246,7 @@ void NativeAdrenoSubmit::driveSwitch(const NativeAdrenoRingClock *clock)
     }
 }
 /* The interrupt's side: a completed switch makes its ring the loaded one and gives that ring's write pointer. */
-bool NativeAdrenoSubmit::preemptIrq()
+bool NativeAdrenoSubmit::completeSwitch()
 {
     if(!preemption() || !preempt_.inFlight())return false;
     if(!preempt_.complete())return false;
@@ -255,7 +257,31 @@ bool NativeAdrenoSubmit::preemptIrq()
     if(now->restoreWptr()) {markPreemptDead(6);return false;}
     preempt_.noteRestoredWptr();
     if(!preempt_.releaseKeepalive()) {markPreemptDead(7);return false;}
+    if(preempt_.loaded()==1) {
+        low_service_us_=clock_now_?clock_now_(clock_cookie_):0;
+        low_slice_until_=aging_grant_ && low_service_us_?low_service_us_+PreemptAgingSliceUs:0;
+    }
+    aging_grant_=false;
     return true;
+}
+bool NativeAdrenoSubmit::preemptIrq()
+{
+    if(!completeSwitch())return false;
+    // Work arriving during the switch is reconsidered as soon as it completes.
+    driveSwitch(nullptr);return true;
+}
+bool NativeAdrenoSubmit::fenceProgress(uint32_t *submitted,uint32_t *retired)
+{
+    if(!attached_ || poisoned_ || !submitted || !retired)return false;
+    uint32_t done[2]={},issued=fence_issued_;
+    for(unsigned i=0;i<ring_count_;++i) {
+        if(ring(i)->fenceValue(&done[i]))return false;
+        if((int32_t)(ring(i)->lastSubmitted()-issued)>0)issued=ring(i)->lastSubmitted();
+    }
+    uint32_t prefix=issued;
+    for(const auto &job:jobs_)if(job.active && (int32_t)(job.fence-done[job.ring])>0 &&
+        (int32_t)((job.fence-1)-prefix)<0)prefix=job.fence-1;
+    *submitted=issued;*retired=prefix;return true;
 }
 IOReturn NativeAdrenoSubmit::setPreemption(NativeAdrenoRing *high,NativeAdrenoRing *low,const PreemptSetup &setup,bool on)
 {
@@ -280,7 +306,7 @@ IOReturn NativeAdrenoSubmit::setPreemption(NativeAdrenoRing *high,NativeAdrenoRi
     }
     rings_[0]=high;rings_[1]=low;ring_count_=2;
     high->setCurrent(true);low->setCurrent(false);
-    preempt_setup_=setup;
+    preempt_setup_=setup;low_service_us_=low_slice_until_=0;aging_grant_=false;
     const IOReturn attached_preempt=preempt_.attach(&setup.io,setup.pages,0,setup.now,setup.clock);
     if(attached_preempt) {ring_count_=1;rings_[1]=nullptr;return attached_preempt;}
     preempt_on_=true;
@@ -820,7 +846,7 @@ IOReturn NativeAdrenoSubmit::recover(NativeAdrenoRestart restart,void *cookie,co
     /* The restart's CP init ran on the first ring: it is the one the CP runs and every replayed job goes there, whatever ring it
      * came from (the words are ring-agnostic and their fence numbers are kept, so each waiter still finds its value). */
     if(preemption()) {
-        preempt_.restart(0);
+        preempt_.restart(0);low_service_us_=low_slice_until_=0;aging_grant_=false;
         ring(0)->setCurrent(true);
         (void)ring(1)->restartSecondary(hung);
         ring(1)->setCurrent(false);
