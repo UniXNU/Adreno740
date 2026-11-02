@@ -10,6 +10,6 @@ Build and interface details: [documentation](https://unixnu.com/drivers/adreno74
 
 ## Frame diagnostics
 
-`sheng-gpu-trace=1` records allocation, command, completion, CPU/GPU and display latency evidence. Pixel capture is disabled. Repeated pending queries are coalesced and idle scheduler stages are excluded. The sheng exporter prioritizes the complete frontend timeline. See [GPU frame diagnostics](https://unixnu.com/porting/gpu-diagnostics) for fields and decoding.
+`sheng-gpu-trace=1` enables the kernel GPU ring: submission, retirement, display arrival, display fence and latch, build identity, and the render server's render, encode and completion thread identities, 65536 records. Repeated pending display queries are coalesced. See [GPU frame diagnostics](https://unixnu.com/porting/gpu-diagnostics) for fields and decoding.
 
-`NativeGpuPerfCounters.h` defines the opt-in 19-counter A7XX BR plan used by sheng diagnostics. Capture records selector readback, unstable 64-bit reads, reset masks and preemption epochs. The host check verifies the register plan against pinned Mesa XML. Dispatch diagnostic events retain task and queue identities through the board latency hook.
+`NativeGpuPerfCounters.h` defines the opt-in 19-counter A7XX BR plan used by sheng diagnostics. Capture records selector readback, unstable 64-bit reads, reset masks and preemption epochs. The host check verifies the register plan against pinned Mesa XML.
