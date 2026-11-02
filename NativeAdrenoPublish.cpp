@@ -737,13 +737,9 @@ IOReturn AGXDeviceUserClient::runTimed(uint32_t method,const void *input,size_t 
     if(method==NativeGpuTraceMethod) {
         if(!input || input_size!=sizeof(NativeGpuTraceRecord) || output_size)return kIOReturnBadArgument;
         const auto *record=static_cast<const NativeGpuTraceRecord *>(input);
-        if(record->event<30 || record->event>69)return kIOReturnBadArgument;
+        if(record->event!=GpuTraceThread)return kIOReturnBadArgument;
         native_gpu_trace_record(record->event,proc_selfpid(),record->value,12);
         return kIOReturnSuccess;
-    }
-    if(method==NativeGpuPixelMethod) {
-        if(!input || input_size!=sizeof(NativeGpuPixelPiece) || output_size)return kIOReturnBadArgument;
-        return native_gpu_pixel_put(static_cast<const NativeGpuPixelPiece *>(input),proc_selfpid())?kIOReturnNoResources:kIOReturnSuccess;
     }
 
     if(method>=NativeAdrenoHandoffBase && method<=NativeAdrenoHandoffLast)
@@ -838,7 +834,7 @@ IOReturn AGXDeviceUserClient::action(OSObject *target,void *,IOExternalMethodArg
 IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector,IOExternalMethodArguments *arguments,
     IOExternalMethodDispatch *,OSObject *target,void *reference)
 {
-    if((selector==NativeGpuTraceMethod || selector==NativeGpuPixelMethod) && arguments)
+    if(selector==NativeGpuTraceMethod && arguments)
         return run(selector,arguments->structureInput,arguments->structureInputSize,
                    arguments->structureOutput,arguments->structureOutputSize);
     /* One entry per ABI method; sizes are the exact wire records. */
@@ -1155,15 +1151,14 @@ extern "C" bool native_adreno_fences_detail(uint32_t *submitted,uint32_t *retire
 {
     if(detail){detail[0]=detail[1]=detail[2]=0;}
     if(!g.published || !g.submit || !submitted || !retired) {
-        gpuTraceEvent(GpuTraceFenceQuery,0,0);return false;
+        return false;
     }
     if(!IOLockTryLock(g.lock)){
         if(detail)detail[2]=1;
-        gpuTraceEvent(GpuTraceFenceQuery,0,1);return false;
+        return false;
     }
     const bool known=g.submit->fenceProgress(submitted,retired,detail);
     if(detail)detail[2]=known?2:3;
-    gpuTraceEvent(GpuTraceFenceQuery,0,known?2:3,known?*submitted:0,known?*retired:0);
     IOLockUnlock(g.lock);return known;
 }
 extern "C" bool native_adreno_fences(uint32_t *submitted,uint32_t *retired)
