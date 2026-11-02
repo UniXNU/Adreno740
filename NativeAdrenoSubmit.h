@@ -95,11 +95,10 @@ private:
     NativeAdrenoVm *table_vm_=nullptr;
     void *table_cookie_=nullptr;
     IOReturn (*write_table_)(void *,uint64_t ttbr0)=nullptr;
-    IOReturn useVm(NativeAdrenoVm *,const NativeAdrenoRingClock *);
+    IOReturn useVm(NativeAdrenoVm *,const NativeAdrenoRingClock *,unsigned index=0);
     NativeAdrenoRing *ring_=nullptr;
-    /* Two rings and the CP's context switch between them (NativeAdrenoPreempt): ring 0 serves every queue but the low and
-     * background ones, which go to ring 1. A submission to the ring the CP does not run is queued behind, and the switch is
-     * triggered as soon as its buffers do not overlap the running ring's. Off unless the board turns it on (sheng-gpu-preempt=1). */
+    /* Ring 0 serves requested high priorities; ring 1 serves normal and low work in mode 2.
+     * Queue ordering is preserved across priority changes. Board policy enables preemption. */
     NativeAdrenoRing *rings_[2]={nullptr,nullptr};
     unsigned ring_count_=0;
     NativeAdrenoPreempt preempt_{};
@@ -117,13 +116,12 @@ private:
     /* A switch that cannot be made (the trigger refused, or the CP did not finish one in time) leaves the second ring's jobs without a
      * CP to run them. The ring is then given up for good (preempt_dead_, with the reason) and the GPU restart replays what it holds on
      * the first ring (stranded_: recover() starts from the oldest job that never ran). */
-    enum : uint32_t {PreemptSwitchTimeoutUs=30000,PreemptStrandedUs=2000000,PreemptAgingUs=250000};   /* a switch not done in 30 ms; a ring-1 job unreached for 2 s */
+    enum : uint32_t {PreemptSwitchTimeoutUs=1000000,PreemptStrandedUs=2000000,PreemptAgingUs=250000};   /* switch watchdog 1 s; a ring-1 job unreached for 2 s */
     bool preempt_dead_=false,stranded_=false;
     uint32_t dead_reason_=0,rescues_=0;
     void markPreemptDead(uint32_t reason) {if(!preempt_dead_) {preempt_dead_=true;dead_reason_=reason;}}
     NativeAdrenoRing *ringOfFence(uint32_t fence) const;
     unsigned ringForPriority() const;
-    bool ringDisjoint(unsigned ring,const uint64_t *handles,size_t count) const;
     /* The oldest job on `index` that the ring's CP has not finished (its fence beyond what that ring last wrote); null when none. */
     const Job *pendingOn(unsigned index);
     void noteFence(uint32_t fence,uint8_t ring);

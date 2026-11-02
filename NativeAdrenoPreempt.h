@@ -67,7 +67,7 @@ class NativeAdrenoPreempt final {
     uint32_t loaded_=0;   /* the ring the CP runs */
     uint32_t next_=0;     /* the ring a switch in flight goes to */
     bool armed_=false;    /* a switch was triggered and its STOP bit not yet seen cleared */
-    bool attached_=false;
+    bool attached_=false,keepalive_=false;
     uint64_t (*now_us_)(void *)=nullptr;
     void *clock_cookie_=nullptr;
     uint64_t trigger_us_=0;
@@ -102,8 +102,10 @@ public:
      * with STOP. `uses_gmem` asks for the GMEM save and restore. False where a switch is still in flight or a register refused. */
     bool trigger(uint32_t ring,bool uses_gmem);
     /* The interrupt's side: read CP_CONTEXT_SWITCH_CNTL; a cleared STOP bit completes the switch and makes its ring the loaded
-     * one, a set one records a fault. False where nothing was in flight. */
+     * one, a set one is still pending. False where nothing was in flight. */
     bool complete();
+    /* Release the power vote after the incoming ring's WPTR is restored. */
+    bool releaseKeepalive();
     bool inFlight() const {return armed_;}
     uint32_t loaded() const {return loaded_;}
     /* A switch triggered more than `limit_us` ago and still not complete. */
@@ -113,7 +115,7 @@ public:
     uint32_t readCntl() const;   /* CP_CONTEXT_SWITCH_CNTL as the hardware holds it (all ones when unreadable); STOP set means a switch is not done */
     uint32_t target() const {return next_;}
     /* After a GPU reset: `ring` is the one the CP runs and nothing is in flight. */
-    void restart(uint32_t ring) {loaded_=ring;armed_=false;event_=nullptr;}
+    void restart(uint32_t ring) {loaded_=ring;armed_=false;event_=nullptr;releaseKeepalive();}
     NativeAdrenoPreemptStats stats() const {return stats_;}
     void noteDisjointSkip() {stats_.disjoint_skips=stats_.disjoint_skips+1;}
     void noteSkipped() {stats_.skipped=stats_.skipped+1;}

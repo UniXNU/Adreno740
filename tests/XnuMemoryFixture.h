@@ -22,6 +22,7 @@ constexpr unsigned kIODirectionOut=2,kIODirectionInOut=3,kIOMemoryMapperNone=0x8
 /* The kernel's physical range (phystokv's), wide enough for every fixture address. */
 extern "C" {inline uint64_t gPhysBase=0,gPhysSize=UINT64_C(1)<<36;}
 inline void *IOMallocZero(size_t bytes) {return std::calloc(1,bytes);}
+inline void IOFree(void *p,size_t) {std::free(p);}
 inline void *kernel_task=reinterpret_cast<void *>(1);
 using task_t=void *;
 /* ScatterUnlessContiguous: what the tablet does, one physical page per span unless the caller asked for contiguous memory. */

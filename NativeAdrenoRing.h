@@ -74,6 +74,7 @@ class NativeAdrenoRing final {
      * ring that is not current appends its words and leaves restore_wptr_ for the switch's arrival. */
     bool current_=true;
     uint64_t record_iova_=0,smmu_iova_=0,bv_rptr_iova_=0;
+    void initPreemptPage();
     uint32_t control_=0;
     IOReturn poison();
     IOReturn writeWptr(uint32_t value);
@@ -115,6 +116,9 @@ public:
      * never carries the record packet, as before. */
     IOReturn setPreempt(uint64_t record,uint64_t smmu_info,uint64_t bv_rptr_addr);
     bool preemption() const {return preempt_;}
+    /* Initialize while idle, or read the TTBR0 the CP last installed, not the last queued table. */
+    IOReturn resetExecutedTable(uint64_t ttbr0);
+    IOReturn executedTable(uint64_t *ttbr0);
     /* The write pointer that waits for a switch (a ring that is not the CP's own appends without moving CP_RB_WPTR). */
     bool restorePending() const {return restore_wptr_;}
     void setCurrent(bool current) {current_=current;}

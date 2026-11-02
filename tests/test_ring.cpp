@@ -35,7 +35,7 @@ static int barrier(void *cookie){CHECK(cookie==&peer);++peer.barriers;
     if(peer.log_order)peer.order.push_back("barrier");return 0;}
 static int publish(void *cookie,const volatile uint32_t *words,size_t bytes)
 {
-    CHECK(cookie==&peer && words && bytes==32768);++peer.publish;
+    CHECK(cookie==&peer && words && (bytes==32768 || bytes==4096));++peer.publish;
     if(peer.log_order)peer.order.push_back("publish");
     return peer.publish==peer.fail_publish;
 }
@@ -275,4 +275,32 @@ int main()
         std::printf("PASS: 1 exact ring programming and submission, 1 wrap submission, 1 refused re-attach, 7 write/1 read attach failures and 4 post-commit poison cases over a software CP register peer (%u failure cases)\n",
             cases);
     }
+    {
+        reset();NativeAdrenoRing r;CHECK(attach(r)==kIOReturnSuccess);
+        CHECK(r.setPreempt(0x200000,0x300000,0x108008)==kIOReturnSuccess);
+        CHECK((fence[16]>>16&127)==0x21 && fence[17]==0x050e && fence[18]==0 && fence[19]==1);
+        CHECK((fence[20]>>16&127)==0x3c && fence[21]==3 && fence[22]==0x050f && fence[24]==1 && fence[25]==1);
+        CHECK(r.resetExecutedTable(0x1234000010000000ull)==kIOReturnSuccess);
+        uint64_t table=0;CHECK(r.executedTable(&table)==kIOReturnSuccess && table==0x1234000010000000ull);
+        r.useTable(0x5678000020000000ull);r.useContext(42);
+        const uint32_t nop=0x70100000;uint32_t end=0;
+        CHECK(r.submitFramed(&nop,1,&end)==kIOReturnSuccess);
+        bool update=false,snapshot=false,amble=false;
+        for(size_t i=0;i<r.writePointer();++i) {
+            const auto h=ring[i];if(h>>28!=7)continue;
+            if((h>>16&127)==0x53) {CHECK(ring[i+1]==0x20000000 && ring[i+2]==0x56780000);update=true;}
+            if((h>>16&127)==0x3d) {CHECK(update && ring[i+1]==0x108080 && ring[i+3]==0x20000000 && ring[i+4]==0x56780000);snapshot=true;}
+            if((h>>16&127)==0x55) {CHECK(ring[i+1]==0x108040 && ring[i+3]==(11|(3<<20)));amble=true;}
+        }
+        CHECK(update && snapshot && amble);
+        CHECK(r.executedTable(&table)==kIOReturnSuccess && table==0x1234000010000000ull); // CPU queued, GPU has not executed
+        fence[32]=0x20000000;fence[33]=0x56780000;
+        CHECK(r.executedTable(&table)==kIOReturnSuccess && table==0x5678000020000000ull);
+        r.setCurrent(false);peer.regs[0x0806]=8191;fence[0]=r.writePointer();
+        const unsigned reads=peer.read_calls;
+        CHECK(r.submitFramed(&nop,1,&end)==kIOReturnSuccess && peer.read_calls==reads);
+        CHECK(r.restart(2)==kIOReturnSuccess && (fence[16]>>16&127)==0x21);
+        std::puts("PASS preemption postamble, executed table snapshot, inactive-ring read pointer and restart");
+    }
+
 }
