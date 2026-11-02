@@ -9,3 +9,5 @@ extern "C" __attribute__((weak)) unsigned native_pmap_user_mappings(ppnum_t,void
 extern "C" {__attribute__((weak)) volatile uint32_t native_gpu_dcvs[15]{};}
 extern "C" __attribute__((weak)) int proc_selfpid() {return 1;}
 extern "C" __attribute__((weak)) uint64_t native_adreno_now_us() {return 0;}
+
+extern "C" __attribute__((weak)) void native_gpu_trace_record(uint32_t,uint32_t,const uint64_t *,uint32_t) {}

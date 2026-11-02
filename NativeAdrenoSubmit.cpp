@@ -1,3 +1,5 @@
+#define NATIVE_GPU_TRACE_OPTIONAL
+#include "NativeGpuTrace.h"
 /* SPDX-License-Identifier: MIT */
 #include "NativeAdrenoSubmit.h"
 #include "AdrenoPM4.h"
@@ -237,6 +239,7 @@ void NativeAdrenoSubmit::driveSwitch(const NativeAdrenoRingClock *clock)
         uint64_t ttbr0=0;
         if(incoming->executedTable(&ttbr0)) {markPreemptDead(5);return;}
         (void)NativeAdrenoPreempt::writeSmmuInfo(preempt_setup_.pages.smmu_cpu[i],ttbr0,uint32_t(ttbr0>>48),0);
+        gpuTraceEvent(GpuTraceSwitch,0,0,loaded,i,first->fence,first->owner,first->priority,ttbr0);
         if(preempt_.trigger(i,true)) {aging_grant_=i==1 && high;ring(0)->setCurrent(false);ring(1)->setCurrent(false);return;}
         /* The trigger itself refused (a register write failed): the second ring cannot be reached, so it is given up at once and the
          * jobs already queued on it are replayed by the restart the hang check asks for. */
@@ -261,6 +264,7 @@ bool NativeAdrenoSubmit::completeSwitch()
         low_service_us_=clock_now_?clock_now_(clock_cookie_):0;
         low_slice_until_=aging_grant_ && low_service_us_?low_service_us_+PreemptAgingSliceUs:0;
     }
+    gpuTraceEvent(GpuTraceSwitch,0,1,preempt_.loaded(),now->lastSubmitted(),low_slice_until_);
     aging_grant_=false;
     return true;
 }
@@ -270,7 +274,7 @@ bool NativeAdrenoSubmit::preemptIrq()
     // Work arriving during the switch is reconsidered as soon as it completes.
     driveSwitch(nullptr);return true;
 }
-bool NativeAdrenoSubmit::fenceProgress(uint32_t *submitted,uint32_t *retired)
+bool NativeAdrenoSubmit::fenceProgress(uint32_t *submitted,uint32_t *retired,uint32_t *rings)
 {
     if(!attached_ || poisoned_ || !submitted || !retired)return false;
     uint32_t done[2]={},issued=fence_issued_;
@@ -281,6 +285,8 @@ bool NativeAdrenoSubmit::fenceProgress(uint32_t *submitted,uint32_t *retired)
     uint32_t prefix=issued;
     for(const auto &job:jobs_)if(job.active && (int32_t)(job.fence-done[job.ring])>0 &&
         (int32_t)((job.fence-1)-prefix)<0)prefix=job.fence-1;
+    gpuTraceEvent(GpuTraceFenceQuery,0,4,issued,prefix,done[0],done[1],ring_count_);
+    if(rings){rings[0]=done[0];rings[1]=done[1];}
     *submitted=issued;*retired=prefix;return true;
 }
 IOReturn NativeAdrenoSubmit::setPreemption(NativeAdrenoRing *high,NativeAdrenoRing *low,const PreemptSetup &setup,bool on)
@@ -305,6 +311,7 @@ IOReturn NativeAdrenoSubmit::setPreemption(NativeAdrenoRing *high,NativeAdrenoRi
         (void)r->writePreemptRecord(setup.pages.record_cpu[i]);
     }
     rings_[0]=high;rings_[1]=low;ring_count_=2;
+    gpuTraceEvent(GpuTraceConfig,0,2,setup.mode,table_mode_,PreemptSwitchTimeoutUs,PreemptAgingUs,PreemptAgingSliceUs);
     high->setCurrent(true);low->setCurrent(false);
     preempt_setup_=setup;low_service_us_=low_slice_until_=0;aging_grant_=false;
     const IOReturn attached_preempt=preempt_.attach(&setup.io,setup.pages,0,setup.now,setup.clock);
@@ -326,6 +333,7 @@ IOReturn NativeAdrenoSubmit::release(Job &job)
         uint64_t start=0,end=0;
         NativeAdrenoRing *r=ringOfFence(job.fence);
         const uint32_t stamped=r?r->timeline(job.fence,&start,&end):0;
+        gpuTraceEvent(GpuTraceRetire,job.owner,job.fence,job.queue,job.ring,job.submit_us,start,end,stamped,job.replays);
         if(native_adreno_tl_cap) {
             const uint32_t n=native_adreno_tl_count;volatile uint64_t *slot=native_adreno_tl[n&(native_adreno_tl_cap-1)];
             slot[0]=(uint64_t)job.fence|(uint64_t)job.count<<32|(uint64_t)stamped<<58;slot[1]=job.submit_us;
@@ -527,6 +535,7 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
     if(clock && clock->now_us) {clock_now_=clock->now_us;clock_cookie_=clock->cookie;}
     job->level=&native_gpu_dcvs?native_gpu_dcvs[1]:0;
     job->owner=next_owner_;next_owner_=0;
+    gpuTraceEvent(GpuTraceSubmit,job->owner,value,queue,index,job->priority,job->role,job->loaded,job->flight,job->context,job->submit_us,handle_count);
     for(size_t i=0;i<word_count;++i)job->words[i]=words[i];
     ++stats_.submissions;
     if(outstanding()>stats_.peak_jobs)stats_.peak_jobs=outstanding();
@@ -771,6 +780,7 @@ IOReturn NativeAdrenoSubmit::hangCheck(bool *hung)
 IOReturn NativeAdrenoSubmit::recover(NativeAdrenoRestart restart,void *cookie,const NativeAdrenoRingClock *clock,
     NativeAdrenoRecovery *out)
 {
+    gpuTraceEvent(GpuTraceRecovery,0,2,preempt_.loaded(),fence_issued_);
     if(!out)return kIOReturnBadArgument;*out={};
     if(!attached_)return kIOReturnNotReady;
     if(!restart)return kIOReturnUnsupported;
@@ -875,6 +885,11 @@ IOReturn NativeAdrenoSubmit::recover(NativeAdrenoRestart restart,void *cookie,co
         if(job && preemption()) {job->ring=0;noteFence(next,0);}
         ++out->replayed;
     }
+    gpuTraceEvent(GpuTraceRecovery,0,3,preempt_.loaded(),fence_issued_);
     ++stats_.restarts;
     return kIOReturnSuccess;
+}
+
+void NativeAdrenoSubmit::markPreemptDead(uint32_t reason) {
+    if(!preempt_dead_) {gpuTraceEvent(GpuTraceRecovery,0,1,reason,preempt_.loaded(),fence_issued_);preempt_dead_=true;dead_reason_=reason;}
 }
