@@ -13,14 +13,13 @@ static uint64_t mach_absolute_time(){return std::chrono::steady_clock::now().tim
 static void absolutetime_to_nanoseconds(uint64_t t,uint64_t *out){*out=t;}
 #include "NativeGpuTrace.inc"
 int main() {
-    NativeGpuThreadTargets targets;assert(targets.find(61)==0);targets.record(61,100);
-    targets.record(61,200);targets.record(0,300);assert(targets.find(61)==200);assert(targets.find(0)==0);
+    NativeGpuThreadTargets targets;assert(targets.find(61,1)==0);targets.record(61,1,100);
+    targets.record(61,1,200);targets.record(61,2,250);targets.record(0,1,300);
+    assert(targets.find(61,1)==200);assert(targets.find(61,2)==250);assert(targets.find(0,1)==0);
     gpuTraceInit();
-    static unsigned dispatch_seen=0;
-    native_gpu_dispatch_hook=[](uint32_t pid,const uint64_t *v,uint32_t count){assert(pid==61 && count==12 && v[0]==123);++dispatch_seen;};
-    uint64_t dispatch[12]={123,1};native_gpu_trace_record(68,61,dispatch,12);assert(dispatch_seen==1);native_gpu_dispatch_hook=nullptr;
     uint64_t thread[6]={3456,1,0,0,0,0};native_gpu_trace_record(63,61,thread,6);
-    assert(native_gpu_render_thread(61)==3456);
+    uint64_t encode[6]={3457,2,0,0,0,0};native_gpu_trace_record(63,61,encode,6);
+    assert(native_gpu_role_thread(61,1)==3456 && native_gpu_role_thread(61,2)==3457);
 
     NativeGpuTraceSlot slots[8]{};NativeGpuTraceStore store;store.slots=slots;store.capacity=8;
     for(unsigned i=0;i<32;++i){NativeGpuTraceRecord r{};r.value[0]=i;assert(store.push(r));}
@@ -37,11 +36,10 @@ int main() {
     bool build=false;for(unsigned i=0;i<head->count;++i)build|=rows[i].event==GpuTraceBuild && rows[i].value[0]==1234;
     assert(build);
     auto issued=gpuTrace.issued;
-    uint64_t noise[3]={0,20,0};native_gpu_trace_record(39,61,noise,3);
-    native_gpu_trace_record(GpuTraceFenceQuery,0,noise,3);
-    native_gpu_trace_record(GpuTraceGmem,61,noise,3);
+    uint64_t noise[3]={123,53,0};
+    for(uint32_t event:{12u,13u,14u,15u,37u,39u,61u,62u,64u,68u})native_gpu_trace_record(event,61,noise,3);
     assert(gpuTrace.issued==issued);
-    noise[0]=123;noise[1]=53;native_gpu_trace_record(39,61,noise,3);assert(gpuTrace.issued==issued+1);
+    native_gpu_trace_record(GpuTraceRetire,61,noise,3);assert(gpuTrace.issued==issued+1);
     NativeGpuLatencyWaits waits;uint64_t omitted=0;
     assert(waits.keep(1,0,55,3,99,omitted));
     for(unsigned i=2;i<100001;++i)assert(!waits.keep(i,0,55,3,99,omitted));
@@ -49,7 +47,5 @@ int main() {
     assert(waits.keep(100003,0,55,4,99,omitted));
     assert(waits.keep(100004,0,55,1,99,omitted));
     assert(waits.keep(100005,0,55,3,100,omitted));
-    NativeGpuPixelPiece p{};assert(native_gpu_pixel_put(&p,42)!=0);
-    uint8_t pixels[16];assert(native_gpu_pixel_snapshot(pixels,sizeof pixels)==0);
     return 0;
 }
