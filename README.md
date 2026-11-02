@@ -11,3 +11,5 @@ Build and interface details: [documentation](https://unixnu.com/drivers/adreno74
 ## Frame diagnostics
 
 `sheng-gpu-trace=1` records frame identities, synchronization and display decisions. `sheng-gpu-pixels=1` retains bounded raw samples after GPU completion. The sheng log exporter carries both streams. See [GPU frame diagnostics](https://unixnu.com/porting/gpu-diagnostics) for fields and decoding.
+
+`NativeGpuPerfCounters.h` defines the opt-in 19-counter A7XX BR plan used by sheng diagnostics. Capture records selector readback, unstable 64-bit reads, reset masks and preemption epochs. The host check verifies the register plan against pinned Mesa XML. Dispatch diagnostic events retain task and queue identities through the board latency hook.
