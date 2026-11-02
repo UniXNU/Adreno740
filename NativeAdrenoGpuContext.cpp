@@ -50,7 +50,7 @@ IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,uns
     }
     if(!status) {
         step(Attach);
-        const ArmSmmu4KStream routes[2]={{slots[0],sids[0]},{slots[1],sids[1]}};
+        const ArmSmmu4KStream routes[2]={{slots[0],sids[0],0},{slots[1],sids[1],0}};
         status=smmu_.attach(routes,2);
         const ArmSmmu4KStreamResult *s=smmu_.streamResult();
         report->route_status=smmu_.attachStatus();
