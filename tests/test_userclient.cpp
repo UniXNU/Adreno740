@@ -110,6 +110,16 @@ int main()
     /* Full client transaction: query, allocate, map, submit, wait, free, close. */
     {
         Path p;CHECK(exposed(p)==kIOReturnSuccess);
+        CHECK(p.client.submitPriority()==-1);
+        CHECK(p.client.setPriority(0,2)==kIOReturnSuccess);
+        fixture.gpu_role=6;CHECK(p.client.submitPriority()==0);
+        fixture.gpu_role=3;CHECK(p.client.submitPriority()==2);
+        fixture.gpu_role=4;CHECK(p.client.submitPriority()==2);
+        fixture.gpu_role=7;CHECK(p.client.submitPriority()==0);
+        CHECK(p.client.setPriority(1,3)==kIOReturnSuccess && p.client.submitPriority()==1);
+        CHECK(p.client.setPriority(3,3)==kIOReturnBadArgument && p.client.submitPriority()==1);
+        CHECK(p.client.setPriority(1,6)==kIOReturnBadArgument);
+        fixture.gpu_role=6;
         NativeAdrenoAbiParams params{};
         CHECK(p.client.query(&params)==kIOReturnSuccess && params.abi_version==NativeAdrenoAbiVersion);
         CHECK(params.input_bits==32 && params.output_bits==40);
@@ -539,15 +549,16 @@ int main()
         CHECK(p.client.waitFence(&future,&ringclock)==kIOReturnBadArgument);
         CHECK(p.client.close()==kIOReturnSuccess);
     }
-    /* Large objects try one contiguous run first and fall back to scattered pages when that fails (and a refused retry). */
+    /* Pageable allocations report failure and leave the client able to allocate again. */
     {
         Path p;CHECK(exposed(p)==kIOReturnSuccess);
         NativeAdrenoAbiBoAlloc big{1u<<20,12,0};
         NativeAdrenoAbiBoAllocReply allocated{};
         fixture.allocation_fail_count=1;
-        CHECK(p.client.allocBo(&big,&allocated)==kIOReturnSuccess && allocated.handle && fixture.allocation_fail_count==0);
+        CHECK(p.client.allocBo(&big,&allocated)==kIOReturnNoMemory && !allocated.handle && fixture.allocation_fail_count==0);
+        CHECK(p.client.allocBo(&big,&allocated)==kIOReturnSuccess && allocated.handle);
         NativeAdrenoAbiBoAllocReply second{};
-        fixture.allocation_fail_count=2; /* contiguous and scattered both fail */
+        fixture.allocation_fail_count=1; /* the pageable allocation fails */
         CHECK(p.client.allocBo(&big,&second)==kIOReturnNoMemory && !second.handle && fixture.allocation_fail_count==0);
         NativeAdrenoAbiBoAlloc demanded{1u<<20,12,1};
         fixture.allocation_fail_count=1; /* a demanded contiguous run is not retried scattered */

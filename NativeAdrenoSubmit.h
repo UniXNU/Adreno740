@@ -95,11 +95,10 @@ private:
     NativeAdrenoVm *table_vm_=nullptr;
     void *table_cookie_=nullptr;
     IOReturn (*write_table_)(void *,uint64_t ttbr0)=nullptr;
-    IOReturn useVm(NativeAdrenoVm *,const NativeAdrenoRingClock *);
+    IOReturn useVm(NativeAdrenoVm *,const NativeAdrenoRingClock *,unsigned index=0);
     NativeAdrenoRing *ring_=nullptr;
-    /* Two rings and the CP's context switch between them (NativeAdrenoPreempt): ring 0 serves every queue but the low and
-     * background ones, which go to ring 1. A submission to the ring the CP does not run is queued behind, and the switch is
-     * triggered as soon as its buffers do not overlap the running ring's. Off unless the board turns it on (sheng-gpu-preempt=1). */
+    /* Ring 0 serves requested high priorities; ring 1 serves normal and low work in mode 2.
+     * Queue ordering is preserved across priority changes. Board policy enables preemption. */
     NativeAdrenoRing *rings_[2]={nullptr,nullptr};
     unsigned ring_count_=0;
     NativeAdrenoPreempt preempt_{};
@@ -117,13 +116,14 @@ private:
     /* A switch that cannot be made (the trigger refused, or the CP did not finish one in time) leaves the second ring's jobs without a
      * CP to run them. The ring is then given up for good (preempt_dead_, with the reason) and the GPU restart replays what it holds on
      * the first ring (stranded_: recover() starts from the oldest job that never ran). */
-    enum : uint32_t {PreemptSwitchTimeoutUs=30000,PreemptStrandedUs=2000000,PreemptAgingUs=250000};   /* a switch not done in 30 ms; a ring-1 job unreached for 2 s */
-    bool preempt_dead_=false,stranded_=false;
+    enum : uint32_t {PreemptSwitchTimeoutUs=1000000,PreemptStrandedUs=2000000,PreemptAgingUs=250000,PreemptAgingSliceUs=2000};   /* switch watchdog 1 s; a ring-1 job unreached for 2 s */
+    bool preempt_dead_=false,stranded_=false,aging_grant_=false;
+    uint64_t low_service_us_=0,low_slice_until_=0;
     uint32_t dead_reason_=0,rescues_=0;
-    void markPreemptDead(uint32_t reason) {if(!preempt_dead_) {preempt_dead_=true;dead_reason_=reason;}}
+    void markPreemptDead(uint32_t reason);
     NativeAdrenoRing *ringOfFence(uint32_t fence) const;
     unsigned ringForPriority() const;
-    bool ringDisjoint(unsigned ring,const uint64_t *handles,size_t count) const;
+    bool completeSwitch();
     /* The oldest job on `index` that the ring's CP has not finished (its fence beyond what that ring last wrote); null when none. */
     const Job *pendingOn(unsigned index);
     void noteFence(uint32_t fence,uint8_t ring);
@@ -164,6 +164,8 @@ public:
     /* The interrupt's side of a switch: the ring the CP moved to is the one whose write pointer is given again. Returns whether a
      * switch completed. Called from the GPU interrupt (native_adreno_preempt_irq). */
     bool preemptIrq();
+    /* Global completed prefix for scanout: later completions on another ring cannot skip pending work. */
+    bool fenceProgress(uint32_t *submitted,uint32_t *retired,uint32_t *rings=nullptr);
     /* The switch counters, the ring the CP runs, whether a switch is in flight and the control register as the hardware holds it. */
     /* A word of ring `index`'s preemption record as the CPU sees it now (the CP saves the read pointer, info and errno there). */
     uint32_t recordWord(unsigned index,uint32_t byte_offset) const
@@ -197,6 +199,7 @@ public:
     /* Turns on table switching (mode 1 or 2, see table_mode_); write installs a TTBR0 from the CPU (used by mode 1 and to leave a
      * table that is about to be freed). Only with no job outstanding. */
     IOReturn setTableSwitching(unsigned mode,IOReturn (*write)(void *,uint64_t),void *cookie);
+    unsigned preemptionMode() const {return preempt_setup_.mode;}
     unsigned tableMode() const {return table_mode_;}
     /* Before a VM is freed: waits for every job, and when the GPU's table is that VM's, installs the default table from the CPU. */
     IOReturn forgetVm(NativeAdrenoVm *,const NativeAdrenoRingClock *,uint32_t timeout_us);

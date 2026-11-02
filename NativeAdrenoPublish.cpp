@@ -22,6 +22,7 @@
 #include <kern/thread.h>
 #include "NativeAdrenoUserClient.h"
 #include "NativeAdrenoGpuContext.h"
+#include "NativeGpuTrace.inc"
 
 extern "C" void proc_selfname(char *, int);
 extern "C" volatile uint32_t native_adreno_table_switches[8];
@@ -733,6 +734,18 @@ static volatile uint32_t *noteRows(volatile uint32_t **slot)
 }
 IOReturn AGXDeviceUserClient::runTimed(uint32_t method,const void *input,size_t input_size,void *output,size_t output_size,uint64_t *lockWait)
 {
+    if(method==NativeGpuTraceMethod) {
+        if(!input || input_size!=sizeof(NativeGpuTraceRecord) || output_size)return kIOReturnBadArgument;
+        const auto *record=static_cast<const NativeGpuTraceRecord *>(input);
+        if(record->event<30 || record->event>69)return kIOReturnBadArgument;
+        native_gpu_trace_record(record->event,proc_selfpid(),record->value,12);
+        return kIOReturnSuccess;
+    }
+    if(method==NativeGpuPixelMethod) {
+        if(!input || input_size!=sizeof(NativeGpuPixelPiece) || output_size)return kIOReturnBadArgument;
+        return native_gpu_pixel_put(static_cast<const NativeGpuPixelPiece *>(input),proc_selfpid())?kIOReturnNoResources:kIOReturnSuccess;
+    }
+
     if(method>=NativeAdrenoHandoffBase && method<=NativeAdrenoHandoffLast)
         return native_gop_handoff_call(method-NativeAdrenoHandoffBase,current_task(),input,input_size,output,output_size);
     if(method==NativeAdrenoExportMethod) {
@@ -825,6 +838,9 @@ IOReturn AGXDeviceUserClient::action(OSObject *target,void *,IOExternalMethodArg
 IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector,IOExternalMethodArguments *arguments,
     IOExternalMethodDispatch *,OSObject *target,void *reference)
 {
+    if((selector==NativeGpuTraceMethod || selector==NativeGpuPixelMethod) && arguments)
+        return run(selector,arguments->structureInput,arguments->structureInputSize,
+                   arguments->structureOutput,arguments->structureOutputSize);
     /* One entry per ABI method; sizes are the exact wire records. */
     static const IOExternalMethodDispatch table[]={
         {&action,0,0,0,sizeof(NativeAdrenoAbiParams)},
@@ -1135,13 +1151,24 @@ extern "C" bool native_adreno_preempt_irq()
 /* For the display's direct scanout (NativeLegacyDisplay): the newest fence handed out and the newest one the CP has written. The compositor
  * submits a frame's swap when its command buffer is scheduled, not when the GPU finished it; a display that reads the surface itself waits
  * for the fences handed out before the swap arrived. False before the GPU is published. */
+extern "C" bool native_adreno_fences_detail(uint32_t *submitted,uint32_t *retired,uint32_t *detail)
+{
+    if(detail){detail[0]=detail[1]=detail[2]=0;}
+    if(!g.published || !g.submit || !submitted || !retired) {
+        gpuTraceEvent(GpuTraceFenceQuery,0,0);return false;
+    }
+    if(!IOLockTryLock(g.lock)){
+        if(detail)detail[2]=1;
+        gpuTraceEvent(GpuTraceFenceQuery,0,1);return false;
+    }
+    const bool known=g.submit->fenceProgress(submitted,retired,detail);
+    if(detail)detail[2]=known?2:3;
+    gpuTraceEvent(GpuTraceFenceQuery,0,known?2:3,known?*submitted:0,known?*retired:0);
+    IOLockUnlock(g.lock);return known;
+}
 extern "C" bool native_adreno_fences(uint32_t *submitted,uint32_t *retired)
 {
-    if(!g.published || !g.ring || !submitted || !retired)return false;
-    uint32_t value=0;
-    if(g.ring->fenceValue(&value))return false;
-    *submitted=g.ring->lastSubmitted();*retired=value;
-    return true;
+    return native_adreno_fences_detail(submitted,retired,nullptr);
 }
 /* Publishes the service once. Everything passed in must outlive the system (the board probe keeps them in statics) and
  * the VM, submit object and ring must already be attached to the live GPU context. The core must not be open. */
@@ -1150,6 +1177,7 @@ extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit 
     uint32_t input_bits,uint32_t output_bits)
 {
     if(g.published || !vm || !submit || !ring || !clock || !clock->now_us)return kIOReturnBadArgument;
+    gpuTraceInit();
     g.lock=IOLockAlloc();
     NativeAdrenoGpuPublished *service=new NativeAdrenoGpuPublished;
     if(!g.lock || !service || !service->init() || !service->attach(IOService::getPlatform())) {
@@ -1174,6 +1202,11 @@ extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit 
     }
     native_adreno_cp_aperture[3]=submit->tableMode();
     g.service=service;g.published=true;
+    gpuTraceEvent(GpuTraceConfig,0,1,submit->tableMode(),submit->preemption(),input_bits,output_bits,submit->preemptionMode());
+#ifdef NATIVE_GPU_BUILD_ID
+    const uint64_t build[]={NATIVE_GPU_BUILD_ID};
+    native_gpu_trace_record(GpuTraceBuild,0,build,1);
+#endif
     {
         thread_t thread=nullptr;
         if(kernel_thread_start(nativeAdrenoHangcheck,nullptr,&thread)==KERN_SUCCESS)thread_deallocate(thread);
