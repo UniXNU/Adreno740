@@ -1,4 +1,6 @@
 #include "NativeGpuThreadTargets.h"
+#include "NativeGpuLatency.h"
+static NativeGpuLatencyWaits gpuLatencyWaits;
 static NativeGpuThreadTargets gpuThreadTargets;
 extern "C" {void (*native_gpu_dispatch_hook)(uint32_t,const uint64_t *,uint32_t);}
 extern "C" uint64_t native_gpu_render_thread(uint32_t pid) {return gpuThreadTargets.find(pid);}
@@ -17,7 +19,7 @@ static void gpuTraceInit()
 {
     unsigned enabled=0,pixels=0;
     PE_parse_boot_argn("sheng-gpu-trace",&enabled,sizeof(enabled));
-    PE_parse_boot_argn("sheng-gpu-pixels",&pixels,sizeof(pixels));
+    /* Pixel capture is outside latency diagnosis. */
     if(enabled!=1)return;
     gpuTrace.slots=static_cast<NativeGpuTraceSlot *>(IOMallocZero(sizeof(NativeGpuTraceSlot)*NativeGpuTraceCapacity));
     if(!gpuTrace.slots)return;
@@ -30,11 +32,12 @@ static void gpuTraceInit()
 extern "C" int native_gpu_trace_enabled(void) {return __atomic_load_n(&gpuTraceOn,__ATOMIC_ACQUIRE);}
 extern "C" void native_gpu_trace_record(uint32_t event,uint32_t pid,const uint64_t *values,uint32_t count)
 {
-    if(!native_gpu_trace_enabled() || count>12 || (count && !values))return;
+    if(!native_gpu_trace_enabled() || count>12 || (count && !values) || !native_gpu_latency_event(event,values,count))return;
     NativeGpuTraceRecord record{};uint64_t ns=0;
     absolutetime_to_nanoseconds(mach_absolute_time(),&ns);
     record.us=ns/1000;record.event=event;record.pid=pid;
     for(uint32_t i=0;i<count;++i)record.value[i]=values[i];
+    if(event==22 && count>=9 && !gpuLatencyWaits.keep(record.us,pid,record.value[0],(uint32_t)record.value[1],record.value[2],record.value[9]))return;
     record.sequence=gpuTrace.push(record);
     if(event==68 && count>=6 && native_gpu_dispatch_hook)native_gpu_dispatch_hook(pid,values,count);
     if(event==63 && count>=2 && record.value[1]==1)gpuThreadTargets.record(pid,record.value[0]);
