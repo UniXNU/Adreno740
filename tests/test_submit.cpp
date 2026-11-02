@@ -271,18 +271,60 @@ int main()
         NativeAdrenoRecovery result{};
         const uint32_t refs=p.object.deviceReferences();
         CHECK(p.submit.recover(restart,nullptr,&ringclock,&result)==kIOReturnSuccess);
-        CHECK(restarted==1 && result.fence==1 && result.replayed==2 && result.guilty==&p.vm && p.vm.faults()==1 && !p.vm.unusable());
+        CHECK(restarted==1 && result.fence==1 && result.replayed==2 && result.guilty==&p.vm && p.vm.hangs()==1 && p.vm.faults()==0 && !p.vm.unusable());
         CHECK(fencemem[1]==1 && p.ring.lastSubmitted()==3 && p.submit.outstanding()==2 && p.object.deviceReferences()==refs-1);
         CHECK(p.submit.stats().restarts==1);
         fencemem[1]=3;
         CHECK(p.submit.wait(3,&ringclock,1000)==kIOReturnSuccess && p.submit.wait(2,&ringclock,1000)==kIOReturnSuccess);
         CHECK(p.submit.outstanding()==0);
-        /* A VM a hang made unusable submits nothing more. */
+        /* Completed recovery leaves the process usable. */
         p.vm.noteHang(true);
-        CHECK(p.submit.submit(&buffer,1,0,&fence)==kIOReturnNotPermitted);
+        CHECK(p.submit.submit(&buffer,1,0,&fence)==kIOReturnSuccess);
         /* A restart that fails leaves the submit object poisoned. */
         CHECK(p.submit.recover([](void *,NativeAdrenoRing *,uint32_t)->IOReturn {return kIOReturnIOError;},nullptr,&ringclock,&result)==kIOReturnIOError);
         CHECK(p.submit.poisoned());
+    }
+    {
+        Path p;CHECK(exposed(p)==kIOReturnSuccess);NativeAdrenoRing low;
+        uint32_t lowmem[8192]{},lowfence[1024]{};uint8_t rec[2][64]{},info[2][32]{};
+        CHECK(low.attachSecondary(&ringio,&ringcache,lowmem,sizeof(lowmem),0x200000,lowfence,sizeof(lowfence),0x208000)==0);
+        CHECK(p.ring.setPreempt(0x300000,0x400000,0x108008)==0 && low.setPreempt(0x500000,0x600000,0x208008)==0);
+        NativeAdrenoSubmit::PreemptSetup setup{};setup.io={&cp,cwrite,cread,cbarrier,nullptr,nullptr};
+        setup.pages={{0x300000,0x500000},{0x400000,0x600000},{rec[0],rec[1]},{info[0],info[1]}};
+        setup.now=cnow;setup.clock=&cp;setup.mode=2;
+        CHECK(p.submit.setPreemption(&p.ring,&low,setup,true)==0);
+        auto write=[](void *,uint64_t)->IOReturn{return 0;};
+        CHECK(p.submit.setTableSwitching(2,write,nullptr)==0);
+        p.ring.tableInstalled(0xaaaa000);low.tableInstalled(0xbbbb000);p.ring.useContext(42);
+        NativeAdrenoSubmitBuffer buffer{p.handle,0x800000,4096};uint32_t first=0,second=0;
+        p.submit.nextPriority(1);CHECK(p.submit.submit(&p.vm,&buffer,1,7,&first,&ringclock)==0);
+        CHECK(low.lastSubmitted()==first && p.ring.lastSubmitted()==0 && low.table()==p.vm.ttbr0() && p.ring.table()==0xaaaa000);
+        CHECK(low.context()==42 && cp.regs[0x08a0]==0x341);
+        cp.regs[0x08a0]=0x340;CHECK(p.submit.preemptIrq());
+        p.submit.nextPriority(0);CHECK(p.submit.submit(&p.vm,&buffer,1,7,&second,&ringclock)==0);
+        CHECK(low.lastSubmitted()==second && p.ring.lastSubmitted()==0); // own queue cannot overtake
+        lowfence[1]=second;CHECK(p.submit.retireCompleted()==0);
+        CHECK(p.submit.submit(&p.vm,&buffer,1,7,&second,&ringclock)==0 && p.ring.lastSubmitted()==second);
+        CHECK(p.ring.table()==p.vm.ttbr0());
+        cp.regs[0x08a0]=0x340;CHECK(p.submit.preemptIrq());fencemem[1]=second;CHECK(p.submit.retireCompleted()==0);
+        p.submit.nextPriority(1);CHECK(p.submit.submit(&p.vm,&buffer,1,7,&first,&ringclock)==0);
+        cp.regs[0x08a0]=0x340;CHECK(p.submit.preemptIrq());
+        // Another ring can advance beyond the small fence-history table while this job remains pending.
+        for(unsigned i=0;i<8193;++i) {
+            p.submit.nextPriority(0);CHECK(p.submit.submit(&p.vm,&buffer,1,8,&second,&ringclock)==0);
+            cp.regs[0x08a0]=0x340;(void)p.submit.preemptIrq();
+            fencemem[0]=p.ring.writePointer();fencemem[1]=second;
+            CHECK(p.submit.retireCompleted()==0 && p.submit.outstanding()==1);
+            cp.regs[0x08a0]=0x340;(void)p.submit.preemptIrq();
+        }
+        CHECK(p.submit.observeFence(first,nullptr,0)==kIOReturnTimeout);
+        lowfence[1]=first;CHECK(p.submit.retireCompleted()==0 && p.submit.outstanding()==0);
+        CHECK(p.submit.wait(first,&ringclock,0)==0 && p.submit.observeFence(first,nullptr,0)==0);
+        CHECK(p.submit.wait(second+1,&ringclock,0)==kIOReturnBadArgument);
+        CHECK(p.submit.setTableSwitching(1,write,nullptr)==0);p.submit.nextPriority(2);
+        CHECK(p.submit.submit(&p.vm,&buffer,1,7,&second,&ringclock)==0 && p.ring.lastSubmitted()==second);
+        fencemem[1]=second;CHECK(p.submit.retireCompleted()==0);
+        std::puts("PASS two-ring priorities, per-ring table/context, queue FIFO, fence-history rollover and CPU-table fallback");
     }
     std::printf("PASS: 1 execbuf submission with exact IB packet and fence, 8 pre-reference refusals, 1 duplicate-buffer reference case and 1 poisoned-commit retention case over software SMMU/CP peers; 2 write-combine audit cases (trusted, dirty and failed); 1 hangcheck and 1 recovery with replay, 1 unusable-VM refusal and 1 failed restart\n");
 }
