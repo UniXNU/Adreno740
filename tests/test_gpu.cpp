@@ -58,7 +58,7 @@ static int idle(void *c)
 static NativeAdrenoGpuConfig config()
 {
     NativeAdrenoGpuConfig c{};
-    c.mmio={&regs,write32,read32,barrier};
+    c.mmio={&regs,write32,read32,barrier,nullptr,nullptr};
     c.cache={&regs,publish,acquire};
     c.time={&regs,timeRead};
     c.clock={&board,now,idle};

@@ -29,6 +29,7 @@ using task_t=void *;
 enum SegmentMode {Contiguous,Scattered,ZeroPhysical,UnalignedPhysical,ShortSegment,HighPhysical,Paired,ScatterUnlessContiguous};
 class IOBufferMemoryDescriptor;
 struct MemoryFixture {
+    int gpu_role=6;
     unsigned created=0,prepared=0,completed=0,released=0,cache_calls=0,segment_calls=0;
     unsigned pageable=0,write_combined_entries=0;   /* inTaskWithOptions: pageable buffers with no task, those with a write-combined entry */
     unsigned allocation_fail_count=0;
@@ -141,4 +142,6 @@ using ppnum_t=uint32_t;
 inline uint64_t mach_absolute_time() {static uint64_t now;return ++now;}
 inline void nanoseconds_to_absolutetime(uint64_t ns,uint64_t *out) {*out=ns;}
 inline void IODelay(unsigned) {}
+inline task_t current_task() {return reinterpret_cast<task_t>(2);}
+inline int task_get_gpu_role(task_t) {return fixture.gpu_role;}
 #endif
