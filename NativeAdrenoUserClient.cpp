@@ -56,7 +56,6 @@ void NativeAdrenoUserClient::publish(Entry &entry)
 }
 void NativeAdrenoUserClient::clear(Entry &entry)
 {
-    if(entry.used && entry.imported)gpuTraceEvent(GpuTraceImport,entry.imported_pid,0,0,0,entry.handle);
     if(entry.used && live_)--live_;
     index_.erase(entry.handle);
     const size_t index=entry.index;if(index<free_hint_)free_hint_=index;
@@ -294,7 +293,6 @@ IOReturn NativeAdrenoUserClient::importBo(const NativeAdrenoAbiBoImport *request
     publish(*entry);
     entry->mapped=0;entry->iova=0;entry->mapped_state=false;entry->imported=true;entry->imported_pid=proc_selfpid();
     reply->handle=entry->handle;
-    gpuTraceEvent(GpuTraceImport,proc_selfpid(),1,request->address,request->bytes,entry->handle,entry->memory.spanCount()?entry->memory.spans()[0].physical:0);
     native_adreno_import_live[0]=native_adreno_import_live[0]+1;
     {
         const unsigned slot=3+(gImportNext++%8)*4;
