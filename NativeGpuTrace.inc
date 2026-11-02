@@ -32,14 +32,15 @@ extern "C" void native_gpu_trace_record(uint32_t event,uint32_t pid,const uint64
     if(event==22 && count>=9 && !gpuLatencyWaits.keep(record.us,pid,record.value[0],(uint32_t)record.value[1],record.value[2],record.value[9]))return;
     record.sequence=gpuTrace.push(record);
     if(event==GpuTraceThread && count>=2)gpuThreadTargets.record(pid,(uint32_t)record.value[1],record.value[0]);
-    const bool meta=event<=3 || event==GpuTraceThread;
+    const bool meta=event<=3 || event==GpuTraceThread || event==GpuTraceProblem;
     uint32_t free=0;
     if(meta && gpuMetadata && __atomic_compare_exchange_n(&gpuMetadataBusy,&free,1,false,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED)) {
         unsigned pick=NativeGpuTraceMetadata;
         for(unsigned i=0;i<NativeGpuTraceMetadata;++i) {
             auto &m=gpuMetadata[i];
             if(!m.event && pick==NativeGpuTraceMetadata)pick=i;
-            if(m.event==event && m.pid==pid && (event!=GpuTraceThread || m.value[0]==record.value[0])){pick=i;break;}
+            if(m.event==event && m.pid==pid && (event!=GpuTraceThread || m.value[0]==record.value[0]) &&
+               (event!=GpuTraceProblem || !memcmp(m.value,record.value,sizeof m.value))){pick=i;break;}
         }
         if(pick<NativeGpuTraceMetadata)gpuMetadata[pick]=record;
         else __atomic_add_fetch(&gpuTrace.dropped,1,__ATOMIC_RELAXED);
