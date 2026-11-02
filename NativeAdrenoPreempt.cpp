@@ -106,6 +106,7 @@ IOReturn NativeAdrenoPreempt::detach()
 {
     if(!attached_)return kIOReturnNotReady;
     if(armed_)return kIOReturnBusy;
+    if(!releaseKeepalive())return kIOReturnIOError;
     attached_=false;io_={};return kIOReturnSuccess;
 }
 /* Both rings' records as the CPU sees them: read pointer, write pointer, errno, info. */
@@ -153,24 +154,26 @@ void NativeAdrenoPreempt::noteTimeout(const uint32_t progress[6])
 {
     if(!armed_ || !event_)return;
     if(progress)for(unsigned i=0;i<6;++i)event_[28+i]=progress[i];
+    stats_.faulted++;
     closeEvent(2);
 }
 bool NativeAdrenoPreempt::trigger(uint32_t ring,bool uses_gmem)
 {
     if(!attached_ || armed_ || ring>=NativeAdrenoPreemptRingCount || ring==loaded_)return false;
-    /* The incoming ring's state first, then the write that starts the switch (a6xx_preempt_trigger's order). */
+    /* Hold the GPU awake before programming any restore register. */
+    if(io_.gmu_write32 && io_.gmu_write32(io_.gmu_cookie,GmuPreemptKeepalive,1))return false;
+    keepalive_=true;
+    if(io_.barrier(io_.cookie)) {releaseKeepalive();return false;}
     const uint64_t info=rings_.smmu_info[ring],record=rings_.record[ring];
     event_=openEvent(ring);
     if(io_.write32(io_.cookie,PreemptSmmuInfo,(uint32_t)info) ||
         io_.write32(io_.cookie,PreemptSmmuInfo+1,(uint32_t)(info>>32)) ||
         io_.write32(io_.cookie,PreemptRestoreAddr,(uint32_t)record) ||
         io_.write32(io_.cookie,PreemptRestoreAddr+1,(uint32_t)(record>>32)))
-        {closeEvent(3);return false;}
-    /* Keep the GPU on until the switch is done, as a6xx_preempt_keepalive_vote does. */
-    if(io_.gmu_write32 && io_.gmu_write32(io_.gmu_cookie,GmuPreemptKeepalive,1)) {closeEvent(3);return false;}
-    if(io_.barrier(io_.cookie)) {closeEvent(3);return false;}
+        {stats_.faulted++;closeEvent(3);releaseKeepalive();return false;}
+    if(io_.barrier(io_.cookie)) {stats_.faulted++;closeEvent(3);releaseKeepalive();return false;}
     const uint32_t cntl=CntlStop|CntlLevel1|CntlSkipSaveRestore|(uses_gmem?CntlUsesGmem:0);
-    if(io_.write32(io_.cookie,PreemptCntl,cntl)) {closeEvent(3);return false;}
+    if(io_.write32(io_.cookie,PreemptCntl,cntl)) {stats_.faulted++;closeEvent(3);releaseKeepalive();return false;}
     event_[6]=readCntl();
     next_=ring;armed_=true;
     trigger_us_=now_us_?now_us_(clock_cookie_):0;
@@ -179,7 +182,7 @@ bool NativeAdrenoPreempt::trigger(uint32_t ring,bool uses_gmem)
 }
 bool NativeAdrenoPreempt::timedOut(uint32_t limit_us) const
 {
-    if(!armed_ || !now_us_ || !trigger_us_)return false;
+    if(!armed_ || !now_us_)return false;
     return now_us_(clock_cookie_)-trigger_us_>limit_us;
 }
 uint32_t NativeAdrenoPreempt::readCntl() const
@@ -193,9 +196,7 @@ bool NativeAdrenoPreempt::complete()
     if(!attached_ || !armed_)return false;
     uint32_t cntl=0;
     if(io_.read32(io_.cookie,PreemptCntl,&cntl)) {stats_.faulted=stats_.faulted+1;return false;}
-    if(cntl&CntlStop) {stats_.faulted=stats_.faulted+1;return false;}   /* the hardware never finished it */
-    /* The GPU's keepalive vote ends once the switch is complete, as a6xx_preempt_irq does. */
-    if(io_.gmu_write32)(void)io_.gmu_write32(io_.gmu_cookie,GmuPreemptKeepalive,0);
+    if(cntl&CntlStop)return false;
     closeEvent(1);
     loaded_=next_;armed_=false;
     if(trigger_us_ && now_us_) {
@@ -204,4 +205,11 @@ bool NativeAdrenoPreempt::complete()
     }
     stats_.completed=stats_.completed+1;
     return true;
+}
+
+bool NativeAdrenoPreempt::releaseKeepalive()
+{
+    if(!keepalive_)return true;
+    if(io_.gmu_write32 && io_.gmu_write32(io_.gmu_cookie,GmuPreemptKeepalive,0))return false;
+    keepalive_=false;return true;
 }
