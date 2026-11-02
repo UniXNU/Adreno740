@@ -25,6 +25,7 @@ class NativeAdrenoUserClient final {
         bool mapped_state=false;
         bool unreleasable=false;
         bool imported=false;
+        uint32_t imported_pid=0;
         uint32_t metadata_bytes=0;
         uint32_t token=0;
         uint32_t mapping_leases=0;
