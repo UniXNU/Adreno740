@@ -13,6 +13,12 @@ static uint64_t mach_absolute_time(){return std::chrono::steady_clock::now().tim
 static void absolutetime_to_nanoseconds(uint64_t t,uint64_t *out){*out=t;}
 #include "NativeGpuTrace.inc"
 int main() {
+    NativeGpuThreadTargets targets;assert(targets.find(61)==0);targets.record(61,100);
+    targets.record(61,200);targets.record(0,300);assert(targets.find(61)==200);assert(targets.find(0)==0);
+    gpuTraceInit();
+    uint64_t thread[6]={3456,1,0,0,0,0};native_gpu_trace_record(63,61,thread,6);
+    assert(native_gpu_render_thread(61)==3456);
+
     NativeGpuTraceSlot slots[8]{};NativeGpuTraceStore store;store.slots=slots;store.capacity=8;
     for(unsigned i=0;i<32;++i){NativeGpuTraceRecord r{};r.value[0]=i;assert(store.push(r));}
     NativeGpuTraceRecord row{};assert(!store.read(24,&row));assert(store.read(25,&row) && row.value[0]==24);
