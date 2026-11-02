@@ -737,7 +737,7 @@ IOReturn AGXDeviceUserClient::runTimed(uint32_t method,const void *input,size_t 
     if(method==NativeGpuTraceMethod) {
         if(!input || input_size!=sizeof(NativeGpuTraceRecord) || output_size)return kIOReturnBadArgument;
         const auto *record=static_cast<const NativeGpuTraceRecord *>(input);
-        if(record->event!=GpuTraceThread)return kIOReturnBadArgument;
+        if(record->event!=GpuTraceThread && record->event!=GpuTraceProblem)return kIOReturnBadArgument;
         native_gpu_trace_record(record->event,proc_selfpid(),record->value,12);
         return kIOReturnSuccess;
     }
