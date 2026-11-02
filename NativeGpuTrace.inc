@@ -1,5 +1,6 @@
 #include "NativeGpuThreadTargets.h"
 static NativeGpuThreadTargets gpuThreadTargets;
+extern "C" {void (*native_gpu_dispatch_hook)(uint32_t,const uint64_t *,uint32_t);}
 extern "C" uint64_t native_gpu_render_thread(uint32_t pid) {return gpuThreadTargets.find(pid);}
 /* SPDX-License-Identifier: MIT */
 /* Included by the IOKit publisher; no allocation or GPU lock in a trace write. */
@@ -35,15 +36,16 @@ extern "C" void native_gpu_trace_record(uint32_t event,uint32_t pid,const uint64
     record.us=ns/1000;record.event=event;record.pid=pid;
     for(uint32_t i=0;i<count;++i)record.value[i]=values[i];
     record.sequence=gpuTrace.push(record);
+    if(event==68 && count>=6 && native_gpu_dispatch_hook)native_gpu_dispatch_hook(pid,values,count);
     if(event==63 && count>=2 && record.value[1]==1)gpuThreadTargets.record(pid,record.value[0]);
-    const bool meta=event<=3 || event==GpuTraceImport || event==46 || event==47 || event==48 || event==56 || event==57 || event==58 || event==59 || event==63;
+    const bool meta=event<=3 || event==GpuTraceImport || event==46 || event==47 || event==48 || event==56 || event==57 || event==58 || event==59 || event==63 || event==67 || (event==68 && ((record.value[1]&255)==0 || (record.value[1]&255)==5));
     uint32_t free=0;
     if(meta && gpuMetadata && __atomic_compare_exchange_n(&gpuMetadataBusy,&free,1,false,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED)) {
         unsigned pick=NativeGpuTraceMetadata;
         for(unsigned i=0;i<NativeGpuTraceMetadata;++i) {
             auto &m=gpuMetadata[i];
             if(!m.event && pick==NativeGpuTraceMetadata)pick=i;
-            if(m.event==event && m.pid==pid && (event!=63 || m.value[0]==record.value[0]) && (event!=GpuTraceImport || m.value[3]==record.value[3]) &&
+            if(m.event==event && m.pid==pid && (event!=63 || m.value[0]==record.value[0]) && (event!=67 || (m.value[0]==record.value[0] && m.value[1]==record.value[1])) && (event!=68 || (m.value[0]==record.value[0] && m.value[1]==record.value[1] && m.value[2]==record.value[2])) && (event!=GpuTraceImport || m.value[3]==record.value[3]) &&
                ((event!=56 && event!=57) || (m.value[0]==record.value[0] && m.value[1]==record.value[1] && m.value[2]==record.value[2]))){pick=i;break;}
         }
         if(pick<NativeGpuTraceMetadata) {

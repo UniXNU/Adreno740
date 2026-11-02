@@ -16,6 +16,9 @@ int main() {
     NativeGpuThreadTargets targets;assert(targets.find(61)==0);targets.record(61,100);
     targets.record(61,200);targets.record(0,300);assert(targets.find(61)==200);assert(targets.find(0)==0);
     gpuTraceInit();
+    static unsigned dispatch_seen=0;
+    native_gpu_dispatch_hook=[](uint32_t pid,const uint64_t *v,uint32_t count){assert(pid==61 && count==12 && v[0]==123);++dispatch_seen;};
+    uint64_t dispatch[12]={123,1};native_gpu_trace_record(68,61,dispatch,12);assert(dispatch_seen==1);native_gpu_dispatch_hook=nullptr;
     uint64_t thread[6]={3456,1,0,0,0,0};native_gpu_trace_record(63,61,thread,6);
     assert(native_gpu_render_thread(61)==3456);
 
