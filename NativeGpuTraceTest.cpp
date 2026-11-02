@@ -36,19 +36,20 @@ int main() {
     auto *head=(NativeGpuTraceHeader *)output.data();auto *rows=(NativeGpuTraceRecord *)(head+1);
     bool build=false;for(unsigned i=0;i<head->count;++i)build|=rows[i].event==GpuTraceBuild && rows[i].value[0]==1234;
     assert(build);
-    NativeGpuPixelPiece p{};auto &h=p.header;h.magic=0x31585047;h.version=1;h.stage=1;h.capture=1;
-    h.width=16;h.height=32;h.grid_width=16;h.grid_height=32;h.row_bytes=64;h.bytes_per_pixel=4;h.bytes=2048;h.flags=1;
-    p.bytes=1024;memset(p.data,0x12,sizeof(p.data));
-    assert(native_gpu_pixel_put(&p,42)==0);
-    assert(native_gpu_pixel_put(&p,42)!=0); // duplicate fragment
-    p.offset=1024;assert(native_gpu_pixel_put(&p,43)!=0); // different process cannot append
-    assert(native_gpu_pixel_put(&p,42)==0);
-    assert(native_gpu_pixel_put(&p,42)!=0); // completed slot is immutable
-    std::vector<uint8_t> pixels(16+24*(112+65536));bytes=native_gpu_pixel_snapshot(pixels.data(),pixels.size());
-    assert(bytes==16+112+2048);auto *ph=(NativeGpuPixelHeader *)(pixels.data()+16);assert(ph->pid==42 && ph->capture==1);
-    p.offset=0;h.flags=0;assert(native_gpu_pixel_put(&p,42)!=0);h.flags=1;
-    for(unsigned n=2;n<=3;++n){h.capture=n;assert(native_gpu_pixel_put(&p,42)==0);p.offset=1024;assert(native_gpu_pixel_put(&p,42)==0);p.offset=0;}
-    h.capture=4;assert(native_gpu_pixel_put(&p,42)!=0); // per-stage quota
-    h.capture=9;h.row_bytes=1;assert(native_gpu_pixel_put(&p,77)!=0);
+    auto issued=gpuTrace.issued;
+    uint64_t noise[3]={0,20,0};native_gpu_trace_record(39,61,noise,3);
+    native_gpu_trace_record(GpuTraceFenceQuery,0,noise,3);
+    native_gpu_trace_record(GpuTraceGmem,61,noise,3);
+    assert(gpuTrace.issued==issued);
+    noise[0]=123;noise[1]=53;native_gpu_trace_record(39,61,noise,3);assert(gpuTrace.issued==issued+1);
+    NativeGpuLatencyWaits waits;uint64_t omitted=0;
+    assert(waits.keep(1,0,55,3,99,omitted));
+    for(unsigned i=2;i<100001;++i)assert(!waits.keep(i,0,55,3,99,omitted));
+    assert(waits.keep(100002,0,55,3,99,omitted) && omitted==99999);
+    assert(waits.keep(100003,0,55,4,99,omitted));
+    assert(waits.keep(100004,0,55,1,99,omitted));
+    assert(waits.keep(100005,0,55,3,100,omitted));
+    NativeGpuPixelPiece p{};assert(native_gpu_pixel_put(&p,42)!=0);
+    uint8_t pixels[16];assert(native_gpu_pixel_snapshot(pixels,sizeof pixels)==0);
     return 0;
 }
