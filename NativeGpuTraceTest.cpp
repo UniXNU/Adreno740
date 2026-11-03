@@ -37,9 +37,12 @@ int main() {
     assert(build);
     auto issued=gpuTrace.issued;
     uint64_t noise[3]={123,53,0};
-    for(uint32_t event:{12u,13u,14u,15u,37u,39u,61u,62u,64u,68u})native_gpu_trace_record(event,61,noise,3);
+    for(uint32_t event:{12u,13u,14u,15u,38u,39u,43u,61u,62u,64u,68u})native_gpu_trace_record(event,61,noise,3);
     assert(gpuTrace.issued==issued);
     native_gpu_trace_record(GpuTraceRetire,61,noise,3);assert(gpuTrace.issued==issued+1);
+    /* The render server's GMEM swap trace: Turnip passes, transfers and attachments. */
+    for(uint32_t event:{36u,37u,44u})native_gpu_trace_record(event,61,noise,3);
+    assert(gpuTrace.issued==issued+4);
     NativeGpuLatencyWaits waits;uint64_t omitted=0;
     assert(waits.keep(1,0,55,3,99,omitted));
     for(unsigned i=2;i<100001;++i)assert(!waits.keep(i,0,55,3,99,omitted));
