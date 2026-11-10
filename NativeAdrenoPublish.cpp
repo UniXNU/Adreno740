@@ -7,7 +7,8 @@
  * everything it created and frees its address space. The board's kernel connection uses the kernel table. A GPU hang is found by msm's
  * hangcheck and restarted through the board's hook; only the client whose submission hung sees its device lost. This is not the Metal
  * or Turnip ABI; it carries NativeAdrenoABI.h unchanged.
- * BO CPU mappings are handed out as uncached physical-range mappings to match the GPU's non-cacheable PTEs.
+ * BO CPU mappings are handed out as uncached physical-range mappings to match the GPU's non-cacheable PTEs; a system BO's view maps
+ * its own descriptor, and a pool BO's view its physical runs, write-combined (NativeAdrenoPoolView).
  * The connection class is named AGXDeviceUserClient on purpose: the original sandbox profiles of the processes that use Metal
  * allow IOServiceOpen for that user-client class name, and nothing else in this system can create one (the Apple AGX kext is
  * never loaded without an Apple GPU), so the name only decides whether the Adreno Metal plugin may open its own driver. */
@@ -24,6 +25,7 @@
 #include <kern/clock.h>
 #include "NativeAdrenoUserClient.h"
 #include "NativeAdrenoGpuContext.h"
+#include "NativeAdrenoPool.h"
 #include "NativeGpuTrace.inc"
 
 extern "C" void proc_selfname(char *, int);
@@ -113,7 +115,8 @@ static void unlockTimed(uint64_t *clock);
 /* A large BoAlloc's phases for the boot export (kernel.boalloc.bin, the board fills it with the caller's user stack): microseconds waiting
  * for the lock before the client's limit was read, making the descriptor, wiring its pages, cleaning them, waiting for the lock again,
  * the allocation under the lock, and giving back pages it did not take. flags: 1 write-combined, 2 the prepared pages were taken, 4 they
- * were cleaned outside the lock, 8 prepared at all. spans: the BO's physical runs. Only BOs of 256 KiB and more, once the board sets the
+ * were cleaned outside the lock, 8 prepared at all, 16 the pages are pool pages (their taking and zero fill is the time of making the
+ * descriptor; nothing is wired or cleaned). spans: the BO's physical runs. Only BOs of 256 KiB and more, once the board sets the
  * hook. */
 struct NativeAdrenoBoTrace {uint64_t entered;uint32_t kib,flags,limit_us,create_us,wire_us,clean_us,lock_us,dispatch_us,discard_us,spans;
     int32_t status;uint32_t reserved;};
@@ -317,6 +320,51 @@ public:
 };
 OSDefineMetaClassAndStructors(NativeAdrenoGpuPublished,IOService)
 
+/* A client's view of a pool BO (NativeAdrenoPool.h): a descriptor of the grant's physical runs whose mappings are write-combined
+ * unless the client asks IOKit for another mode. Pool pages have no VM object that keeps them alive for a mapping, so the view
+ * does: it holds a reference to the grant from its making until its own free, and IOKit frees a descriptor only after every
+ * IOMemoryMap made from it, in whatever task, is gone. A BO freed while a client still maps it therefore leaves its pages out of
+ * the pool, as a view of a descriptor BO keeps that BO's VM object.
+ * A mapping IOKit does not know of is the other way to keep the pages mapped: the client can copy its mapping in the VM
+ * (mach_vm_remap, a memory entry), which holds the VM object of this descriptor's device pager, not the descriptor. The driver cannot
+ * see that, so the pool does not reuse the pages of a grant that had a view unless the board set gpu-pool=2 (NativeAdrenoPool.h). */
+class NativeAdrenoPoolView : public IOGeneralMemoryDescriptor {
+    OSDeclareDefaultStructors(NativeAdrenoPoolView)
+    NativeAdrenoPoolGrant *grant_=nullptr;
+public:
+    static NativeAdrenoPoolView *make(NativeAdrenoPoolGrant *grant);
+    void free() APPLE_KEXT_OVERRIDE;
+};
+OSDefineMetaClassAndStructors(NativeAdrenoPoolView,IOGeneralMemoryDescriptor)
+NativeAdrenoPoolView *NativeAdrenoPoolView::make(NativeAdrenoPoolGrant *grant)
+{
+    if(!grant || !grant->count)return nullptr;
+    IOAddressRange *ranges=IONewData(IOAddressRange,grant->count);
+    if(!ranges)return nullptr;
+    for(uint32_t i=0;i<grant->count;++i)ranges[i]={grant->runs[i].physical,grant->runs[i].bytes};
+    NativeAdrenoPoolView *view=new NativeAdrenoPoolView;
+    /* The descriptor copies the ranges. Its own cache mode is what a mapping that names none gets. */
+    if(view && !view->initWithOptions(ranges,grant->count,0,nullptr,static_cast<IOOptionBits>(kIODirectionInOut)|
+        static_cast<IOOptionBits>(kIOMemoryTypePhysical64)|(static_cast<IOOptionBits>(kIOWriteCombineCache)<<kIOMemoryBufferCacheShift),nullptr)) {
+        view->release();view=nullptr;
+    }
+    IODeleteData(ranges,IOAddressRange,grant->count);
+    if(view) {
+        NativeAdrenoPoolRetain(grant);
+        NativeAdrenoPoolNoteView(grant);   /* a client can map the pages from here on */
+        view->grant_=grant;
+    }
+    return view;
+}
+void NativeAdrenoPoolView::free()
+{
+    /* Every IOMemoryMap of this descriptor is gone: each held a reference to it. */
+    NativeAdrenoPoolGrant *const grant=grant_;
+    grant_=nullptr;
+    IOGeneralMemoryDescriptor::free();
+    NativeAdrenoPoolRelease(grant);
+}
+
 class AGXDeviceUserClient : public IOUserClient {
     OSDeclareDefaultStructors(AGXDeviceUserClient)
     bool live_=false;
@@ -485,7 +533,13 @@ void AGXDeviceUserClient::dropViews(uint32_t token)
         IOLockUnlock(g.lock);
         if(!view)return;
         /* The returned reference is the last one outside the descriptor's own list: dropping it frees the map, which unmaps the user range. */
-        while(removeMappingForDescriptor(view))native_adreno_metal_diag.forced_unmaps=native_adreno_metal_diag.forced_unmaps+1;
+        /* A pool view's mappings are dropped here for certain: a mapping left behind would keep the view, and with it the grant's
+         * pages, out of the pool for as long as the connection lives. */
+        const bool pool=OSDynamicCast(NativeAdrenoPoolView,view)!=nullptr;
+        while(IOMemoryMap *map=removeMappingForDescriptor(view)) {
+            native_adreno_metal_diag.forced_unmaps=native_adreno_metal_diag.forced_unmaps+1;
+            if(pool)map->release();
+        }
         view->release();
     }
 }
@@ -575,7 +629,8 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
     if(!growViews(type)) {IOLockUnlock(g.lock);return kIOReturnNoMemory;}
     View *v=viewSlot(type);
     if(v && v->descriptor && v->token==type) {
-        v->descriptor->retain();*memory=v->descriptor;*options=kIOMapAnywhere|kIOMapInhibitCache;
+        v->descriptor->retain();*memory=v->descriptor;
+        *options=kIOMapAnywhere|(OSDynamicCast(NativeAdrenoPoolView,v->descriptor)?kIOMapWriteCombineCache:kIOMapInhibitCache);
         native_adreno_view_diag[2]=native_adreno_view_diag[2]+1;
         IOLockUnlock(g.lock);
         return kIOReturnSuccess;
@@ -591,6 +646,20 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
         *options=kIOMapAnywhere;
         native_adreno_view_diag[1]=native_adreno_view_diag[1]+1;
         status=kIOReturnSuccess;
+    }
+    else if(backing && backing->poolGrant()) {
+        /* Pool pages: the view describes the grant's physical runs, write-combined as the client's view of any system BO is (the
+         * GPU maps them non-cacheable), and holds the grant until IOKit frees it (NativeAdrenoPoolView). */
+        NativeAdrenoPoolView *descriptor=v && !v->descriptor?NativeAdrenoPoolView::make(backing->poolGrant()):nullptr;
+        if(!descriptor)status=v && !v->descriptor?kIOReturnNoMemory:kIOReturnNoResources;
+        else {
+            v->token=type;v->descriptor=descriptor;v->bytes=backing->bytes();   /* the cache keeps make()'s reference */
+            NativeAdrenoNoteHolder(native_adreno_view_owners,pid_,int64_t(v->bytes));
+            descriptor->retain();*memory=descriptor;
+            *options=kIOMapAnywhere|kIOMapWriteCombineCache;
+            native_adreno_view_diag[1]=native_adreno_view_diag[1]+1;
+            status=kIOReturnSuccess;
+        }
     }
     else if(backing) {
         /* The BO's pages are cached in the kernel and the GPU's PTEs are non-cacheable, so the client needs an uncached
@@ -766,17 +835,19 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
         NativeAdrenoAbiBoAlloc request{};
         uint64_t began=0,limited=0,made=0,wired=0,prepared=0,locked=0,dispatched=0;
         uint32_t spans=0;
-        bool offered=false,cleaned=false;
+        bool offered=false,cleaned=false,pooled=false;
         if(alloc) {
             memcpy(&request,input,sizeof(request));
             began=mach_absolute_time();
             lockTimed(lockWait);
             const uint64_t limit=connection->live_?connection->core_->boLimit():0;
+            const unsigned bits=connection->live_?connection->core_->outputBits():0;
             unlockTimed(lockWait);
             limited=mach_absolute_time();
+            /* Pool pages when the board registered some (zero-filled here), else the VM's. */
             if(!request.contiguous && request.bytes && !(request.bytes&4095) && request.bytes<=limit)
-                (void)NativeAdrenoMemory::prepareSystem((size_t)request.bytes,NativeAdrenoUserClient::systemWriteCombined(),&pages);
-            offered=pages.descriptor!=nullptr;made=pages.made;wired=pages.wired;cleaned=pages.cleaned;
+                (void)NativeAdrenoMemory::prepareSystem((size_t)request.bytes,NativeAdrenoUserClient::systemWriteCombined(),&pages,bits);
+            offered=pages.held();pooled=pages.grant!=nullptr;made=pages.made;wired=pages.wired;cleaned=pages.cleaned;
             prepared=mach_absolute_time();
         }
         /* i e38a0b1eb: a BoFree held the lock up to 38 ms, unwiring and freeing a large BO's pages; they now go after the lock. */
@@ -785,7 +856,7 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
         lockTimed(lockWait);
         locked=mach_absolute_time();
         spans=native_adreno_bo_memory[1];
-        if(connection->live_)connection->core_->offerSystemPages(pages.descriptor?&pages:nullptr);
+        if(connection->live_)connection->core_->offerSystemPages(pages.held()?&pages:nullptr);
         if(connection->live_ && freeing)connection->core_->collectFreedPages(&freed);
         status=connection->live_?connection->core_->dispatch(method,input,input_size,output,output_size,&g.clock):kIOReturnNotReady;
         if(connection->live_)connection->core_->offerSystemPages(nullptr);
@@ -796,14 +867,14 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
         spans=native_adreno_bo_memory[1]-spans;
         dispatched=mach_absolute_time();
         unlockTimed(lockWait);
-        const bool taken=offered && !pages.descriptor;
+        const bool taken=offered && !pages.held();
         NativeAdrenoMemory::discardSystem(&pages);
-        if(freed.descriptor) {native_adreno_freed_outside=native_adreno_freed_outside+1;NativeAdrenoMemory::discardSystem(&freed);}
+        if(freed.held()) {native_adreno_freed_outside=native_adreno_freed_outside+1;NativeAdrenoMemory::discardSystem(&freed);}
         if(alloc && request.bytes>=(UINT64_C(256)<<10))
             if(void (*hook)(const NativeAdrenoBoTrace *)=native_adreno_bo_hook) {
                 NativeAdrenoBoTrace trace{};
                 trace.entered=began;trace.kib=uint32_t(request.bytes>>10);
-                trace.flags=(NativeAdrenoUserClient::systemWriteCombined()?1u:0u)|(taken?2u:0u)|(cleaned?4u:0u)|(offered?8u:0u);
+                trace.flags=(NativeAdrenoUserClient::systemWriteCombined()?1u:0u)|(taken?2u:0u)|(cleaned?4u:0u)|(offered?8u:0u)|(pooled?16u:0u);
                 trace.limit_us=microseconds(began,limited);
                 trace.create_us=microseconds(limited,offered?made:prepared);
                 trace.wire_us=offered?microseconds(made,wired):0;

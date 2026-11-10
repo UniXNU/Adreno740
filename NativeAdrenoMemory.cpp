@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "NativeAdrenoMemory.h"
+#include "NativeAdrenoPool.h"
 /* Where a call that never returns is stuck: the free/unmap/release path stores a stage number here, the board page shows it. */
 extern "C" {volatile uint32_t native_adreno_trace_stage;}
 #include <IOKit/IOBufferMemoryDescriptor.h>
@@ -138,9 +139,26 @@ IOReturn NativeAdrenoMemory::takeSegments(IOBufferMemoryDescriptor *descriptor,s
     }
     return kIOReturnSuccess;
 }
+/* The grant's runs as spans, each below `limit`. */
+IOReturn NativeAdrenoMemory::takeRuns(const NativeAdrenoPoolGrant *grant,size_t bytes,uint64_t limit)
+{
+    if(!grant->count || grant->bytes!=bytes)return kIOReturnUnsupported;
+    span_capacity_=grant->count;
+    spans_=IONewData(NativeAdrenoPhysicalSpan,span_capacity_);
+    if(!spans_)return kIOReturnNoMemory;
+    uint64_t offset=0;
+    for(uint32_t i=0;i<grant->count;++i) {
+        const NativeAdrenoPoolRun &run=grant->runs[i];
+        if(!run.physical || !run.bytes || ((run.physical|run.bytes)&4095) || run.bytes>bytes-offset || run.physical>=limit ||
+            run.bytes>limit-run.physical)return kIOReturnUnsupported;
+        spans_[span_count_++]={offset,run.physical,run.bytes};
+        offset+=run.bytes;
+    }
+    return offset==bytes?kIOReturnSuccess:kIOReturnUnsupported;
+}
 IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous,size_t budget)
 {
-    if(descriptor_ || spans_ || quarantined_)return kIOReturnBusy;
+    if(descriptor_ || grant_ || spans_ || quarantined_)return kIOReturnBusy;
     if(!bytes || (bytes&4095) || !outputWidth(bits) || !budget)
         return kIOReturnBadArgument;
     if(bytes>budget)return kIOReturnNoResources;
@@ -208,9 +226,18 @@ static IOBufferMemoryDescriptor *systemDescriptor(size_t bytes,bool write_combin
     if(wired)*wired=mach_absolute_time();
     return descriptor;
 }
-IOReturn NativeAdrenoMemory::prepareSystem(size_t bytes,bool write_combined,NativeAdrenoSystemPages *out)
+IOReturn NativeAdrenoMemory::prepareSystem(size_t bytes,bool write_combined,NativeAdrenoSystemPages *out,unsigned bits)
 {
-    if(!out || out->descriptor || !bytes || (bytes&4095))return kIOReturnBadArgument;
+    if(!out || out->held() || !bytes || (bytes&4095) || (bits && !outputWidth(bits)))return kIOReturnBadArgument;
+    /* Pool pages first: taken and zero-filled here, outside the driver's lock. Nothing to clean, no cache holds them. */
+    if(bits) {
+        NativeAdrenoPoolGrant *grant=nullptr;
+        if(NativeAdrenoPoolAllocate(bytes,UINT64_C(1)<<bits,write_combined,&grant)==kIOReturnSuccess) {
+            out->grant=grant;out->bytes=bytes;out->write_combined=write_combined;out->cleaned=true;
+            out->made=out->wired=mach_absolute_time();
+            return kIOReturnSuccess;
+        }
+    }
     uint64_t made=0,wired=0;
     IOBufferMemoryDescriptor *descriptor=systemDescriptor(bytes,write_combined,&made,&wired);
     if(!descriptor)return kIOReturnNoMemory;
@@ -236,28 +263,43 @@ IOReturn NativeAdrenoMemory::prepareSystem(size_t bytes,bool write_combined,Nati
 }
 void NativeAdrenoMemory::discardSystem(NativeAdrenoSystemPages *pages)
 {
-    if(!pages || !pages->descriptor)return;
-    pages->descriptor->complete();pages->descriptor->release();
+    if(!pages || !pages->held())return;
+    if(pages->descriptor) {pages->descriptor->complete();pages->descriptor->release();}
+    /* The BO's reference to its pool pages: they go back once no client view holds them either. */
+    if(pages->grant)NativeAdrenoPoolRelease(pages->grant);
     *pages=NativeAdrenoSystemPages{};
 }
 IOReturn NativeAdrenoMemory::allocateSystem(size_t bytes,unsigned bits,size_t budget,bool write_combined,NativeAdrenoSystemPages *prepared)
 {
-    if(descriptor_ || spans_ || quarantined_)return kIOReturnBusy;
+    if(descriptor_ || grant_ || spans_ || quarantined_)return kIOReturnBusy;
     if(!bytes || (bytes&4095) || !outputWidth(bits) || !budget)return kIOReturnBadArgument;
     if(bytes>budget)return kIOReturnNoResources;
     NativeAdrenoCpuState cpu{};
     IOReturn status=NativeAdrenoQueryCpu4K(&cpu);if(status!=kIOReturnSuccess)return status;
     /* Pages prepared outside the lock for this very request are taken over; any other request makes its own. */
     bool cleaned=false;
-    if(prepared && prepared->descriptor && prepared->bytes==bytes && prepared->write_combined==write_combined) {
-        descriptor_=prepared->descriptor;cleaned=prepared->cleaned;*prepared=NativeAdrenoSystemPages{};
-    } else descriptor_=systemDescriptor(bytes,write_combined);
-    status=descriptor_?kIOReturnSuccess:kIOReturnNoMemory;
+    if(prepared && prepared->held() && prepared->bytes==bytes && prepared->write_combined==write_combined) {
+        descriptor_=prepared->descriptor;grant_=prepared->grant;cleaned=prepared->cleaned;*prepared=NativeAdrenoSystemPages{};
+    } else if(NativeAdrenoPoolAllocate(bytes,UINT64_C(1)<<bits,write_combined,&grant_)!=kIOReturnSuccess) {
+        grant_=nullptr;descriptor_=systemDescriptor(bytes,write_combined);
+    }
+    if(grant_) {
+        /* Pool pages: the grant's runs are the spans. A grant that does not fit this client's physical limit after all (it was
+         * prepared for another width) goes back and the VM's pages take its place. */
+        const IOReturn taken=takeRuns(grant_,bytes,UINT64_C(1)<<bits);
+        if(taken!=kIOReturnSuccess) {
+            if(spans_)IODeleteData(spans_,NativeAdrenoPhysicalSpan,span_capacity_);
+            spans_=nullptr;span_count_=span_capacity_=0;
+            NativeAdrenoPoolRelease(grant_);grant_=nullptr;cleaned=false;
+            descriptor_=systemDescriptor(bytes,write_combined);
+        }
+    }
+    status=descriptor_ || grant_?kIOReturnSuccess:kIOReturnNoMemory;
     if(status==kIOReturnSuccess) {
         system_=true;prepared_=true;bytes_=bytes;write_combined_=write_combined;owner_pid_=proc_selfpid();noteSystem((int64_t)bytes,owner_pid_);
-        status=descriptor_->getLength()==bytes?takeSegments(descriptor_,bytes,UINT64_C(1)<<bits,false):kIOReturnUnsupported;
+        if(descriptor_)status=descriptor_->getLength()==bytes?takeSegments(descriptor_,bytes,UINT64_C(1)<<bits,false):kIOReturnUnsupported;
         /* Default-attribute pages may still hold the zero fill in this CPU's cache: written back before the GPU reads them. */
-        if(status==kIOReturnSuccess && !write_combined && !cleaned) {
+        if(status==kIOReturnSuccess && descriptor_ && !write_combined && !cleaned) {
             status=maintainImported(0,bytes,NativeAdrenoClean);
             NativeAdrenoNotePhase(NativeAdrenoPhaseAllocate,bytes);
         }
@@ -292,7 +334,7 @@ static IOMemoryDescriptor *importRange(uint64_t address,size_t bytes,IODirection
 IOReturn NativeAdrenoMemory::importTask(void *task,uint64_t address,size_t bytes,unsigned bits,size_t budget)
 {
     native_adreno_import_stage=10;
-    if(descriptor_ || imported_ || spans_ || quarantined_)return kIOReturnBusy;
+    if(descriptor_ || grant_ || imported_ || spans_ || quarantined_)return kIOReturnBusy;
     native_adreno_import_stage=11;
     if(!task || !address || (address&4095) || !bytes || (bytes&4095) || address>UINT64_MAX-bytes || !outputWidth(bits) ||
         !budget)return kIOReturnBadArgument;
@@ -331,6 +373,11 @@ IOReturn NativeAdrenoMemory::importTask(void *task,uint64_t address,size_t bytes
         if(!physical || (physical&4095) || length<4096 || physical>=limit || 4096>limit-physical)
             {native_adreno_import_stage=18;native_adreno_import_fail_pa=physical;native_adreno_import_fail_offset=offset;
              status=kIOReturnUnsupported;goto failed;}
+        /* A range that maps pool pages (a client view of a pool BO) is not imported: the pin of such a range holds no page, so the
+         * pool could give the pages to another client while this import still maps them for the GPU. */
+        if(NativeAdrenoPoolContains(physical,4096))
+            {native_adreno_import_stage=18;native_adreno_import_fail_pa=physical;native_adreno_import_fail_offset=offset;
+             status=kIOReturnNotPermitted;goto failed;}
         if(span_count_ && physical==spans_[span_count_-1].physical+spans_[span_count_-1].bytes)
             spans_[span_count_-1].bytes+=4096;
         else spans_[span_count_++]={offset,physical,4096};
@@ -346,7 +393,7 @@ failed:
 }
 IOReturn NativeAdrenoMemory::borrow(void *mapping,uint64_t physical,size_t bytes)
 {
-    if(descriptor_ || imported_ || spans_ || quarantined_ || borrowed_)return kIOReturnBusy;
+    if(descriptor_ || grant_ || imported_ || spans_ || quarantined_ || borrowed_)return kIOReturnBusy;
     if(!mapping || ((uintptr_t)mapping&4095) || !physical || (physical&4095) || !bytes || (bytes&4095))return kIOReturnBadArgument;
     spans_=IONewData(NativeAdrenoPhysicalSpan,1);
     if(!spans_)return kIOReturnNoMemory;
@@ -423,6 +470,8 @@ IOReturn NativeAdrenoMemory::release()
         descriptor_->release();descriptor_=nullptr;
         native_adreno_trace_stage=34;
     }
+    /* Pool pages: the BO's reference goes; the pages return to the pool once no client view holds the grant. */
+    if(grant_) {NativeAdrenoPoolRelease(grant_);grant_=nullptr;prepared_=false;}
     if(owned_) {noteOwned(spans_,span_count_,false);owned_=false;}
     if(system_) {noteSystem(-(int64_t)bytes_,owner_pid_);system_=false;}
     if(import_noted_) {noteImport(-(int64_t)bytes_,owner_pid_);import_noted_=false;}
@@ -433,10 +482,11 @@ IOReturn NativeAdrenoMemory::release()
 }
 IOReturn NativeAdrenoMemory::releaseSystemInto(NativeAdrenoSystemPages *out)
 {
-    if(!out || out->descriptor || !system_ || !descriptor_ || !prepared_ || imported_ || device_references_ || quarantined_)return release();
-    /* The GPU no longer maps the pages (the free unmapped them first) and every client view holds the descriptor itself. */
-    out->descriptor=descriptor_;out->bytes=bytes_;out->write_combined=write_combined_;out->cleaned=false;
-    descriptor_=nullptr;prepared_=false;
+    if(!out || out->held() || !system_ || !(descriptor_ || grant_) || !prepared_ || imported_ || device_references_ || quarantined_)return release();
+    /* The GPU no longer maps the pages (the free unmapped them first) and every client view holds the descriptor itself, or its own
+     * reference to the pool grant. */
+    out->descriptor=descriptor_;out->grant=grant_;out->bytes=bytes_;out->write_combined=write_combined_;out->cleaned=false;
+    descriptor_=nullptr;grant_=nullptr;prepared_=false;
     return release();
 }
 IOReturn NativeAdrenoMemory::holdForDevice()
@@ -471,7 +521,7 @@ IOReturn NativeAdrenoMemory::acquireDeviceWrites(size_t offset,size_t bytes,unsi
 {
     if(!backed() || !prepared_ || quarantined_)return kIOReturnNotReady;
     if(!bytes || ((offset|bytes)&4095) || offset>bytes_ || bytes>bytes_-offset)return kIOReturnBadArgument;
-    if(imported_ && owner_uncached_)return kIOReturnSuccess;
+    if(grant_ || (imported_ && owner_uncached_))return kIOReturnSuccess;
     /* Imported pages may hold the owner's unrelated dirty lines next to the GPU's writes: clean as well as invalidate. */
     if(imported_) {NativeAdrenoNotePhase(phase,bytes);return maintainImported(offset,bytes,NativeAdrenoCleanInvalidate);}
     if(write_combined_)return kIOReturnSuccess;

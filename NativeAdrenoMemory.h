@@ -5,10 +5,13 @@
 #include <stddef.h>
 #include <stdint.h>
 class IOBufferMemoryDescriptor;
-/* System memory prepared outside the driver's lock (NativeAdrenoMemory::prepareSystem). */
+struct NativeAdrenoPoolGrant;
+/* System memory prepared outside the driver's lock (NativeAdrenoMemory::prepareSystem): a wired descriptor of the VM's pages, or a
+ * grant of zero-filled pool pages (NativeAdrenoPool.h), never both. */
 /* made, wired: when the descriptor was made and when its pages were wired (mach units), for the allocation trace. */
 struct NativeAdrenoSystemPages {IOBufferMemoryDescriptor *descriptor=nullptr;size_t bytes=0;bool write_combined=false,cleaned=false;
-    uint64_t made=0,wired=0;};
+    uint64_t made=0,wired=0;NativeAdrenoPoolGrant *grant=nullptr;
+    bool held() const {return descriptor || grant;}};
 class IOMemoryDescriptor;
 struct NativeAdrenoPhysicalSpan {uint64_t offset,physical,bytes;};
 struct NativeAdrenoCpuState {
@@ -49,6 +52,9 @@ void NativeAdrenoNoteHolder(volatile uint32_t (*table)[4],int32_t pid,int64_t by
  * References are lifetime accounting, never fences or proof of quiescence. */
 class NativeAdrenoMemory final {
     IOBufferMemoryDescriptor *descriptor_=nullptr;
+    /* A system BO of pool pages (NativeAdrenoPool.h) has this grant and no descriptor: pages outside the kernel's DRAM, which only
+     * the SMMU tables and non-cacheable CPU mappings name. No CPU cache holds a line of them, so nothing is ever maintained. */
+    NativeAdrenoPoolGrant *grant_=nullptr;
     IOMemoryDescriptor *imported_=nullptr;
     bool read_only_=false;
     /* An import whose every page the pmap holds non-cacheable (iPadOS 27's display surfaces are write-combined): nothing to maintain. */
@@ -62,6 +68,7 @@ class NativeAdrenoMemory final {
     bool import_noted_=false;   /* an import counted in native_adreno_import_memory until release() */
     bool synchronized_=false;   /* declareSynchronized(): its writers keep the device's view current themselves */
     IOReturn takeSegments(IOBufferMemoryDescriptor *,size_t bytes,uint64_t limit,bool contiguous);
+    IOReturn takeRuns(const NativeAdrenoPoolGrant *,size_t bytes,uint64_t limit);
     IOReturn maintainImported(size_t offset,size_t bytes,NativeAdrenoCacheOperation);
 public:
     NativeAdrenoMemory()=default;
@@ -82,13 +89,17 @@ public:
      * default attribute (vm_object_reap). No kernel address range, no physical contiguity search, no fixed pool: the BO pool of 1536 MiB
      * (untagged-ed1611b1) filled with the runtime's 4-64 MiB blocks, 404 BOs fell back to scattered kernel memory, 96 allocations of
      * 96 MiB failed and the pressure it reported stayed on, so the clients' BO caches flushed and allocated again (5.6 GB of maintenance).
-     * Client views map this descriptor itself (the VM object and its attribute), not its physical pages. */
+     * Client views map this descriptor itself (the VM object and its attribute), not its physical pages.
+     * A write-combined BO is first asked of the pool of DRAM outside the kernel's (NativeAdrenoPool.h), when the board registered
+     * one: such a BO has a grant instead of a descriptor, costs the VM no page, and its client views map its physical runs. Whatever
+     * the pool does not serve takes the descriptor path above. */
     IOReturn allocateSystem(size_t bytes,unsigned output_bits,size_t byte_budget,bool write_combined,
         struct NativeAdrenoSystemPages *prepared=nullptr);
     /* allocateSystem's slow part, which needs no driver state: the descriptor made and wired (the VM's zero fill and attribute) and, for
      * default-attribute pages, the zero fill written back. The caller does it before taking the driver's lock (i14aef633e: 5454 BoAllocs
      * held it 4.0 s, every other process's submit waiting); allocateSystem adopts it, and discardSystem gives back one it did not take. */
-    static IOReturn prepareSystem(size_t bytes,bool write_combined,struct NativeAdrenoSystemPages *out);
+    /* output_bits: the client's physical address width, for pool pages (0: the descriptor path only). */
+    static IOReturn prepareSystem(size_t bytes,bool write_combined,struct NativeAdrenoSystemPages *out,unsigned output_bits=0);
     static void discardSystem(struct NativeAdrenoSystemPages *);
     /* Memory pressure: the system could not give a user BO its memory (allocateSystem failed); cleared by the next one that succeeds.
      * Clients read it in Query and give their cached BOs back. */
@@ -105,6 +116,9 @@ public:
     bool imported() const {return imported_!=nullptr;}
     /* Memory from allocateSystem: the VM owns its pages' attribute, and its client views map the descriptor. */
     bool system() const {return system_;}
+    /* The grant of a system BO made of pool pages; null for any other memory. A client view of it describes the grant's runs and
+     * holds a reference of its own (the pages have no VM object that could keep them for the view). */
+    NativeAdrenoPoolGrant *poolGrant() const {return grant_;}
     /* An import of memory the owner maps read-only (the kernel could pin it for reading only): the GPU may read it, never write it. */
     bool readOnly() const {return read_only_;}
     bool ownerUncached() const {return owner_uncached_;}
@@ -123,9 +137,10 @@ public:
     bool synchronized() const {return synchronized_;}
     /* Whether a CPU cache can hold a line of this memory that the device has not seen: not for an import whose owner maps it
      * non-cacheable, and not for write-combined memory unless a view of it was found caching (include_write_combined). The passes that
-     * decide without calling publishForDevice use the same answer. */
+     * decide without calling publishForDevice use the same answer. Never for pool pages: the kernel has no cacheable mapping of them
+     * to maintain them through, and the pool drops whatever a client's own view cached before the pages change hands. */
     bool holdsCpuLines(bool include_write_combined) const
-    {return !(imported_ && owner_uncached_) && !(write_combined_ && !include_write_combined);}
+    {return !grant_ && !(imported_ && owner_uncached_) && !(write_combined_ && !include_write_combined);}
     /* Whether reassertWriteCombined has pages to look at. */
     bool reassertable() const {return write_combined_ && span_count_ && !system_;}
     /* NativeAdrenoReassertWriteCombined over this object's pages; nothing for an object that is not write-combined, nor for system memory:
@@ -134,12 +149,13 @@ public:
      * object's own attribute. The submissions' line audit still covers every object. */
     IOReturn reassertWriteCombined(uint32_t *reset) const
     {return reassertable()?NativeAdrenoReassertWriteCombined(spans_,span_count_,reset):kIOReturnSuccess;}
-    bool backed() const {return descriptor_ || imported_ || borrowed_;}
+    bool backed() const {return descriptor_ || grant_ || imported_ || borrowed_;}
     /* Refuses device references/quarantine; only clears ownership after real
      * descriptor complete() succeeds. No automatic reset or resource recycling. */
     IOReturn release();
-    /* release() for a BO of system memory whose pages may go after the driver's lock: its descriptor (still wired) is handed to out,
-     * for discardSystem to unwire and free once the lock is let go. Any other BO, or an out that holds pages, is released here. */
+    /* release() for a BO of system memory whose pages may go after the driver's lock: its descriptor (still wired) or its pool grant
+     * is handed to out, for discardSystem to unwire and free, or to give back to the pool, once the lock is let go. Any other BO, or
+     * an out that holds pages, is released here. A quarantined BO is refused before either: its pool pages stay out of the pool. */
     IOReturn releaseSystemInto(struct NativeAdrenoSystemPages *out);
     IOReturn holdForDevice();
     IOReturn retireAfterQuiescence();
