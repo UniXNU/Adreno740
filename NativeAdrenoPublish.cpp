@@ -90,6 +90,9 @@ namespace {
 IOBufferMemoryDescriptor *gMailbox=nullptr;
 volatile uint32_t *gMailboxWords=nullptr;
 volatile bool gPollerStarted=false;
+/* True while the owner's task holds a mapping of the mailbox page: only then can a request appear. Written under g.lock; the poller
+ * reads it once without the lock as a hint and again under it. Its address is the poller's sleep event. */
+bool gMailboxMapped=false;
 }
 class AGXDeviceUserClient;
 /* The render server's connection serves the mailbox; it is retained while set (under g.lock), so the poller never runs on a freed object. */
@@ -359,6 +362,12 @@ void nativeAdrenoMailboxPoller(void *,wait_result_t)
     thread_set_thread_name(current_thread(),"gpu-mailbox");
     uint32_t last=0;
     for(;;) {
+        /* A request is a store into the shared page, so nothing can signal it; the page being mapped can. */
+        if(!gMailboxMapped) {
+            IOLockLock(g.lock);
+            while(!gMailboxMapped)IOLockSleep(g.lock,&gMailboxMapped,THREAD_UNINT);
+            IOLockUnlock(g.lock);
+        }
         IOSleep(1);
         if(!gMailboxOwner || !gMailboxWords)continue;
         const uint32_t request=gMailboxWords[1];
@@ -456,7 +465,7 @@ bool AGXDeviceUserClient::mount(bool kernel)
             }
         }
         if(gMailboxOwner)gMailboxOwner->release();
-        retain();gMailboxOwner=this;
+        retain();gMailboxOwner=this;gMailboxMapped=false;
     }
     IOLockUnlock(g.lock);
     if(core)delete core;
@@ -500,7 +509,7 @@ IOReturn AGXDeviceUserClient::clientClose()
     IOLockLock(g.lock);
     IOReturn status=kIOReturnSuccess;
     AGXDeviceUserClient *mailbox=nullptr;
-    if(gMailboxOwner==this) {mailbox=gMailboxOwner;gMailboxOwner=nullptr;}
+    if(gMailboxOwner==this) {mailbox=gMailboxOwner;gMailboxOwner=nullptr;gMailboxMapped=false;}
     if(live_) {
         const uint64_t peak=core_->windowPeak();
         status=core_->releaseAll(&g.clock,2000000);
@@ -552,6 +561,9 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
             *memory=gMailbox;
             *options=kIOMapAnywhere;   /* ordinary cached memory: both sides are CPUs, so it is coherent */
             native_adreno_metal_diag.mb_maps=native_adreno_metal_diag.mb_maps+1;
+            IOLockLock(g.lock);
+            if(gMailboxOwner==this) {gMailboxMapped=true;IOLockWakeup(g.lock,&gMailboxMapped,false);}
+            IOLockUnlock(g.lock);
             return kIOReturnSuccess;
         }
         return kIOReturnNotReady;
