@@ -52,6 +52,7 @@ class NativeAdrenoMemory final {
     NativeAdrenoPhysicalSpan *spans_=nullptr;
     size_t bytes_=0,span_count_=0,span_capacity_=0;
     uint32_t device_references_=0;
+    int32_t owner_pid_=0;   /* the process that allocated a system BO, for the holders' table */
     bool prepared_=false,quarantined_=false,write_combined_=false,system_=false,borrowed_=false,owned_=false;
     IOReturn takeSegments(IOBufferMemoryDescriptor *,size_t bytes,uint64_t limit,bool contiguous);
     IOReturn maintainImported(size_t offset,size_t bytes,NativeAdrenoCacheOperation);
