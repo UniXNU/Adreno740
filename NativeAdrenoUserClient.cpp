@@ -5,8 +5,8 @@
 #include <kern/task.h>
 #include <sys/resource_private.h>   /* PRIO_DARWIN_GPU_*: the process's GPU role, set by the system */
 extern "C" volatile uint32_t native_adreno_trace_stage;
-/* 0 keeps user BOs cacheable and maintained before every submission (int-070..097); the board sets it from the sheng-gpu-wc boot argument. */
-/* sheng-gpu-owned-coherent=1: the GPU's own BOs use the IO-coherent path (CPU write-back view, GPU write-back inner-shareable mapping) instead of
+/* 0 keeps user BOs cacheable and maintained before every submission (int-070..097); the board sets it from the gpu-wc boot argument. */
+/* gpu-owned-coherent=1: the GPU's own BOs use the IO-coherent path (CPU write-back view, GPU write-back inner-shareable mapping) instead of
  * write-combine: no write-combined audit and no cache maintenance per submission. Effective only once the board proved IO coherence. */
 extern "C" {volatile uint32_t native_adreno_wc_enabled=1,native_adreno_owned_coherent=0;extern volatile uint32_t native_adreno_io_coherent;}
 static bool ownedCoherent() {return native_adreno_owned_coherent && native_adreno_io_coherent;}

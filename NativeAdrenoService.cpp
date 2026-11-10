@@ -301,13 +301,13 @@ bool NativeAdrenoGpuService::start(IOService *provider)
     } else {
         IOLog("NativeAdreno: SMMU node not published yet\n");
     }
-    /* Explicit opt-in (sheng-gpu-bringup=1). Without the bank/asid/sid/slot arguments the SMMU window is only read
+    /* Explicit opt-in (gpu-bringup=1). Without the bank/asid/sid/slot arguments the SMMU window is only read
      * (identity and fault registers). With all four arguments the sequence below PROGRAMS the SMMU: it prepares a context
      * bank, attaches the stream and maps the GMU payloads. Do not run it before the read-only power/clock observation
-     * (sheng-gpu-power, docs/gpu-hardware-plan.md) shows the GPU SMMU powered and writable: the apps SMMU on this board is
+     * (gpu-power, docs/gpu-hardware-plan.md) shows the GPU SMMU powered and writable: the apps SMMU on this board is
      * hypervisor-managed (docs/native-ufs.md) and the adreno SMMU has not been shown to differ. */
     uint32_t bringup=0;
-    if(PE_parse_boot_argn("sheng-gpu-bringup",&bringup,sizeof(bringup)) && bringup) {
+    if(PE_parse_boot_argn("gpu-bringup",&bringup,sizeof(bringup)) && bringup) {
         NativeAdrenoSmmuService *node=OSDynamicCast(NativeAdrenoSmmuService,smmu);
         if(node && node->windowCount() && node->windowAddress(0)) {
             volatile uint8_t *smmu_base=node->windowAddress(0);
@@ -321,10 +321,10 @@ bool NativeAdrenoGpuService::start(IOService *provider)
                 id0,id1,id2,scr0,fault,static_cast<unsigned long>(smmu_bytes));
             uint32_t bank=0,asid=0,sid=0,slot=0;
             const bool configured=
-                PE_parse_boot_argn("sheng-gpu-bank",&bank,sizeof(bank)) &&
-                PE_parse_boot_argn("sheng-gpu-asid",&asid,sizeof(asid)) &&
-                PE_parse_boot_argn("sheng-gpu-sid",&sid,sizeof(sid)) &&
-                PE_parse_boot_argn("sheng-gpu-slot",&slot,sizeof(slot));
+                PE_parse_boot_argn("gpu-bank",&bank,sizeof(bank)) &&
+                PE_parse_boot_argn("gpu-asid",&asid,sizeof(asid)) &&
+                PE_parse_boot_argn("gpu-sid",&sid,sizeof(sid)) &&
+                PE_parse_boot_argn("gpu-slot",&slot,sizeof(slot));
             if(!configured || bank>63 || !asid || asid>0xffff || sid>0xffff || slot>127) {
                 IOLog("NativeAdreno: bring-up needs bank/asid/sid/slot arguments\n");
             } else {
@@ -376,9 +376,9 @@ bool NativeAdrenoGpuService::start(IOService *provider)
                     uint32_t version=0;
                     if(!firmware_valid_ || !gmu_io_bound_) {
                         IOLog("NativeAdreno: GMU boot needs firmware and bound windows\n");
-                    } else if(!PE_parse_boot_argn("sheng-gpu-cmddb-version",&version,
+                    } else if(!PE_parse_boot_argn("gpu-cmddb-version",&version,
                         sizeof(version)) || !version) {
-                        IOLog("NativeAdreno: GMU boot needs sheng-gpu-cmddb-version\n");
+                        IOLog("NativeAdreno: GMU boot needs gpu-cmddb-version\n");
                     } else {
                         IODeviceMemory *db=IODeviceMemory::withRange(
                             SHENG_GMU_COMMAND_DB_BASE,SHENG_GMU_COMMAND_DB_BYTES);
@@ -448,11 +448,11 @@ bool NativeAdrenoGpuService::start(IOService *provider)
                                             NativeAdrenoRingCache cache{&ring_cache_,ring_publish,fence_acquire};
                                             ring_status=ring_.attach(&ring_io,&cache,ring_mem_.mapping(),
                                                 ring_bytes,ring_iova,fence_mem_.mapping(),fence_bytes,fence_iova);
-                                            /* With the diagnostics (sheng-diag=1) framed submissions stamp the CP's always-on counter before and after their
-                                             * buffers; sheng-gpu-timeline=0 or 1 overrides that. */
-                                            {unsigned timeline=0,diag=0;PE_parse_boot_argn("sheng-diag",&diag,sizeof(diag));
+                                            /* With the diagnostics (diag=1) framed submissions stamp the CP's always-on counter before and after their
+                                             * buffers; gpu-timeline=0 or 1 overrides that. */
+                                            {unsigned timeline=0,diag=0;PE_parse_boot_argn("diag",&diag,sizeof(diag));
                                              native_adreno_diag=diag==1;
-                                             if(!PE_parse_boot_argn("sheng-gpu-timeline",&timeline,sizeof(timeline)))timeline=diag==1;
+                                             if(!PE_parse_boot_argn("gpu-timeline",&timeline,sizeof(timeline)))timeline=diag==1;
                                              ring_.setTimeline(timeline!=0);}
                                             if(!ring_status && sqe_bytes) {
                                                 memcpy(sqe_mem_.mapping(),native_adreno_sqe_firmware_image,

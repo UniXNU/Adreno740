@@ -3,7 +3,7 @@
 #define NATIVE_GPU_PERF_COUNTERS_H
 #include <stdint.h>
 /* A7XX BR counters from Mesa a6xx.xml and a7xx_perfcntrs.xml. Slots are reserved
- * only with sheng-gpu-perf=1; selector readback detects another counter owner. */
+ * only with gpu-perf=1; selector readback detects another counter owner. */
 struct NativeGpuPerfCounter {uint32_t select,value,low;};
 static constexpr NativeGpuPerfCounter NativeGpuPerfPlan[]={
  {0x08dd,0,0x031a}, /* CP_ALWAYS_COUNT, slot 13 */

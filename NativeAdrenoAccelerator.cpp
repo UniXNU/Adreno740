@@ -27,8 +27,8 @@ OSDefineMetaClassAndStructors(AGXAccelerator,IOAcceleratorES)
 IOReturn AGXAccelerator::newUserClient(task_t owningTask,void *securityID,UInt32 type,OSDictionary *properties,
     IOUserClient **handler)
 {
-    unsigned limit=0;   /* sheng-gpu-metal-opens: connections granted to each process name (0 = unlimited, as on Apple GPUs) */
-    PE_parse_boot_argn("sheng-gpu-metal-opens",&limit,sizeof(limit));
+    unsigned limit=0;   /* gpu-metal-opens: connections granted to each process name (0 = unlimited, as on Apple GPUs) */
+    PE_parse_boot_argn("gpu-metal-opens",&limit,sizeof(limit));
     return native_adreno_new_user_client(this,owningTask,securityID,type,properties,handler,limit);
 }
 OSObject *AGXAccelerator::copyProperty(const OSSymbol *key) const
