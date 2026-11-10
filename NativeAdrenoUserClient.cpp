@@ -376,8 +376,8 @@ IOReturn NativeAdrenoUserClient::freeBo(const NativeAdrenoAbiBoFree *request)
     clear(*entry);
     return kIOReturnSuccess;
 }
-/* The GPU priority this process's next submission takes: its queues' foreground value while it renders visible UI (any GPU role above
- * background), their background value otherwise. A process that never told us keeps the daemon's default (no ring choice). */
+/* The GPU priority this process's next submission takes: its queues' foreground value while it renders visible UI (a GPU role above
+ * utility, or an unmanaged task), their background value for the denied, background and utility roles. A process that never told us keeps the daemon's default (no ring choice). */
 /* Which processes told the driver what (the newest 32): pid, foreground priority, background priority, the GPU role then, the time (ms of
  * the submission clock when the board gave one, else 0) and how many times this connection had told it before (0 the runtime's first call
  * at device open, later ones the process's own setGPUPriority:/setBackgroundGPUPriority: through the frontend). */
@@ -387,7 +387,8 @@ int32_t NativeAdrenoUserClient::submitPriority() const
 {
     if(priority_foreground_<0 && priority_background_<0)return -1;
     const int32_t role=task_get_gpu_role(current_task());
-    const bool background=role==PRIO_DARWIN_GPU_BACKGROUND || role==PRIO_DARWIN_GPU_UTILITY;
+    /* A task RunningBoard denies the GPU renders nothing visible either: where it still submits it takes the background value. */
+    const bool background=role==PRIO_DARWIN_GPU_DENY || role==PRIO_DARWIN_GPU_BACKGROUND || role==PRIO_DARWIN_GPU_UTILITY;
     return background?(priority_background_>=0?priority_background_:priority_foreground_)
                      :(priority_foreground_>=0?priority_foreground_:priority_background_);
 }
