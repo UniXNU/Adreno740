@@ -20,6 +20,8 @@
 #include <IOKit/IOUserClient.h>
 #include <string.h>
 #include <kern/thread.h>
+#include <kern/thread_call.h>
+#include <kern/clock.h>
 #include "NativeAdrenoUserClient.h"
 #include "NativeAdrenoGpuContext.h"
 #include "NativeGpuTrace.inc"
@@ -168,7 +170,15 @@ static unsigned tableMode()
     return mode==2?2:1;
 }
 
+/* The fence waiters' wake path (runCore's WaitFence): [0] GPU interrupts the board delivered (native_adreno_gpu_interrupt), [1] those
+ * with the CP's fence bit, [2] completion passes run, [3] waiters a pass woke, [4] waits that slept, [5] sleeps that ended at the caller's
+ * deadline, [6] waiters the periodic pass woke (their interrupt never came or came before they slept), [7] ring switches the passes
+ * triggered or completed. */
+extern "C" {volatile uint64_t native_adreno_fence_wake[8];}
 namespace {
+/* A thread waiting for a fence, on its own stack and in g.waiters while it waits. armed: it has not seen its fence complete and may be
+ * asleep on its own address; the completion pass disarms and wakes it. */
+struct FenceWaiter {uint32_t fence;bool armed;FenceWaiter *next,*prev;};
 void shiftName(char names[3][17]) {
     memcpy(names[2], names[1], 17);
     memcpy(names[1], names[0], 17);
@@ -194,7 +204,50 @@ struct Published {
     NativeAdrenoStatus status;
     NativeAdrenoRestart restart=nullptr;
     void *restart_cookie=nullptr;
+    /* The fence waiters and the completion pass that wakes them. wake_lock guards the list and every waiter's armed flag. It is a
+     * leaf: the pass takes it while it holds `lock`, a waiter takes it alone, and nothing takes `lock` while holding it. */
+    IOLock *wake_lock=nullptr;
+    FenceWaiter *waiters=nullptr;
+    thread_call_t fence_call=nullptr;
+    /* The board hands its GPU interrupts to native_adreno_gpu_interrupt (seen once one asked for a pass); until then, or with
+     * gpu-fence-wake=0, a waiter pauses on the board's clock instead. */
+    volatile bool interrupts=false;
+    bool wake_by_interrupt=true;
 } g;
+/* The completion pass: what msm does on every CP_CACHE_FLUSH_TS interrupt (a6xx_irq: msm_gpu_retire, then a6xx_preempt_trigger) and
+ * once per hang check period for an interrupt that never came (hangcheck_handler). Finished jobs are retired, which lets go of their
+ * buffers and looks at the switch between the two rings again: a ring that went idle leaves the CP to the other ring's queued work, and
+ * a switch the CP finished is completed here even when its own handler found the lock busy. Then every waiter whose fence the CP has
+ * written is woken. Runs on a thread (it takes the driver's lock), never in the interrupt. */
+void fencePass(bool periodic)
+{
+    if(!g.published || !g.submit || !g.wake_lock)return;
+    uint32_t woken=0;
+    IOLockLock(g.lock);
+    const NativeAdrenoPreemptStats before=g.submit->preemptStats();
+    (void)g.submit->retireCompleted();
+    const NativeAdrenoPreemptStats after=g.submit->preemptStats();
+    IOLockLock(g.wake_lock);
+    for(FenceWaiter *w=g.waiters;w;w=w->next)
+        if(w->armed && !g.submit->fencePending(w->fence)) {w->armed=false;++woken;IOLockWakeup(g.wake_lock,w,false);}
+    native_adreno_fence_wake[2]=native_adreno_fence_wake[2]+1;
+    native_adreno_fence_wake[periodic?6:3]=native_adreno_fence_wake[periodic?6:3]+woken;
+    native_adreno_fence_wake[7]=native_adreno_fence_wake[7]+(after.triggers-before.triggers)+(after.completed-before.completed);
+    IOLockUnlock(g.wake_lock);
+    IOLockUnlock(g.lock);
+}
+void fenceCall(thread_call_param_t,thread_call_param_t) {fencePass(false);}
+}
+/* The board's GPU interrupt handler calls this with the RBBM_INT_0_STATUS word it read and cleared, in interrupt context. A fence the
+ * CP wrote (CP_CACHE_FLUSH_TS, bit 20) or a finished ring switch (CP_SW, bit 8) asks for the completion pass; nothing else is done
+ * here, and nothing here blocks. */
+extern "C" void native_adreno_gpu_interrupt(uint32_t status)
+{
+    native_adreno_fence_wake[0]=native_adreno_fence_wake[0]+1;
+    if(status&(1u<<20))native_adreno_fence_wake[1]=native_adreno_fence_wake[1]+1;
+    if(!(status&((1u<<20)|(1u<<8))) || !g.fence_call)return;
+    g.interrupts=true;
+    (void)thread_call_enter(g.fence_call);
 }
 /* GPU hangs (msm hangcheck, NativeAdrenoSubmit::hangCheck) and restarts: [0] hangs, [1] restarts, [2] failed restarts, [3] the last hung
  * fence, [4] the last restart's IOReturn, [5] submissions replayed so far, [6] hangs with a guilty job, [7] hangs of the kernel's own VM. */
@@ -247,6 +300,9 @@ static void nativeAdrenoHangcheck(void *,wait_result_t)
             }
         }
         IOLockUnlock(g.lock);
+        /* msm's hangcheck_handler retires here too ("workaround for missing irq"): a fence whose interrupt was lost still wakes its
+         * waiters and moves the rings within one period. */
+        fencePass(true);
     }
 }
 
@@ -592,14 +648,16 @@ static uint32_t microseconds(uint64_t from,uint64_t to)
     if(to>from)absolutetime_to_nanoseconds(to-from,&ns);
     return uint32_t(ns/1000>UINT32_MAX?UINT32_MAX:ns/1000);
 }
-/* Whether the CP has not reached fence yet, read without the lock (the ring's fence word and its newest number, as the display reads
- * them). False when the answer needs the locked path: the fence is not one handed out, the ring is poisoned or not published. */
-extern "C" bool native_adreno_fences(uint32_t *submitted,uint32_t *retired);
+/* Whether the CP has not reached fence yet on the ring that issued it (NativeAdrenoSubmit::fencePending), read when the lock is free.
+ * False when the answer needs the locked path: the lock is busy, the fence is not one a job holds, or the submit object is poisoned.
+ * The display's prefix (native_adreno_fences) is not the measure here: it stays below a finished fence of the high ring for as long
+ * as an older fence of the low ring is pending, and a waiter that trusted it slept until its deadline with its own fence written. */
 static bool fencePending(uint64_t fence)
 {
-    uint32_t submitted=0,retired=0;
-    if(!fence || fence>UINT32_MAX || !native_adreno_fences(&submitted,&retired) || g.ring->poisoned())return false;
-    return fence<=submitted && retired<fence;
+    if(!fence || fence>UINT32_MAX || !g.submit || !IOLockTryLock(g.lock))return false;
+    const bool pending=g.submit->fencePending(uint32_t(fence));
+    IOLockUnlock(g.lock);
+    return pending;
 }
 static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const void *input,size_t input_size,void *output,size_t output_size,uint64_t *lockWait)
 {
@@ -619,21 +677,32 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
     native_adreno_metal_diag.inflight_since_calls=native_adreno_metal_diag.calls;
     IOReturn status;
     if(method==NativeAdrenoMethodWaitFence && connection->live_ && input && input_size==sizeof(NativeAdrenoAbiWaitFence) && g.clock.now_us) {
-        /* int-147: a fence wait pauses outside the lock. int-146 slept inside the lock (up to the caller's 1 ms slice per call), so every
-         * other thread's submit, map or allocation waited for the GPU to finish unrelated work. i55eb173a6: the polls still took the lock
-         * every 100 us or less, and with several processes waiting (the render server, the poster extension) a poll waited up to 46 ms for
-         * it. While the CP has not reached the fence the poll now reads the ring's fence word without the lock; the core's own zero-timeout
-         * wait (retirement, statistics, the stall handler) runs under the lock once the fence has passed and when the time is up. The pause
-         * is the board's (until the next GPU interrupt, at most 100 us). */
+        /* A fence wait sleeps outside the lock: under it every other thread's submit, map or allocation would wait for the GPU to
+         * finish unrelated work. While the CP has not reached the fence the check reads the ring's fence word when the lock is free;
+         * the core's own zero-timeout wait (retirement, statistics, the stall handler) runs under the lock once the fence has passed
+         * and when the time is up.
+         * With the board's interrupts (native_adreno_gpu_interrupt) the waiter sleeps on its own record until the completion pass
+         * finds its fence written, and the only timeout is the caller's deadline. It arms itself before it looks at the fence, so a
+         * completion between the look and the sleep is not lost: the pass that follows that completion disarms it, and a disarmed
+         * waiter does not sleep. Without them the pause is the board's (until the next GPU interrupt, at most its pause time). */
         NativeAdrenoAbiWaitFence poll{};
         memcpy(&poll,input,sizeof(poll));
         const uint64_t timeout_us=poll.timeout_ns/1000,began=g.clock.now_us(g.clock.cookie);
         poll.timeout_ns=0;
         uint64_t waited=0;
         status=kIOReturnTimeout;
+        FenceWaiter self{uint32_t(poll.fence),false,nullptr,nullptr};
+        const bool wake=timeout_us && g.interrupts && g.wake_by_interrupt && g.wake_lock;
+        bool slept=false;
+        if(wake) {
+            IOLockLock(g.wake_lock);
+            self.next=g.waiters;if(g.waiters)g.waiters->prev=&self;g.waiters=&self;
+            IOLockUnlock(g.wake_lock);
+        }
         for(;;) {
             waited=g.clock.now_us(g.clock.cookie)-began;
             bool polled=false;
+            if(wake) {IOLockLock(g.wake_lock);self.armed=true;IOLockUnlock(g.wake_lock);}
             if(waited>=timeout_us || !fencePending(poll.fence)) {
                 /* The connection's own core while it is live; a close that ran between two polls ends the wait. */
                 lockTimed(lockWait);
@@ -644,6 +713,19 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
                 if(status!=kIOReturnTimeout || waited>=timeout_us)break;
             } else native_adreno_wait_outer[4]=native_adreno_wait_outer[4]+1;
             native_adreno_wait_outer[2]=native_adreno_wait_outer[2]+1;
+            if(wake) {
+                const uint64_t left=timeout_us-waited;
+                uint64_t deadline=0;
+                clock_interval_to_deadline(left>UINT32_MAX?UINT32_MAX:uint32_t(left),NSEC_PER_USEC,&deadline);
+                IOLockLock(g.wake_lock);
+                if(self.armed) {
+                    slept=true;
+                    if(IOLockSleepDeadline(g.wake_lock,&self,deadline,THREAD_UNINT)==THREAD_TIMED_OUT)
+                        native_adreno_fence_wake[5]=native_adreno_fence_wake[5]+1;
+                }
+                IOLockUnlock(g.wake_lock);
+                continue;
+            }
             if(!g.clock.idle || g.clock.idle(g.clock.cookie)) {
                 if(!polled) {
                     lockTimed(lockWait);
@@ -653,6 +735,13 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
                 }
                 break;
             }
+        }
+        if(wake) {
+            IOLockLock(g.wake_lock);
+            if(self.prev)self.prev->next=self.next;else g.waiters=self.next;
+            if(self.next)self.next->prev=self.prev;
+            if(slept)native_adreno_fence_wake[4]=native_adreno_fence_wake[4]+1;
+            IOLockUnlock(g.wake_lock);
         }
         native_adreno_wait_outer[0]=native_adreno_wait_outer[0]+1;native_adreno_wait_outer[1]=native_adreno_wait_outer[1]+waited;
         if(waited>native_adreno_wait_outer[3])native_adreno_wait_outer[3]=waited;
@@ -1200,6 +1289,15 @@ extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit 
     if(!g.lock || !service || !service->init() || !service->attach(IOService::getPlatform())) {
         if(service)service->release();
         return kIOReturnNoMemory;
+    }
+    /* The fence waiters' wake path. Without its lock or its thread call the waiters keep the board's pause. gpu-fence-wake=0 keeps
+     * that pause too, for a comparison on the same image. */
+    {
+        unsigned by_interrupt=1;
+        PE_parse_boot_argn("gpu-fence-wake",&by_interrupt,sizeof by_interrupt);
+        g.wake_by_interrupt=by_interrupt!=0;
+        g.wake_lock=IOLockAlloc();
+        g.fence_call=g.wake_lock?thread_call_allocate(fenceCall,nullptr):nullptr;
     }
     g.vm=vm;g.submit=submit;g.ring=ring;g.clock=*clock;g.timer=timer;g.info=info;g.input_bits=input_bits;g.output_bits=output_bits;
     /* Per-process address spaces: without table switching every user connection would be refused (createVm needs it). */
