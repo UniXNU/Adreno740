@@ -19,6 +19,24 @@ extern "C" volatile uint32_t native_adreno_coherence[8];
 /* The write-combine audit (int-100), see NativeAdrenoSubmit.cpp, and the submission (1-based) that ended the trust; 0 = never. */
 extern "C" volatile uint32_t native_adreno_wc_audit[6];
 extern "C" volatile uint32_t native_adreno_wc_distrusted;
+/* gpu-audit (NativeAdrenoSubmit.cpp): 0 the submissions run no line audit, 1 they do, ~0 the boot argument is not read yet. */
+extern "C" volatile uint32_t native_adreno_audit_mode;
+/* The jobs' GPU time, kept for every job at its retirement (NativeAdrenoSubmit::noteJobTime), with or without diag=1.
+ * native_adreno_job_time: [0] jobs timed, [1] of them by the CP's stamps (gpu-timeline=1 or diag=1), [2] over 8 ms (one frame at
+ * 120 Hz), [3] over 16 ms, [4] over 33 ms, [5] over 100 ms, [6] the longest (us), [7] rows written to native_adreno_slow_jobs.
+ * A row of native_adreno_long_jobs (the 8 longest since boot, unordered) and of native_adreno_slow_jobs (the newest 16 over 8 ms, at
+ * [n & 15]): [0] fence | IBs << 32 | ring << 40 | (priority + 1) << 44 | source << 52 (1 the CP's stamps: from after the prologue's
+ * idle wait to after the job's IBs; 2 the driver's clock: from the later of its submission and the previous retirement seen on its
+ * ring to its own, an upper bound) | replays << 56, [1] duration (us), [2] IB bytes, [3] pid | GPU role << 32 | GPU level at
+ * submission << 40, [4] queue, [5] submission time (us), [6] submission to retirement seen (us), [7] the job's number in [0]. */
+extern "C" volatile uint32_t native_adreno_job_time[8];
+extern "C" volatile uint64_t native_adreno_long_jobs[8][8],native_adreno_slow_jobs[16][8];
+/* The first stage of a stall (write pointer given again, translations dropped) and what the CP did before it: [0] the fence, [1] us
+ * it had been pending, [2..7] the CP's progress (NativeAdrenoRing::progressState: IB1 base lo/hi, IB2 base lo/hi, IB1 and IB2 dwords
+ * left) at the fence's first timed-out wait, [8..13] at the stage, [14..19] 500 us later, just before the stage acts, [20] bit 0: the
+ * CP moved between the first wait and the stage, bit 1: it moved in the 500 us, [21] us from the stage to the job's retirement seen
+ * (0: not yet), [22] the job's pid, [23] its IBs | ring << 16 | (priority + 1) << 24, [24] its IB bytes, [25] stages recorded. */
+extern "C" volatile uint32_t native_adreno_stall_kick[26];
 /* A GPU restart after a hang (NativeAdrenoSubmit::recover): the board resets the GPU and brings the CP up again on the same ring (a6xx_recover
  * and hw_init), calling NativeAdrenoRing::restart(completed) between the reset and its CP init. Nonzero: the GPU could not be restarted. */
 typedef IOReturn (*NativeAdrenoRestart)(void *cookie,NativeAdrenoRing *ring,uint32_t completed);
@@ -77,6 +95,7 @@ private:
         uint8_t loaded=0,flight=0;    /* the ring the CP ran when it was submitted, and whether a switch was in flight then */
         uint8_t replays=0;            /* how many GPU restarts replayed it */
         uint64_t replay_us=0;         /* when it was last given to the ring again (0: never) */
+        uint32_t ib_bytes=0;          /* the bytes of its IBs (UINT32_MAX at most) */
     };
     /* The jobs, grown on demand; a job never moves. Iterates as Job &. */
     struct JobList {
@@ -138,6 +157,12 @@ private:
     NativeAdrenoSubmitStats stats_{};
     /* The CP's state for a fence that stopped advancing (native_adreno_stall); waited is the fence the timed-out wait was for. */
     void noteStall(uint32_t observed,const NativeAdrenoRingClock *clock,uint32_t waited);
+    /* A retired job's GPU time into native_adreno_job_time and the two job tables (stamped: NativeAdrenoRing::timeline's status). */
+    void noteJobTime(const Job &job,uint32_t stamped,uint64_t start,uint64_t end);
+    /* noteStall's CP snapshot (native_adreno_stall, _stall_mem, _stall_ring), taken before the first stage acts. */
+    void snapshot(uint32_t next,uint32_t waited,uint64_t now,uint64_t pending,NativeAdrenoRing *stalled);
+    uint32_t stall_begin_cp_[6]{};   /* the CP's progress at the stalled fence's first timed-out wait */
+    uint64_t ring_retired_us_[2]{};uint32_t ring_retired_fence_[2]{};   /* the newest retirement seen on each ring */
     bool attached_=false,poisoned_=false;
     uint32_t audit_tick_=0;   /* submissions since attach; every eighth one audits its IB lines */
     /* submit()'s distinct buffers and ring words: too large for the kernel stack at 128 IBs (callers serialize every method) */
