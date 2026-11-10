@@ -338,6 +338,38 @@ int main()
         fencemem[1]=second;CHECK(p.submit.retireCompleted()==0);
         std::puts("PASS two-ring priorities, per-ring table/context, queue FIFO, fence-history rollover and CPU-table fallback");
     }
+    {
+        /* A wait that pauses under the caller's lock (a connection's teardown) for a low-ring job behind a busy high ring. The pause
+         * plays the CP: the high job ends, a triggered switch finishes, and the low ring's job runs only once the CP was switched
+         * to it. Nothing but the wait looks at the rings, so the wait itself has to trigger and complete the switch. */
+        Path p;CHECK(exposed(p)==kIOReturnSuccess);NativeAdrenoRing low;
+        static uint32_t lowfence[1024];std::memset(lowfence,0,sizeof(lowfence));
+        uint32_t lowmem[8192]{};uint8_t rec[2][64]{},info[2][32]{};
+        CHECK(low.attachSecondary(&ringio,&ringcache,lowmem,sizeof(lowmem),0x200000,lowfence,sizeof(lowfence),0x208000)==0);
+        CHECK(p.ring.setPreempt(0x300000,0x400000,0x108008)==0 && low.setPreempt(0x500000,0x600000,0x208008)==0);
+        NativeAdrenoSubmit::PreemptSetup setup{};setup.io={&cp,cwrite,cread,cbarrier,nullptr,nullptr};
+        setup.pages={{0x300000,0x500000},{0x400000,0x600000},{rec[0],rec[1]},{info[0],info[1]}};
+        setup.now=cnow;setup.clock=&cp;setup.mode=2;
+        CHECK(p.submit.setPreemption(&p.ring,&low,setup,true)==0);
+        auto write=[](void *,uint64_t)->IOReturn{return 0;};
+        CHECK(p.submit.setTableSwitching(2,write,nullptr)==0);
+        p.ring.tableInstalled(0xaaaa000);low.tableInstalled(0xbbbb000);
+        NativeAdrenoSubmitBuffer buffer{p.handle,0x800000,4096};
+        static uint32_t high_fence,low_fence,pauses,switched;high_fence=low_fence=pauses=switched=0;
+        clock_us=1;p.submit.nextPriority(0);CHECK(p.submit.submit(&p.vm,&buffer,1,8,&high_fence,&ringclock)==0);
+        p.submit.nextPriority(1);CHECK(p.submit.submit(&p.vm,&buffer,1,7,&low_fence,&ringclock)==0);
+        CHECK(p.ring.lastSubmitted()==high_fence && low.lastSubmitted()==low_fence && !(cp.regs[0x08a0]&1));   /* the high ring keeps the CP */
+        const NativeAdrenoRingClock playing{&cp,cnow,[](void *)->int {
+            clock_us+=1000;++pauses;
+            if(pauses==1)fencemem[1]=high_fence;                                    /* the high ring goes idle */
+            else if(cp.regs[0x08a0]&1) {cp.regs[0x08a0]&=~1u;switched=pauses;}      /* the CP finishes a triggered switch */
+            else if(switched && pauses>switched)lowfence[1]=low_fence;              /* and only then runs the low ring's job */
+            return 0;}};
+        CHECK(p.submit.wait(low_fence,&playing,2000000)==kIOReturnSuccess);
+        CHECK(switched && pauses<=8 && p.submit.preemptStats().triggers==1 && p.submit.preemptStats().completed==1);
+        CHECK(p.submit.retireCompleted()==0 && p.submit.outstanding()==0);
+        std::puts("PASS a pausing wait drives the ring switch for a low-ring job");
+    }
     std::printf("PASS: 1 execbuf submission with exact IB packet and fence, 8 pre-reference refusals, 1 duplicate-buffer reference case and 1 poisoned-commit retention case over software SMMU/CP peers; 2 write-combine audit cases (trusted, dirty and failed); 1 hangcheck and 1 recovery with replay, 1 usable VM after recovery and 1 failed restart\n");
 }
 /* Physical-page maintenance (imported BOs): record it; no host page is touched. */

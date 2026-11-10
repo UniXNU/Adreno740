@@ -549,7 +549,7 @@ IOReturn NativeAdrenoSubmit::observeFence(uint32_t fence,const NativeAdrenoRingC
     driveSwitch(clock);
     NativeAdrenoRing *const r=ringOfFence(fence);
     if(!r)return kIOReturnBadArgument;
-    const NativeAdrenoRingFence result=r->observeFence(fence,clock,timeout_us,nullptr);
+    const NativeAdrenoRingFence result=waitOnRing(r,false,fence,clock,timeout_us,nullptr);
     if(result==NativeAdrenoRingFencePoisoned)return poison();
     if(result==NativeAdrenoRingFenceArgument)return kIOReturnBadArgument;
     if(result==NativeAdrenoRingFenceTimeout)return kIOReturnTimeout;
@@ -651,6 +651,25 @@ void NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingClock
     native_adreno_stall[1]=stall_timeouts;
     native_adreno_stall[0]=next;
 }
+/* A wait that pauses is made with the caller's lock held for all of it (a connection's teardown, a CPU table switch, the board's own
+ * calls), so nothing else can look at the switch between the two rings meanwhile. It looks itself after every pause: the fence may be
+ * of a ring the CP is not running, which gets the CP once the other ring goes idle or its job has aged, and a switch the CP finished
+ * has to be completed for the incoming ring to get its write pointer. Without that a low-ring job behind a busy high ring sat out the
+ * whole timeout, and after 2 s the hang check took it for a ring the CP cannot reach and restarted the GPU. */
+NativeAdrenoRingFence NativeAdrenoSubmit::waitOnRing(NativeAdrenoRing *r,bool held,uint32_t fence,const NativeAdrenoRingClock *clock,
+    uint32_t timeout_us,uint32_t *observed)
+{
+    if(!preemption() || !timeout_us || !clock || !clock->now_us)
+        return held?r->wait(fence,clock,timeout_us,observed):r->observeFence(fence,clock,timeout_us,observed);
+    const uint64_t start=clock->now_us(clock->cookie);
+    for(;;) {
+        const NativeAdrenoRingFence state=held?r->wait(fence,clock,0,observed):r->observeFence(fence,clock,0,observed);
+        if(state!=NativeAdrenoRingFenceTimeout)return state;
+        if(clock->now_us(clock->cookie)-start>=timeout_us)return NativeAdrenoRingFenceTimeout;
+        if(clock->idle && clock->idle(clock->cookie))return NativeAdrenoRingFenceTimeout;
+        driveSwitch(clock);
+    }
+}
 IOReturn NativeAdrenoSubmit::wait(uint32_t fence,const NativeAdrenoRingClock *clock,
     uint32_t timeout_us)
 {
@@ -664,7 +683,7 @@ IOReturn NativeAdrenoSubmit::wait(uint32_t fence,const NativeAdrenoRingClock *cl
     if(!r)return kIOReturnBadArgument;
     if(!job) {
         native_adreno_fence_wait[6]=native_adreno_fence_wait[6]+1;
-        const NativeAdrenoRingFence passed=r->observeFence(fence,clock,timeout_us,&observed);
+        const NativeAdrenoRingFence passed=waitOnRing(r,false,fence,clock,timeout_us,&observed);
         if(passed==NativeAdrenoRingFencePoisoned)return poison();
         if(passed==NativeAdrenoRingFenceArgument) {native_adreno_fence_wait[7]=fence;return kIOReturnBadArgument;}
         if(passed==NativeAdrenoRingFenceTimeout) {
@@ -676,7 +695,7 @@ IOReturn NativeAdrenoSubmit::wait(uint32_t fence,const NativeAdrenoRingClock *cl
         }
         return kIOReturnSuccess;
     }
-    const NativeAdrenoRingFence result=r->wait(fence,clock,timeout_us,&observed);
+    const NativeAdrenoRingFence result=waitOnRing(r,true,fence,clock,timeout_us,&observed);
     if(result==NativeAdrenoRingFencePoisoned)return poison();
     if(result==NativeAdrenoRingFenceArgument) {native_adreno_fence_wait[7]=fence;return kIOReturnBadArgument;}
     if(result==NativeAdrenoRingFenceTimeout) {
