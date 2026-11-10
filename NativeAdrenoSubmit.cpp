@@ -65,8 +65,15 @@ extern "C" {volatile uint32_t native_adreno_fence_pending[8];}
  * timed-out waits that fence had seen when it did. */
 /* [4] bus drains, [5] client halt acknowledge, [6] arbiter halt acknowledge, [7] the fence of the last drain, [8] drains after which that fence completed */
 extern "C" {volatile uint32_t native_adreno_unstick[15];}
-/* The IBs of the last submissions: [slot] fence, iova low/high, bytes, then the first 28 dwords of the first IB (read as the kernel maps it). */
+/* The IBs of the last submissions: [slot] fence, iova low/high, bytes, then the first 28 dwords of the first IB. The words are a
+ * diagnostic (diag=1, zero otherwise) and are read through NativeAdrenoVm::headWords: the board's uncached reader makes and removes
+ * a kernel mapping for every word, 28 pairs a submission under the driver's lock. */
 extern "C" {volatile uint32_t native_adreno_ib_log[4][4+28];volatile uint32_t native_adreno_ib_log_count;}
+/* Where an accepted submission's time under the driver's lock goes (us, summed; the clock is the caller's): [0] submissions timed,
+ * [1] validation, retiring finished jobs and holding the buffers, [2] the write-combine re-assertion and the audits, [3] the pass
+ * over the mappings with its cache maintenance (and every 64th time the coherence sample), [4] the submission log, [5] the table
+ * switch, the ring and the job record, [6] all of it. A wait_fence before the submission is not in it. */
+extern "C" {volatile uint64_t native_adreno_submit_us[8];}
 extern "C" volatile uint32_t native_adreno_table_switches[8];
 /* Where the last recover() stopped: [0] the step (1 fence read, 2 restart hook, 3 table write, 4 nop encode, 5 replay vm, 6 replay submit), [1] the IOReturn or value there, [2] fence, [3] last submitted. */
 extern "C" {volatile uint32_t native_adreno_recover_trace[4];}
@@ -397,6 +404,14 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
     /* msm_ioctl_gem_submit refuses a VM a hang made unusable. */
     if(vm->unusable())return kIOReturnNotPermitted;
     if(!buffers || !count || count>SubmitMaxBuffers)return kIOReturnBadArgument;
+    /* The phases' clock: each lap takes the time since the one before; an accepted submission adds them to native_adreno_submit_us. */
+    uint64_t lap_us=clock && clock->now_us?clock->now_us(clock->cookie):0,laps[6]={};
+    const uint64_t began_us=lap_us;
+    auto lap=[&](unsigned slot) {
+        if(!began_us)return;
+        const uint64_t now=clock->now_us(clock->cookie);
+        laps[slot]=now-lap_us;lap_us=now;
+    };
     native_adreno_submit_ibs[0]=native_adreno_submit_ibs[0]+1;native_adreno_submit_ibs[1]=native_adreno_submit_ibs[1]+(uint32_t)count;
     if(count>native_adreno_submit_ibs[2])native_adreno_submit_ibs[2]=(uint32_t)count;
     if(count>16)native_adreno_submit_ibs[3]=native_adreno_submit_ibs[3]+1;
@@ -436,6 +451,7 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
         }
         ++stats_.references_held;
     }
+    lap(1);
     uint32_t value=0;
     /* int-070: the first IB word as the kernel's cacheable alias and DRAM see it before any maintenance, then DRAM after the CPU
      * caches over every mapped BO are cleaned and invalidated. The board shows the last submission's record on a stall. */
@@ -475,6 +491,24 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
             native_adreno_wc_distrusted=native_adreno_coherence[0]+1;
         }
     }
+    /* The driver's own buffers (ring, memptrs, SQE, preemption records) are not cleaned at every submission: their writers keep the
+     * GPU's view current (NativeAdrenoMemory::declareSynchronized). The first 8 submissions and every 1024th after them compare the
+     * head of each one as a CPU cache and DRAM hold it (the ring lines the submission before stored are among them); a dirty line (a
+     * writer that stored through a cacheable mapping and did not clean) ends that trust for good, and from this submission on they
+     * are cleaned every time. */
+    if((native_adreno_submit_ibs[0]<=8 || !(native_adreno_submit_ibs[0]&1023)) && !native_adreno_sync_audit[4]) {
+        uint32_t lines=0,dirty=0,stale=0;
+        const IOReturn audited=vm_->auditSynchronized(&lines,&dirty,&stale);
+        if(audited!=kIOReturnUnsupported) {   /* no board hook (host): nothing to compare */
+            native_adreno_sync_audit[0]=native_adreno_sync_audit[0]+1;
+            native_adreno_sync_audit[1]=native_adreno_sync_audit[1]+lines;
+            native_adreno_sync_audit[2]=native_adreno_sync_audit[2]+dirty;
+            native_adreno_sync_audit[3]=native_adreno_sync_audit[3]+stale;
+            if(audited)native_adreno_sync_audit[5]=(uint32_t)audited;
+            if(dirty || audited)native_adreno_sync_audit[4]=native_adreno_sync_audit[0];
+        }
+    }
+    lap(2);
     /* The coherence sample reads the first IB's word through a fresh uncached mapping before and after the publication: every 64th
      * submission only (two such mappings per submission were CPU time on every frame). */
     static uint32_t coherence_turn;
@@ -499,6 +533,7 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
         for(size_t i=0;i<handle_count;++i) {vm_->retireJobAfterCompletion(handles[i]);++stats_.references_retired;}
         return status;
     }
+    lap(3);
     /* The ring this job goes to (the first ring alone unless the board turned the switch on). */
     unsigned index=preemption()?ringForPriority():0;
     /* A priority change cannot overtake this queue's earlier submissions. It moves
@@ -507,13 +542,14 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
         if(earlier.active && earlier.queue==queue) {index=earlier.ring;break;}
     NativeAdrenoRing *const target=ring(index);
     {
-        const uint32_t slot=native_adreno_ib_log_count&3;uint32_t head[28];
-        (void)vm_->peekWords(buffers[0].iova,head,28);
+        const uint32_t slot=native_adreno_ib_log_count&3;uint32_t head[28]={};
+        if(native_adreno_diag)(void)vm_->headWords(buffers[0].handle,buffers[0].iova,head,28);
         native_adreno_ib_log[slot][0]=target->lastSubmitted()+1;native_adreno_ib_log[slot][1]=(uint32_t)buffers[0].iova;
         native_adreno_ib_log[slot][2]=(uint32_t)(buffers[0].iova>>32);native_adreno_ib_log[slot][3]=(uint32_t)buffers[0].bytes;
         for(unsigned i=0;i<28;++i)native_adreno_ib_log[slot][4+i]=head[i];
         native_adreno_ib_log_count=native_adreno_ib_log_count+1;
     }
+    lap(4);
     target->useContext(ring(0)->context());
     status=useVm(vm,clock,index);
     if(status) {
@@ -557,6 +593,12 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
     if(outstanding()>stats_.peak_jobs)stats_.peak_jobs=outstanding();
     *fence=value;
     driveSwitch(clock);
+    lap(5);
+    if(began_us) {
+        native_adreno_submit_us[0]=native_adreno_submit_us[0]+1;
+        for(unsigned i=1;i<6;++i)native_adreno_submit_us[i]=native_adreno_submit_us[i]+laps[i];
+        native_adreno_submit_us[6]=native_adreno_submit_us[6]+(lap_us-began_us);
+    }
     return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoSubmit::observeFence(uint32_t fence,const NativeAdrenoRingClock *clock,

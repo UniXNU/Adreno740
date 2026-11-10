@@ -31,7 +31,8 @@ IOReturn NativeAdrenoReassertWriteCombined(const NativeAdrenoPhysicalSpan *,size
  * hold a line, so the GPU needs no CPU cache maintenance around them. */
 bool NativeAdrenoPagesUncached(const NativeAdrenoPhysicalSpan *,size_t count);
 /* CPU cache maintenance by the phase that asked for it, for the board log: [phase][0] passes, [phase][1] KiB. */
-enum NativeAdrenoMaintenancePhase {NativeAdrenoPhaseUnused,NativeAdrenoPhaseAllocate,NativeAdrenoPhaseMap,NativeAdrenoPhaseSubmit,
+/* NativeAdrenoPhaseWrite: a writer of the driver's own memory cleaning what it stored through a cacheable mapping. */
+enum NativeAdrenoMaintenancePhase {NativeAdrenoPhaseWrite,NativeAdrenoPhaseAllocate,NativeAdrenoPhaseMap,NativeAdrenoPhaseSubmit,
     NativeAdrenoPhaseUnmap,NativeAdrenoPhaseComplete,NativeAdrenoPhaseTable,NativeAdrenoPhaseDiagnostic};
 void NativeAdrenoNotePhase(unsigned phase,size_t bytes);
 /* One holder's change in a table of 24 rows {pid, live KiB, live objects, peak KiB} (native_adreno_bo_owners and the tables shaped like
@@ -59,6 +60,7 @@ class NativeAdrenoMemory final {
     int32_t owner_pid_=0;   /* the process that allocated a system BO or made an import, for the holders' tables */
     bool prepared_=false,quarantined_=false,write_combined_=false,system_=false,borrowed_=false,owned_=false;
     bool import_noted_=false;   /* an import counted in native_adreno_import_memory until release() */
+    bool synchronized_=false;   /* declareSynchronized(): its writers keep the device's view current themselves */
     IOReturn takeSegments(IOBufferMemoryDescriptor *,size_t bytes,uint64_t limit,bool contiguous);
     IOReturn maintainImported(size_t offset,size_t bytes,NativeAdrenoCacheOperation);
 public:
@@ -110,12 +112,28 @@ public:
      * write-combined, so publishForDevice/acquireDeviceWrites have nothing left to do. release() restores the default attribute. */
     IOReturn makeWriteCombined();
     bool writeCombined() const {return write_combined_;}
+    /* The driver's own kernel-mapped buffer whose users keep the device's view current themselves, as a driver of a non-coherent device
+     * does with dma_sync_single_for_device and dma_sync_single_for_cpu: whoever stores into it through a cacheable mapping cleans what
+     * it stored before the device can read it (publishForDevice), whoever loads what the device wrote invalidates first
+     * (acquireDeviceWrites), and a user with a non-cacheable view needs neither. A dirty line can then exist only between a store and
+     * its writer's own clean, so the passes over every mapping (at a map, an unmap, a submission) have nothing to do for it and leave it
+     * out. Called after allocate() and before any mapping: the zero fill is cleaned and dropped here, so no line of the buffer is in a
+     * CPU cache when its users take it over. */
+    IOReturn declareSynchronized();
+    bool synchronized() const {return synchronized_;}
+    /* Whether a CPU cache can hold a line of this memory that the device has not seen: not for an import whose owner maps it
+     * non-cacheable, and not for write-combined memory unless a view of it was found caching (include_write_combined). The passes that
+     * decide without calling publishForDevice use the same answer. */
+    bool holdsCpuLines(bool include_write_combined) const
+    {return !(imported_ && owner_uncached_) && !(write_combined_ && !include_write_combined);}
+    /* Whether reassertWriteCombined has pages to look at. */
+    bool reassertable() const {return write_combined_ && span_count_ && !system_;}
     /* NativeAdrenoReassertWriteCombined over this object's pages; nothing for an object that is not write-combined, nor for system memory:
      * XNU set the pages of BOs whose views mapped their physical pages back to the default attribute as it tore a device-pager view down
      * (int-160: 123847 pages; untagged-2319cf3e5: 685208 pages, 3.8 s of submissions), while a view of a VM object maps it with the
      * object's own attribute. The submissions' line audit still covers every object. */
     IOReturn reassertWriteCombined(uint32_t *reset) const
-    {return write_combined_ && span_count_ && !system_?NativeAdrenoReassertWriteCombined(spans_,span_count_,reset):kIOReturnSuccess;}
+    {return reassertable()?NativeAdrenoReassertWriteCombined(spans_,span_count_,reset):kIOReturnSuccess;}
     bool backed() const {return descriptor_ || imported_ || borrowed_;}
     /* Refuses device references/quarantine; only clears ownership after real
      * descriptor complete() succeeds. No automatic reset or resource recycling. */

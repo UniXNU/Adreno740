@@ -32,8 +32,14 @@ IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,uns
         /* Stage-1 input size: smmu->va_size from ID2.UBS (arm_smmu_init_domain_context: ias = smmu->va_size for AArch64 stage 1). */
         input_bits_=NativeAdrenoSmmuInputBits(report->id2);
     }
-    for(unsigned i=0;!status && i<GpuBufferCount;++i)
+    for(unsigned i=0;!status && i<GpuBufferCount;++i) {
         status=buffers_[i].allocate(kBytes[i],report->output_bits,true,kBytes[i]);
+        /* The CPU's users of these buffers keep the GPU's view current themselves (a non-cacheable view, as the header asks, or a clean
+         * after each store through the kernel's mapping, as probeBuffer does), so no table that maps them and no submission cleans
+         * them. Every process table maps all of them: cleaning their 8548 KiB at each submission was 351 of a submission's 579 us
+         * (macOS run61). */
+        if(!status)status=buffers_[i].declareSynchronized();
+    }
     if(!status) {
         step(Prepare);
         const uint64_t aperture=UINT64_C(1)<<input_bits_;
@@ -222,6 +228,9 @@ IOReturn NativeAdrenoGpuContext::probeBuffer(NativeAdrenoProcessVm *p,uint64_t *
     uint32_t nop=0;
     if(AdrenoPM4Type7(0x10,0,&nop)!=AdrenoPM4Success)return kIOReturnInternalError;   /* CP_NOP */
     scratch[0xF00/4]=nop;
+    /* The store went through the kernel's own mapping of the page, which may cache: written back before the CP reads it. */
+    const IOReturn cleaned=buffers_[4].publishForDevice(0,GpuPageBytes,false,true,NativeAdrenoPhaseWrite);
+    if(cleaned)return cleaned;
     *handle=p->handles_[4];*iova=GpuScratchIova+0xF00;*bytes=4;
     return kIOReturnSuccess;
 }
