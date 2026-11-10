@@ -25,6 +25,14 @@
 #include "NativeGpuTrace.inc"
 
 extern "C" void proc_selfname(char *, int);
+/* The system's render server, the process that composes the display: backboardd on iPadOS, WindowServer on macOS. It gets the
+ * reserved row 0 and its mailbox page, the cache export and its own report line. */
+#if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
+static constexpr char kRenderServer[]="WindowServer";
+#else
+static constexpr char kRenderServer[]="backboardd";
+#endif
+static bool isRenderServer(const char *name,size_t size) {return !strncmp(name,kRenderServer,size);}
 extern "C" volatile uint32_t native_adreno_table_switches[8];
 /* The plugin's telemetry table (rows of text the Metal bridge keeps), sent as markers: 0xC000|row starts a row, 0x8000|(a<<7)|b appends two characters. */
 extern "C" {char native_adreno_metal_rows[48][96];volatile uint32_t native_adreno_metal_rows_seq;}
@@ -331,7 +339,7 @@ bool AGXDeviceUserClient::mount(bool kernel)
     if(!core)return false;
     IOLockLock(g.lock);
     bool ok=false;
-    const bool server=!kernel && !strncmp(name_,"backboardd",sizeof name_);
+    const bool server=!kernel && isRenderServer(name_,sizeof name_);
     NativeAdrenoProcessVm *space=nullptr;
     IOReturn opened=kIOReturnSuccess;
     if(kernel)opened=g.kernel_client?kIOReturnBusy:kIOReturnSuccess;
@@ -751,7 +759,7 @@ IOReturn AGXDeviceUserClient::runTimed(uint32_t method,const void *input,size_t 
         Piece piece{};
         if(input && input_size>=sizeof(piece))memcpy(&piece,input,sizeof(piece));
         const bool valid=!output_size && input && input_size>=sizeof(piece) && piece.bytes && piece.bytes<=NativeAdrenoExportMaxPiece &&
-            input_size==sizeof(piece)+piece.bytes && !strncmp(caller,"backboardd",sizeof caller);
+            input_size==sizeof(piece)+piece.bytes && isRenderServer(caller,sizeof caller);
         const int stored=valid && boot_log_export_put?boot_log_export_put(piece.generation,piece.total,piece.offset,
             static_cast<const uint8_t *>(input)+sizeof(piece),piece.bytes):-1;
         if(stored) {native_adreno_export_stats[1]=native_adreno_export_stats[1]+1;return kIOReturnBadArgument;}
@@ -925,7 +933,7 @@ extern "C" IOReturn native_adreno_new_user_client(IOService *provider,task_t own
                  * rewrites report2 every ten seconds, so the reason another process's device failed would be gone from it. */
                 char who[20]={};
                 proc_selfname(who,sizeof who);
-                if(value==0x7fff && strncmp(who,"backboardd",sizeof who)) {
+                if(value==0x7fff && !isRenderServer(who,sizeof who)) {
                     for(auto &entry:native_adreno_client_text) {
                         if(!entry.name[0]) strlcpy(entry.name,who,sizeof entry.name);
                         if(!strncmp(entry.name,who,sizeof entry.name)) {line=entry.text;break;}
