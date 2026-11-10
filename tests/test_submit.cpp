@@ -147,6 +147,46 @@ int main()
         CHECK(p.submit.wait(2,&ringclock,1000)==kIOReturnSuccess);
         CHECK(p.submit.detach()==kIOReturnSuccess);
     }
+    /* Every retired job is timed by the driver's clock without the CP's stamps: from its submission, or from the retirement before it
+     * on its ring, to its own; a job over 8 ms is named in the slow table and the longest stay in the long table. */
+    {
+        Path p;CHECK(exposed(p,true)==kIOReturnSuccess);
+        NativeAdrenoSubmitBuffer buffer{p.handle,0x800000,4096};
+        const uint32_t timed=native_adreno_job_time[0],slow=native_adreno_job_time[7],over=native_adreno_job_time[2];
+        uint32_t fence=0;
+        clock_us=1000;p.submit.nextOwner(77);
+        CHECK(p.submit.submit(&p.vm,&buffer,1,5,&fence,&ringclock)==kIOReturnSuccess && fence==1);
+        uint32_t second=0;p.submit.nextOwner(78);
+        CHECK(p.submit.submit(&p.vm,&buffer,1,5,&second,&ringclock)==kIOReturnSuccess && second==2);
+        clock_us=11000;fencemem[1]=1;CHECK(p.submit.retireCompleted()==kIOReturnSuccess);   /* 10 ms from its submission */
+        clock_us=12000;fencemem[1]=2;CHECK(p.submit.retireCompleted()==kIOReturnSuccess);   /* 1 ms after the first retired */
+        CHECK(native_adreno_job_time[0]==timed+2 && native_adreno_job_time[2]==over+1 && native_adreno_job_time[7]==slow+1);
+        const volatile uint64_t *row=native_adreno_slow_jobs[slow&15];
+        CHECK((uint32_t)row[0]==1 && (row[0]>>32&0xff)==1 && (row[0]>>52&15)==2 && row[1]==10000 && row[2]==4096 && (uint32_t)row[3]==77 &&
+            row[4]==5 && row[5]==1000 && row[6]==10000);
+        bool found=false;for(unsigned i=0;i<8;++i)found=found || (native_adreno_long_jobs[i][1]==10000 && (uint32_t)native_adreno_long_jobs[i][3]==77);
+        CHECK(found && native_adreno_job_time[6]>=10000);
+        CHECK(p.submit.detach()==kIOReturnSuccess);
+    }
+    /* Without gpu-audit the submissions compare no line: neither the write-combined IBs nor the synchronized driver buffers. */
+    {
+        Path p;CHECK(exposed(p,true)==kIOReturnSuccess);
+        NativeAdrenoSubmitBuffer buffer{p.handle,0x800000,4096};
+        static unsigned calls;calls=0;
+        native_adreno_line_audit=[](uint64_t,size_t,uint32_t *,uint32_t *) {++calls;return 0;};
+        native_adreno_audit_mode=~0u;   /* read from the boot arguments: none on the host */
+        const uint32_t wc=native_adreno_wc_audit[0],sync=native_adreno_sync_audit[0];
+        for(uint32_t n=1;n<=4;++n) {
+            uint32_t fence=0;
+            CHECK(p.submit.submit(&buffer,1,0,&fence)==kIOReturnSuccess && fence==n);
+            fencemem[1]=n;CHECK(p.submit.wait(n,&ringclock,1000)==kIOReturnSuccess);
+        }
+        CHECK(native_adreno_audit_mode==0 && calls==0 && native_adreno_wc_audit[0]==wc && native_adreno_sync_audit[0]==sync);
+        CHECK(p.vm.writeCombinedTrusted());
+        native_adreno_line_audit=nullptr;
+        CHECK(p.submit.detach()==kIOReturnSuccess);
+    }
+    native_adreno_audit_mode=1;   /* gpu-audit=1 for the audit tests below */
     /* int-100: a write-combined BO is not maintained while the IB audit finds no dirty line; a dirty line or a failed audit ends the
      * trust, and that submission already maintains every BO through its physical pages. */
     {
