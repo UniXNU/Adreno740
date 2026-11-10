@@ -134,6 +134,27 @@ int main()
     /* A retired grant's pages never come back. */
     NativeAdrenoPoolRetire(grant);NativeAdrenoPoolRelease(grant);
     CHECK(native_adreno_pool_state[8]==1 && native_adreno_pool_state[9]==8 && native_adreno_pool_state[2]==reachable+4-8);
+    /* gpu-pool=1: a view the kernel tracks to its pager's close gives the pages back once the kernel reports that close (no mapping of
+     * them is left anywhere), through the cache pass; a view it cannot track retires its grant. */
+    native_adreno_pool_state[10]=1;
+    {
+        const uint32_t retired=native_adreno_pool_state[8],free_kib=native_adreno_pool_state[2],drops=native_adreno_host_pool_drops;
+        const uint32_t closes=native_adreno_pool_views[2],back=native_adreno_pool_views[3];
+        NativeAdrenoPoolGrant *viewed=nullptr;
+        CHECK(!NativeAdrenoPoolAllocate(16384,limit,true,&viewed));
+        const uint64_t page=viewed->runs[0].physical;
+        NativeAdrenoPoolRetain(viewed);NativeAdrenoPoolNoteView(viewed,true);
+        NativeAdrenoPoolRelease(viewed);                               /* the BO goes; the view's descriptor may go too, a copy maps on */
+        CHECK(native_adreno_pool_state[2]==free_kib-16 && native_adreno_pool_state[8]==retired);
+        NativeAdrenoPoolViewClosed(viewed);                            /* the kernel: the pager closed, nothing maps the pages */
+        CHECK(native_adreno_pool_state[2]==free_kib && native_adreno_pool_state[8]==retired);
+        CHECK(native_adreno_pool_views[2]==closes+1 && native_adreno_pool_views[3]==back+1);
+        (void)page;(void)drops;   /* the pages are free again, marked for the cache pass (the gpu-pool=2 case above shows the pass) */
+        CHECK(!NativeAdrenoPoolAllocate(16384,limit,true,&viewed));
+        NativeAdrenoPoolRetain(viewed);NativeAdrenoPoolNoteView(viewed,false);
+        NativeAdrenoPoolRelease(viewed);NativeAdrenoPoolRelease(viewed);
+        CHECK(native_adreno_pool_state[8]==retired+1 && native_adreno_pool_state[2]==free_kib-16);
+    }
     std::printf("pool: %u served, %u exhausted, %u fragmented, lowest free %u KiB\n",native_adreno_pool_state[6],
         native_adreno_pool_fallbacks[NativeAdrenoPoolExhausted],native_adreno_pool_fallbacks[NativeAdrenoPoolFragmented],native_adreno_pool_state[3]);
     return 0;
