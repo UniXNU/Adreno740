@@ -9,10 +9,10 @@
  * vm_page for such a page and phystokv panics on it, so nothing but this allocator, the SMMU tables and non-cacheable CPU mappings
  * ever names one:
  *  - the allocator's own state (a bitmap a range) lives in kernel memory;
- *  - each range has one write-combined kernel mapping, made at registration, which is the only way the kernel writes the pages;
- *  - every page of a grant is zero-filled through that mapping before the grant leaves NativeAdrenoPoolAllocate, whatever held the
+ *  - the kernel writes the pages only through a write-combined mapping of a run, made for its zero fill and gone after it;
+ *  - every page of a grant is zero-filled through such a mapping before the grant leaves NativeAdrenoPoolAllocate, whatever held the
  *    page before (boot firmware, another client), so a client never reads what it did not write. Freed pages keep their old bytes
- *    until then; no mapping but the range's own reaches a free page;
+ *    until then; no kernel mapping reaches a free page;
  *  - pages a client could map (a grant that had a client view) get their CPU cache lines dropped before that zero fill: a client can
  *    ask IOKit for a cacheable view, and a line it left dirty would otherwise be written over the next owner's data later;
  *  - a grant is reference counted: the BO holds one reference and every client view descriptor one, so its end comes only when no
@@ -23,7 +23,7 @@
  *    gives such pages back instead (after the cache pass above), for a system whose GPU clients are trusted not to do that.
  * Lock order: the allocator's gate is a leaf. It is taken under the driver's lock, under IOKit's memory lock (a view descriptor's
  * free) or under no lock; nothing is called with it held. Registration has its own lock, taken before the gate, so the kernel
- * mapping of a new range is made without the gate. Zero fill and cache maintenance run with no lock at all. */
+ * bitmaps of a new range are made without the gate. Zero fill and cache maintenance run with no lock at all. */
 /* mapping: the run in its range's kernel mapping. viewed: a client could have mapped a page of it since its last zero fill. */
 struct NativeAdrenoPoolRun {uint64_t physical,bytes;void *mapping;uint64_t viewed;};
 struct NativeAdrenoPoolGrant {
@@ -76,8 +76,10 @@ void NativeAdrenoPoolRetire(NativeAdrenoPoolGrant *);
 /* Whether any page of [physical, physical+bytes) lies in a registered range. */
 bool NativeAdrenoPoolContains(uint64_t physical,uint64_t bytes);
 /* The kernel services under the allocator (NativeAdrenoCpu.cpp; host doubles in tests/HostKernelHooks.cpp).
- * NativeAdrenoPoolMapRange: one write-combined kernel mapping of a whole range, kept for good; *owner takes the object that holds it.
- * NativeAdrenoPoolScrub: zero-fills [mapping, mapping+bytes) through that mapping and waits for the stores to reach DRAM; with
+ * NativeAdrenoPoolMapRange: the value that stands for a range's first page in the runs ("mapping"); the kernel's is the physical
+ * address and keeps no mapping, the host's is memory standing for the pages. *owner takes what holds it, if anything.
+ * NativeAdrenoPoolScrub: zero-fills the run at [mapping, mapping+bytes) (the kernel maps the run for the call) and waits for the
+ * stores to reach DRAM; with
  * drop_lines it first drops every CPU cache line over the pages, by the mapping's addresses (data cache maintenance by address acts
  * on the lines of the physical page whatever the attributes of the mapping used). A failure leaves the pages unfit to hand out. */
 void *NativeAdrenoPoolMapRange(uint64_t physical,size_t bytes,void **owner);

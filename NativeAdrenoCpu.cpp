@@ -171,34 +171,36 @@ IOReturn NativeAdrenoReassertWriteCombined(const NativeAdrenoPhysicalSpan *spans
     __atomic_fetch_add(&native_adreno_reassert_ticks,mach_absolute_time()-began,__ATOMIC_RELAXED);
     return kIOReturnSuccess;
 }
-/* A pool range's kernel mapping: an IOKit mapping of the physical range, write-combined (Normal non-cacheable), in the kernel map's
- * ordinary address space. ml_io_map_wcomb is not used: it takes permanent addresses from the kernel's 1 GiB I/O range, which the
- * registers of every device share and which panics when it runs out. The mapping is never removed; *owner keeps the object. */
+/* The kernel keeps no mapping of a pool range: a whole range mapped at registration (several hundred MiB, write-combined, in the
+ * kernel map, before the GPU's own windows are mapped) kept the GPU from powering up on sheng. The value the allocator takes for a
+ * range's "mapping" is the range's physical address, and each scrub maps just the run it fills for the time it takes. */
 void *NativeAdrenoPoolMapRange(uint64_t physical,size_t bytes,void **owner)
 {
     if(!owner || !physical || !bytes || ((physical|bytes)&4095))return nullptr;
-    IOMemoryDescriptor *range=IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress)physical,bytes,kIODirectionInOut);
-    if(!range)return nullptr;
-    IOMemoryMap *map=range->createMappingInTask(kernel_task,0,kIOMapAnywhere|kIOMapWriteCombineCache);
-    range->release();
-    if(!map)return nullptr;
-    void *const address=reinterpret_cast<void *>(map->getVirtualAddress());
-    if(!address || ((uintptr_t)address&4095) || map->getLength()!=bytes) {map->release();return nullptr;}
-    *owner=map;
-    return address;
+    *owner=nullptr;
+    return reinterpret_cast<void *>(physical);
 }
 /* Before a pool page goes to its next owner. A page a client could map may have lines in a CPU cache (the client chooses the cache
- * mode of its own IOKit mapping): they are dropped first, by the range mapping's addresses, so none is written over the zeros or
- * over the next owner's data later. The pages have no other mapping at this point, so nothing is lost with a dropped line. The zero
- * fill goes through the write-combined mapping and the barrier completes it before the GPU or a client can read the pages. */
+ * mode of its own IOKit mapping): they are dropped first, by the run mapping's addresses, so none is written over the zeros or over
+ * the next owner's data later. The pages have no other mapping at this point, so nothing is lost with a dropped line. The zero fill
+ * goes through a write-combined mapping of the run made for it, and the barrier completes it before the GPU or a client can read
+ * the pages; the mapping is gone again before the call returns. */
 IOReturn NativeAdrenoPoolScrub(void *mapping,size_t bytes,bool drop_lines)
 {
-    if(!mapping || !bytes || (((uintptr_t)mapping|bytes)&4095))return kIOReturnBadArgument;
-    if(drop_lines) {
-        const IOReturn dropped=maintainOwnedPages(mapping,bytes,NativeAdrenoInvalidate);
-        if(dropped)return dropped;
+    const uint64_t physical=reinterpret_cast<uintptr_t>(mapping);
+    if(!physical || !bytes || ((physical|bytes)&4095))return kIOReturnBadArgument;
+    IOMemoryDescriptor *run=IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress)physical,bytes,kIODirectionInOut);
+    if(!run)return kIOReturnNoMemory;
+    IOMemoryMap *map=run->createMappingInTask(kernel_task,0,kIOMapAnywhere|kIOMapWriteCombineCache);
+    run->release();
+    if(!map)return kIOReturnNoMemory;
+    void *const address=reinterpret_cast<void *>(map->getVirtualAddress());
+    IOReturn status=(!address || ((uintptr_t)address&4095) || map->getLength()!=bytes)?kIOReturnNoMemory:kIOReturnSuccess;
+    if(!status && drop_lines)status=maintainOwnedPages(address,bytes,NativeAdrenoInvalidate);
+    if(!status) {
+        bzero(address,bytes);
+        __asm__ volatile("dsb sy":::"memory");
     }
-    bzero(mapping,bytes);
-    __asm__ volatile("dsb sy":::"memory");
-    return kIOReturnSuccess;
+    map->release();
+    return status;
 }
