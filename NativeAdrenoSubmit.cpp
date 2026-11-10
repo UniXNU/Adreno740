@@ -294,6 +294,17 @@ bool NativeAdrenoSubmit::fenceProgress(uint32_t *submitted,uint32_t *retired,uin
     if(rings){rings[0]=done[0];rings[1]=done[1];}
     *submitted=issued;*retired=prefix;return true;
 }
+bool NativeAdrenoSubmit::fencePending(uint32_t fence)
+{
+    if(!attached_ || poisoned_ || !fence)return false;
+    const Job *const job=find(fence);
+    /* Two rings: a fence without a job was retired (wait() succeeds at once) or never handed out (wait() refuses it). */
+    if(preemption() && !job)return false;
+    NativeAdrenoRing *const r=job?ring(job->ring):ringOfFence(fence);
+    uint32_t done=0;
+    if(!r || r->poisoned() || fence>r->lastSubmitted() || r->fenceValue(&done))return false;
+    return done<fence;
+}
 IOReturn NativeAdrenoSubmit::setPreemption(NativeAdrenoRing *high,NativeAdrenoRing *low,const PreemptSetup &setup,bool on)
 {
     if(!attached_ || poisoned_)return kIOReturnNotReady;

@@ -163,7 +163,9 @@ int main()
         CHECK(audited.size()==2 && audited[0]==p.object.spans()[0].physical && audited[1]==4096);
         CHECK(native_adreno_wc_audit[0]==submissions+1 && native_adreno_wc_audit[1]==lines+64 && native_adreno_wc_distrusted==0);
         CHECK(fixture.physical_calls==physical && fixture.cache_calls==owned && p.vm.writeCombinedTrusted());   /* no maintenance */
-        fencemem[1]=1;CHECK(p.submit.wait(1,&ringclock,1000)==kIOReturnSuccess);
+        CHECK(p.submit.fencePending(1) && !p.submit.fencePending(2));   /* one ring: pending until the CP writes it; 2 was never handed out */
+        fencemem[1]=1;CHECK(!p.submit.fencePending(1));
+        CHECK(p.submit.wait(1,&ringclock,1000)==kIOReturnSuccess && !p.submit.fencePending(1));
         dirty_lines=2;
         CHECK(p.submit.submit(&buffer,1,0,&fence)==kIOReturnSuccess && fence==2);
         CHECK(!p.vm.writeCombinedTrusted() && native_adreno_wc_distrusted);
@@ -329,7 +331,18 @@ int main()
         }
         uint32_t issued=0,retired=0;CHECK(p.submit.fenceProgress(&issued,&retired) && issued==second && retired==first-1);
         CHECK(p.submit.observeFence(first,nullptr,0)==kIOReturnTimeout);
-        lowfence[1]=first;CHECK(p.submit.retireCompleted()==0 && p.submit.outstanding()==0);
+        /* A waiter's check is its own ring's: the high ring's finished fence is not pending while the scanout's prefix still waits for
+         * the low ring's older one. Neither an unknown fence nor fence 0 is pending (wait() answers those). */
+        CHECK(p.submit.fencePending(first) && !p.submit.fencePending(second) && !p.submit.fencePending(second+1) && !p.submit.fencePending(0));
+        p.submit.nextPriority(0);uint32_t running=0;CHECK(p.submit.submit(&p.vm,&buffer,1,8,&running,&ringclock)==0);
+        cp.regs[0x08a0]=0x340;(void)p.submit.preemptIrq();
+        CHECK(p.submit.fencePending(running) && p.submit.fencePending(first));
+        fencemem[0]=p.ring.writePointer();fencemem[1]=running;
+        CHECK(!p.submit.fencePending(running) && p.submit.fencePending(first));   /* written, not yet retired */
+        CHECK(p.submit.wait(running,&ringclock,0)==0 && !p.submit.fencePending(running) && p.submit.outstanding()==1);second=running;
+        cp.regs[0x08a0]=0x340;(void)p.submit.preemptIrq();
+        lowfence[1]=first;CHECK(!p.submit.fencePending(first));
+        CHECK(p.submit.retireCompleted()==0 && p.submit.outstanding()==0);
         CHECK(p.submit.fenceProgress(&issued,&retired) && issued==second && retired==second);
         CHECK(p.submit.wait(first,&ringclock,0)==0 && p.submit.observeFence(first,nullptr,0)==0);
         CHECK(p.submit.wait(second+1,&ringclock,0)==kIOReturnBadArgument);
