@@ -35,13 +35,60 @@ extern "C" int (*native_adreno_cached_read32)(uint64_t physical,uint32_t *value)
  * DRAM (a fresh uncached mapping) read it. A line that differs is cleaned and invalidated and DRAM read again: when DRAM then holds the
  * cached copy the line was dirty (*dirty), when DRAM is unchanged it was a stale clean copy (*stale). 0 on success. */
 extern "C" int (*native_adreno_line_audit)(uint64_t physical,size_t bytes,uint32_t *dirty,uint32_t *stale);
+/* What a mapping is, for the maintenance counters: the rows of native_adreno_maint_kind. */
+enum NativeAdrenoMappingKind : unsigned {
+    NativeAdrenoKindDriver,          /* the driver's own synchronized buffer (NativeAdrenoMemory::declareSynchronized) */
+    NativeAdrenoKindSystemWc,        /* a user BO of system memory, write-combined */
+    NativeAdrenoKindSystemCached,    /* a user BO of system memory with the default attribute */
+    NativeAdrenoKindKernel,          /* kernel-mapped memory nobody declared synchronized (a contiguous user BO, a board's buffer) */
+    NativeAdrenoKindImportRead,      /* an import the GPU only reads */
+    NativeAdrenoKindImportWritten,   /* an import the GPU writes */
+    NativeAdrenoKindImportUncached,  /* an import whose owner maps it non-cacheable */
+    NativeAdrenoKindCount
+};
+/* CPU cache maintenance at submissions by kind of mapping: [kind][0] mappings maintained, [1] their KiB, [2] mappings left alone
+ * (coherent, non-cacheable for the CPU, or synchronized by their writers). */
+extern "C" volatile uint64_t native_adreno_maint_kind[8][3];
+/* The passes over a VM's mappings: [0] submissions, [1] mappings their passes visited, [2] mappings the VMs held at those submissions,
+ * [3] completions, [4] mappings their passes visited, [5] times every mapping was classified again (a mode changed), [6] mappings the
+ * write-combine re-assertion visited. */
+extern "C" volatile uint64_t native_adreno_maint_walk[8];
+/* Synchronized driver memory left out of the maintenance at [0] a map and [1] an unmap. */
+extern "C" volatile uint32_t native_adreno_sync_skips[2];
+/* The audit of the synchronized driver buffers (NativeAdrenoVm::auditSynchronized): [0] audits, [1] lines compared, [2] dirty lines,
+ * [3] stale clean lines, [4] the audit that found a dirty line or failed (0: never; from then on these buffers are maintained at every
+ * map, unmap and submission again), [5] the last failure. */
+extern "C" volatile uint32_t native_adreno_sync_audit[6];
+/* gpu-maint-all=1 (read at the first use; ~0 until then), for a comparison on the machine: every pass visits every mapping of the VM
+ * and the driver's own synchronized buffers are cleaned and invalidated at every map, unmap and submission like memory nobody
+ * declared. */
+extern "C" volatile uint32_t native_adreno_maint_all;
 class NativeAdrenoVm final {
     struct Mapping {
         NativeAdrenoMemory *memory=nullptr;
         uint64_t handle=0,iova=0;
         size_t spans=0,mapped_spans=0;
         unsigned permissions=0,writeback=0,shareability=0,jobs=0,upper=0;
+        uint32_t care=UINT32_MAX;   /* its place in care_ (UINT32_MAX: not there) */
+        uint8_t kind=0,work=0;      /* NativeAdrenoMappingKind, and the Work bits it was counted with */
     };
+    /* What the passes owe a mapping in the current mode: cleaning before a submission, invalidating after a completion, a look at
+     * its pages' write-combined attribute; and how the counters took it (coherent at a submission, and at a completion). */
+    enum : uint8_t {WorkSubmit=1,WorkComplete=2,WorkReassert=4,WorkAny=7,CountedCoherent=8,CountedCoherentWrite=16};
+    /* The mappings a pass has work for (mappings_ slots, in no order): a submission, a completion and the re-assertion visit these
+     * instead of every mapping. A render server holds thousands of write-combined BOs none of which a pass touches, and a pass per
+     * submission over all of them is time under the driver's lock that grows with the client, not with its work. The list follows the
+     * mode (IO coherence, the write-combined trust, the synchronized trust, gpu-maint-all): sync() classifies every mapping again when
+     * the mode changed. */
+    uint32_t *care_=nullptr;
+    size_t care_count_=0;
+    size_t kind_count_[NativeAdrenoKindCount]{},kind_work_[NativeAdrenoKindCount]{};   /* mapped objects by kind, and those with WorkSubmit */
+    size_t submit_skips_=0,complete_skips_=0;   /* the mappings a submission and a completion leave alone as coherent */
+    uint32_t mode_=UINT32_MAX;
+    uint32_t mode() const;
+    void sync();
+    void enlist(Mapping *);
+    void delist(Mapping *);
     Mapping *mappings_=nullptr;
     NativeAdrenoHandleIndex index_;   /* live handle -> its mappings_ slot */
     size_t free_hint_=0;   /* no free mappings_ slot below it */
@@ -115,9 +162,12 @@ public:
      * synchronizes by ASID; this is the stronger form the submit path uses before each submission (int-070: on sheng the CP read
      * zeros from an IB whose table entry and DRAM were both correct, after the address had been mapped to other pages before). */
     IOReturn invalidateTlb();
-    /* Cleans and invalidates the CPU caches over every mapped BO (whole objects; imported ones through their physical pages), so
-     * no CPU cache line can hold data the GPU should see or hide what it wrote. Lines are physically tagged, so this also reaches
-     * lines a user mapping of the same pages left behind. int-070 runs it before every submission. */
+    /* Before every submission: cleans and invalidates the CPU caches over every mapped BO a CPU cache can hold a line of that the GPU
+     * would not see (whole objects; imported ones through their physical pages). Lines are physically tagged, so this also reaches
+     * lines a user mapping of the same pages left behind. Left alone: coherent mappings, memory no CPU mapping caches (write-combined
+     * while trusted, imports their owner maps non-cacheable), every import once IO coherence is proved (the GPU-written ones were
+     * cleaned when mapped and the CPU leaves them alone while the GPU owns them), and the driver's own synchronized buffers, whose
+     * writers cleaned what they stored. Only the mappings with such work are visited. */
     IOReturn publishMapped();
     /* The submit path saw a CPU-cached word that DRAM did not hold yet in a client's BO: from now on write-combined BOs are maintained
      * like any other (sticky; the safe behaviour of int-070..097). */
@@ -138,6 +188,15 @@ public:
      * default attribute is write-combined again (and its lines written back); *reset counts the pages. */
     IOReturn reassertWriteCombined(uint32_t *reset) const;
     IOReturn auditRange(uint64_t iova,size_t bytes,uint32_t *lines,uint32_t *dirty,uint32_t *stale) const;
+    /* The proof on the machine that the synchronized driver buffers hold no dirty line when a submission arrives: the first 32 KiB of
+     * each one mapped here, through native_adreno_line_audit, counted as auditRange counts. The lines the comparison brought into the
+     * cache are dropped again. kIOReturnUnsupported without a board hook. The caller (the first submissions) ends the trust on a dirty
+     * line: native_adreno_sync_audit[4]. */
+    IOReturn auditSynchronized(uint32_t *lines,uint32_t *dirty,uint32_t *stale) const;
+    /* Up to `count` dwords at iova inside the mapping `handle`, for the submission log: through the kernel's mapping when the memory has
+     * one, else through the board's cacheable physical reader (one load and one dropped line a word) and only without it through the
+     * uncached one, which makes and removes a kernel mapping for every word. */
+    IOReturn headWords(uint64_t handle,uint64_t iova,uint32_t *out,size_t count) const;
     /* Read-only description of a live mapping; never pins or extends it. */
     IOReturn describe(uint64_t handle,uint64_t *iova,size_t *bytes,unsigned *permissions) const;
     /* Up to `count` dwords of a mapped kernel-owned BO at a GPU address (through the kernel's own mapping), for the board log. */

@@ -16,6 +16,35 @@ static bool coherentMapping(unsigned writeback) {return writeback && native_adre
  * write-back mappings), and the CPU never touches their pixels while the GPU owns them: they were cleaned when mapped and need no
  * maintenance per submission, which cost about 60 ms per frame. */
 static bool importedUntouched(const NativeAdrenoMemory *memory) {return memory->imported() && native_adreno_io_coherent;}
+extern "C" {volatile uint64_t native_adreno_maint_kind[8][3];volatile uint64_t native_adreno_maint_walk[8];
+    volatile uint32_t native_adreno_sync_skips[2];volatile uint32_t native_adreno_sync_audit[6];volatile uint32_t native_adreno_maint_all=~0u;}
+extern "C" boolean_t PE_parse_boot_argn(const char *,void *,int);
+static bool maintainAll()
+{
+    if(native_adreno_maint_all==~0u) {
+        uint32_t all=0;PE_parse_boot_argn("gpu-maint-all",&all,sizeof all);
+        native_adreno_maint_all=all?1:0;
+    }
+    return native_adreno_maint_all!=0;
+}
+/* A synchronized driver buffer is left out of the passes while nothing says otherwise: its writers cleaned what they stored
+ * (NativeAdrenoMemory::declareSynchronized), so no CPU cache holds a line the GPU has not seen. The audit of the first submissions
+ * checks that on the machine and ends the trust for good on a dirty line. */
+static bool synchronizedTrusted() {return !maintainAll() && !native_adreno_sync_audit[4];}
+static void noteKind(unsigned kind,size_t bytes)
+{
+    native_adreno_maint_kind[kind][0]=native_adreno_maint_kind[kind][0]+1;
+    native_adreno_maint_kind[kind][1]=native_adreno_maint_kind[kind][1]+((bytes+1023)>>10);
+}
+static unsigned kindOf(const NativeAdrenoMemory *memory,unsigned permissions)
+{
+    if(memory->imported())
+        return memory->ownerUncached()?NativeAdrenoKindImportUncached:
+            (permissions&ArmSmmu4KWrite)?NativeAdrenoKindImportWritten:NativeAdrenoKindImportRead;
+    if(memory->synchronized())return NativeAdrenoKindDriver;
+    if(memory->system())return memory->writeCombined()?NativeAdrenoKindSystemWc:NativeAdrenoKindSystemCached;
+    return NativeAdrenoKindKernel;
+}
 /* Mappings of one cache/shareability/privilege class may share pages; only pages shared across classes refuse. */
 static unsigned aliasClass(unsigned permissions,unsigned writeback,unsigned shareability)
 {return writeback|(shareability<<1)|((permissions&ArmSmmu4KPrivileged)?8u:0u);}
@@ -103,11 +132,13 @@ IOReturn NativeAdrenoVm::attach(const ArmSmmu4KIo *io,ArmSmmu4KContextConfig *co
         return kIOReturnBadArgument;
     const size_t first=capacity<1024?capacity:1024;
     changes_=IONewData(ArmSmmu4KRange,first);alias_scratch_=IONewData(uint32_t,first);mappings_=IONewData(Mapping,64);
-    order_=IONewData(uint32_t,64);
+    order_=IONewData(uint32_t,64);care_=IONewData(uint32_t,64);
     capacity_=first;mapping_capacity_=64;
-    if(!changes_ || !alias_scratch_ || !mappings_ || !order_ || !index_.allocate()) {freeTables();return kIOReturnNoMemory;}
-    memset(mappings_,0,sizeof(Mapping)*64);
+    if(!changes_ || !alias_scratch_ || !mappings_ || !order_ || !care_ || !index_.allocate()) {freeTables();return kIOReturnNoMemory;}
+    for(size_t i=0;i<64;++i)mappings_[i]=Mapping{};
     free_hint_=0;high_=0;memset(class_spans_,0,sizeof(class_spans_));order_count_[0]=order_count_[1]=0;
+    care_count_=0;memset(kind_count_,0,sizeof(kind_count_));memset(kind_work_,0,sizeof(kind_work_));
+    submit_skips_=complete_skips_=0;mode_=mode();
     io_=*io;context_=context;streams_=streams;budget_=budget;
     if(lower)regions_[0]=*lower;if(upper)regions_[1]=*upper;
     for(unsigned i=0;i<2;++i)if(regions_[i].arena) {
@@ -135,8 +166,9 @@ void NativeAdrenoVm::freeTables()
     if(alias_scratch_)IODeleteData(alias_scratch_,uint32_t,capacity_);
     if(mappings_)IODeleteData(mappings_,Mapping,mapping_capacity_);
     if(order_)IODeleteData(order_,uint32_t,mapping_capacity_);
+    if(care_)IODeleteData(care_,uint32_t,mapping_capacity_);
     index_.release();
-    changes_=nullptr;alias_scratch_=nullptr;mappings_=nullptr;order_=nullptr;capacity_=mapping_capacity_=0;
+    changes_=nullptr;alias_scratch_=nullptr;mappings_=nullptr;order_=nullptr;care_=nullptr;capacity_=mapping_capacity_=0;care_count_=0;
 }
 bool NativeAdrenoVm::growScratch(size_t needed)
 {
@@ -160,11 +192,14 @@ bool NativeAdrenoVm::growMappings()
     if(!made)return false;
     uint32_t *order=IONewData(uint32_t,size);
     if(!order) {IODeleteData(made,Mapping,size);return false;}
-    memset(made,0,sizeof(Mapping)*size);
-    memcpy(made,mappings_,sizeof(Mapping)*mapping_capacity_);
+    uint32_t *care=IONewData(uint32_t,size);
+    if(!care) {IODeleteData(made,Mapping,size);IODeleteData(order,uint32_t,size);return false;}
+    for(size_t i=0;i<size;++i)made[i]=i<mapping_capacity_?mappings_[i]:Mapping{};
     memcpy(order,order_,sizeof(uint32_t)*(order_count_[0]+order_count_[1]));
+    memcpy(care,care_,sizeof(uint32_t)*care_count_);
     IODeleteData(mappings_,Mapping,mapping_capacity_);IODeleteData(order_,uint32_t,mapping_capacity_);
-    mappings_=made;order_=order;mapping_capacity_=size;
+    IODeleteData(care_,uint32_t,mapping_capacity_);
+    mappings_=made;order_=order;care_=care;mapping_capacity_=size;
     return true;
 }
 IOReturn NativeAdrenoVm::invalidateAsid()
@@ -299,6 +334,7 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t 
     if(!handle)return kIOReturnBadArgument;*handle=0;result_={};
     if(!attached_ || poisoned_)return kIOReturnNotReady;
     PhaseClock clock;
+    sync();   /* the new mapping is classified in the mode the others are in */
     const unsigned cls=aliasClass(permissions,writeback,shareability)&15;
     /* Room for the new spans' table transaction and their alias index. */
     if(memory && memory->spanCount() && !growScratch(memory->spanCount()))return kIOReturnNoResources;
@@ -320,6 +356,8 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t 
     if(!record) {memory->quarantine();return fail(ArmSmmu4KStateMismatch);}
     *record={memory,0,iova,memory->spanCount(),0,permissions,writeback,shareability,0,upper};++objects_;
     if(coherentMapping(writeback))native_adreno_coherent_skips[0]=native_adreno_coherent_skips[0]+1;
+    /* A synchronized buffer was cleaned by whoever stored into it: one more table that maps it finds no line to write back. */
+    else if(memory->synchronized() && synchronizedTrusted())native_adreno_sync_skips[0]=native_adreno_sync_skips[0]+1;
     else {
         checked=memory->publishForDevice(0,memory->bytes(),permissions&ArmSmmu4KWrite,distrust_write_combined_);
         if(checked)return fail(ArmSmmu4KIoError);
@@ -350,6 +388,7 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t 
     if(status)return fail(status);
     clock.lap(0,3);
     insert(record);record->mapped_spans=spans;result_.completed_spans=spans;
+    enlist(record);
     if(memory->imported())import_spans_[cls]+=spans;
     clock.lap(0,4);clock.done(0,memory->bytes());
     {
@@ -374,6 +413,10 @@ IOReturn NativeAdrenoVm::unmap(uint64_t handle)
     clock.lap(1,1);
     const unsigned upper=record->upper;
     if(coherentMapping(record->writeback))native_adreno_coherent_skips[1]=native_adreno_coherent_skips[1]+1;
+    /* Whoever reads what the GPU wrote into a synchronized buffer invalidates first, or reads through a non-cacheable view. */
+    else if(record->memory->synchronized() && synchronizedTrusted()) {
+        if(record->permissions&ArmSmmu4KWrite)native_adreno_sync_skips[1]=native_adreno_sync_skips[1]+1;
+    }
     else if(record->permissions&ArmSmmu4KWrite) {
         if(record->memory->acquireDeviceWrites(0,record->memory->bytes())!=kIOReturnSuccess)
             return fail(ArmSmmu4KIoError);
@@ -396,6 +439,7 @@ IOReturn NativeAdrenoVm::unmap(uint64_t handle)
     if(status)return fail(status);
     clock.lap(1,3);
     if(!erase(record))return fail(ArmSmmu4KStateMismatch);
+    delist(record);
     record->mapped_spans=0;result_.completed_spans=spans;
     native_adreno_trace_stage=14;
     clock.lap(1,4);
@@ -436,26 +480,109 @@ IOReturn NativeAdrenoVm::invalidateTlb()
         ArmSmmu4KInvalidateAllOwnedContext(&io_,streams_->bank,context_,budget_,&r);
     return status?fail(status):kIOReturnSuccess;
 }
+/* The mode the mappings were classified in: IO coherence, the two trusts and gpu-maint-all decide which mappings a pass has work for. */
+uint32_t NativeAdrenoVm::mode() const
+{
+    return (native_adreno_io_coherent?1u:0u)|(distrust_write_combined_?2u:0u)|(native_adreno_sync_audit[4]?4u:0u)|(maintainAll()?8u:0u);
+}
+void NativeAdrenoVm::enlist(Mapping *m)
+{
+    const NativeAdrenoMemory *memory=m->memory;
+    const bool coherent=coherentMapping(m->writeback) || importedUntouched(memory);
+    const bool written=memory->imported() && (m->permissions&ArmSmmu4KWrite);
+    unsigned work=0;
+    /* As publishMapped, acquireImported and reassertWriteCombined decide for one mapping. */
+    if(!coherent && memory->holdsCpuLines(distrust_write_combined_) && !(memory->synchronized() && synchronizedTrusted()))work|=WorkSubmit;
+    if(written && !coherent && memory->holdsCpuLines(false))work|=WorkComplete;
+    if(memory->reassertable())work|=WorkReassert;
+    m->kind=(uint8_t)kindOf(memory,m->permissions);
+    ++kind_count_[m->kind];
+    if(work&WorkSubmit)++kind_work_[m->kind];
+    if(coherent) {++submit_skips_;work|=CountedCoherent;}
+    if(coherent && written) {++complete_skips_;work|=CountedCoherentWrite;}
+    m->work=(uint8_t)work;m->care=UINT32_MAX;
+    if(work&WorkAny) {m->care=(uint32_t)care_count_;care_[care_count_++]=(uint32_t)(m-mappings_);}
+}
+void NativeAdrenoVm::delist(Mapping *m)
+{
+    --kind_count_[m->kind];
+    if(m->work&WorkSubmit)--kind_work_[m->kind];
+    if(m->work&CountedCoherent)--submit_skips_;
+    if(m->work&CountedCoherentWrite)--complete_skips_;
+    if(m->care!=UINT32_MAX) {
+        /* The last entry takes its place. */
+        const uint32_t moved=care_[--care_count_];
+        care_[m->care]=moved;mappings_[moved].care=m->care;
+    }
+    m->care=UINT32_MAX;m->work=0;
+}
+void NativeAdrenoVm::sync()
+{
+    const uint32_t now=mode();
+    if(now==mode_)return;
+    mode_=now;
+    care_count_=0;memset(kind_count_,0,sizeof(kind_count_));memset(kind_work_,0,sizeof(kind_work_));
+    submit_skips_=complete_skips_=0;
+    for(size_t i=0;mappings_ && i<high_;++i)if(mappings_[i].memory && mappings_[i].mapped_spans)enlist(&mappings_[i]);
+    native_adreno_maint_walk[5]=native_adreno_maint_walk[5]+1;
+}
 IOReturn NativeAdrenoVm::publishMapped()
 {
     if(!attached_ || poisoned_)return kIOReturnNotReady;
-    for(size_t i=0;i<high_;++i) {
-        const Mapping &m=mappings_[i];
-        if(!m.memory)continue;
-        if(coherentMapping(m.writeback) || importedUntouched(m.memory)) {native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+1;continue;}
-        if(m.memory->publishForDevice(0,m.memory->bytes(),true,distrust_write_combined_,NativeAdrenoPhaseSubmit))return fail(ArmSmmu4KIoError);
+    sync();
+    native_adreno_maint_walk[0]=native_adreno_maint_walk[0]+1;
+    native_adreno_maint_walk[2]=native_adreno_maint_walk[2]+objects_;
+    if(maintainAll()) {
+        /* gpu-maint-all: every mapping is visited. */
+        native_adreno_maint_walk[1]=native_adreno_maint_walk[1]+high_;
+        for(size_t i=0;i<high_;++i) {
+            const Mapping &m=mappings_[i];
+            if(!m.memory)continue;
+            if(coherentMapping(m.writeback) || importedUntouched(m.memory)) {
+                native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+1;
+                native_adreno_maint_kind[m.kind][2]=native_adreno_maint_kind[m.kind][2]+1;continue;
+            }
+            if(!m.memory->holdsCpuLines(distrust_write_combined_)) {native_adreno_maint_kind[m.kind][2]=native_adreno_maint_kind[m.kind][2]+1;continue;}
+            if(m.memory->publishForDevice(0,m.memory->bytes(),true,distrust_write_combined_,NativeAdrenoPhaseSubmit))return fail(ArmSmmu4KIoError);
+            noteKind(m.kind,m.memory->bytes());
+        }
+        return kIOReturnSuccess;
     }
+    native_adreno_maint_walk[1]=native_adreno_maint_walk[1]+care_count_;
+    for(size_t i=0;i<care_count_;++i) {
+        const Mapping &m=mappings_[care_[i]];
+        if(!(m.work&WorkSubmit))continue;
+        if(m.memory->publishForDevice(0,m.memory->bytes(),true,distrust_write_combined_,NativeAdrenoPhaseSubmit))return fail(ArmSmmu4KIoError);
+        noteKind(m.kind,m.memory->bytes());
+    }
+    /* What the pass left alone, counted without a visit. */
+    native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+(uint32_t)submit_skips_;
+    for(unsigned k=0;k<NativeAdrenoKindCount;++k)
+        native_adreno_maint_kind[k][2]=native_adreno_maint_kind[k][2]+(kind_count_[k]-kind_work_[k]);
     return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoVm::acquireImported()
 {
     if(!attached_ || poisoned_)return kIOReturnNotReady;
-    for(size_t i=0;i<high_;++i) {
-        const Mapping &m=mappings_[i];
-        if(!m.memory || !m.memory->imported() || !(m.permissions&ArmSmmu4KWrite))continue;
-        if(coherentMapping(m.writeback) || importedUntouched(m.memory)) {native_adreno_coherent_skips[3]=native_adreno_coherent_skips[3]+1;continue;}
+    sync();
+    native_adreno_maint_walk[3]=native_adreno_maint_walk[3]+1;
+    if(maintainAll()) {
+        native_adreno_maint_walk[4]=native_adreno_maint_walk[4]+high_;
+        for(size_t i=0;i<high_;++i) {
+            const Mapping &m=mappings_[i];
+            if(!m.memory || !m.memory->imported() || !(m.permissions&ArmSmmu4KWrite))continue;
+            if(coherentMapping(m.writeback) || importedUntouched(m.memory)) {native_adreno_coherent_skips[3]=native_adreno_coherent_skips[3]+1;continue;}
+            if(m.memory->acquireDeviceWrites(0,m.memory->bytes(),NativeAdrenoPhaseComplete))return fail(ArmSmmu4KIoError);
+        }
+        return kIOReturnSuccess;
+    }
+    native_adreno_maint_walk[4]=native_adreno_maint_walk[4]+care_count_;
+    for(size_t i=0;i<care_count_;++i) {
+        const Mapping &m=mappings_[care_[i]];
+        if(!(m.work&WorkComplete))continue;
         if(m.memory->acquireDeviceWrites(0,m.memory->bytes(),NativeAdrenoPhaseComplete))return fail(ArmSmmu4KIoError);
     }
+    native_adreno_coherent_skips[3]=native_adreno_coherent_skips[3]+(uint32_t)complete_skips_;
     return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoVm::sampleWord(uint64_t iova,uint32_t *cached,uint32_t *dram) const
@@ -487,11 +614,77 @@ IOReturn NativeAdrenoVm::reassertWriteCombined(uint32_t *reset) const
 {
     if(!reset)return kIOReturnBadArgument;
     if(!attached_ || poisoned_)return kIOReturnNotReady;
-    for(size_t i=0;i<high_;++i) {
-        const Mapping &m=mappings_[i];
-        if(!m.memory)continue;
+    if(maintainAll()) {
+        native_adreno_maint_walk[6]=native_adreno_maint_walk[6]+high_;
+        for(size_t i=0;i<high_;++i) {
+            const Mapping &m=mappings_[i];
+            if(!m.memory)continue;
+            const IOReturn status=m.memory->reassertWriteCombined(reset);
+            if(status)return status;
+        }
+        return kIOReturnSuccess;
+    }
+    /* Whether a mapping's pages can lose the attribute does not depend on the mode: every such mapping is in the list. */
+    native_adreno_maint_walk[6]=native_adreno_maint_walk[6]+care_count_;
+    for(size_t i=0;i<care_count_;++i) {
+        const Mapping &m=mappings_[care_[i]];
+        if(!(m.work&WorkReassert))continue;
         const IOReturn status=m.memory->reassertWriteCombined(reset);
         if(status)return status;
+    }
+    return kIOReturnSuccess;
+}
+/* The page of memory that holds offset: its physical address and how many bytes of the span follow it. */
+static bool physicalAt(const NativeAdrenoMemory &memory,size_t offset,uint64_t *physical,size_t *run)
+{
+    for(size_t j=0;j<memory.spanCount();++j) {
+        const auto &span=memory.spans()[j];
+        if(offset<span.offset || offset-span.offset>=span.bytes)continue;
+        *physical=span.physical+(offset-span.offset);*run=(size_t)(span.bytes-(offset-span.offset));
+        return true;
+    }
+    return false;
+}
+IOReturn NativeAdrenoVm::auditSynchronized(uint32_t *lines,uint32_t *dirty,uint32_t *stale) const
+{
+    if(!lines || !dirty || !stale)return kIOReturnBadArgument;
+    if(!attached_ || poisoned_)return kIOReturnNotReady;
+    if(!native_adreno_line_audit)return kIOReturnUnsupported;
+    for(size_t i=0;i<high_;++i) {
+        const Mapping &m=mappings_[i];
+        if(!m.memory || !m.mapped_spans || !m.memory->synchronized())continue;
+        const size_t end=m.memory->bytes()<32768?m.memory->bytes():32768;
+        for(size_t at=0;at<end;at+=4096) {
+            uint64_t physical=0;size_t run=0;
+            if(!physicalAt(*m.memory,at,&physical,&run))return kIOReturnBadArgument;
+            if(native_adreno_line_audit(physical,4096,dirty,stale))return kIOReturnIOError;
+            *lines+=64;
+            /* The comparison loaded the page's lines through the cacheable aperture: none stays, so a later reader of that aperture
+             * does not take a copy from now for what DRAM holds then. */
+            const IOReturn dropped=NativeAdrenoMaintainPhysicalPages(physical,4096,NativeAdrenoCleanInvalidate);
+            NativeAdrenoNotePhase(NativeAdrenoPhaseDiagnostic,4096);
+            if(dropped)return dropped;
+        }
+    }
+    return kIOReturnSuccess;
+}
+IOReturn NativeAdrenoVm::headWords(uint64_t handle,uint64_t iova,uint32_t *out,size_t count) const
+{
+    if(!out || !attached_ || poisoned_)return kIOReturnBadArgument;
+    for(size_t k=0;k<count;++k)out[k]=0;
+    const Mapping *m=find(handle);
+    if(!m || iova<m->iova || iova-m->iova>=m->memory->bytes() || (iova&3))return kIOReturnBadArgument;
+    const size_t offset=(size_t)(iova-m->iova),bytes=m->memory->bytes();
+    if(m->memory->mapping()) {
+        for(size_t k=0;k<count && offset+4*k+4<=bytes;++k)out[k]=static_cast<const volatile uint32_t *>(m->memory->mapping())[offset/4+k];
+        return kIOReturnSuccess;
+    }
+    int (*const read)(uint64_t,uint32_t *)=native_adreno_cached_read32?native_adreno_cached_read32:native_adreno_dram_read32;
+    if(!read)return kIOReturnUnsupported;
+    uint64_t physical=0;size_t run=0;
+    for(size_t k=0;k<count && offset+4*k+4<=bytes;++k,physical+=4,run-=4) {
+        if(run<4 && !physicalAt(*m->memory,offset+4*k,&physical,&run))return kIOReturnBadArgument;
+        if(read(physical,&out[k]))return kIOReturnUnsupported;
     }
     return kIOReturnSuccess;
 }

@@ -366,6 +366,15 @@ IOReturn NativeAdrenoMemory::makeWriteCombined()
     if(status)return status;
     write_combined_=true;return kIOReturnSuccess;
 }
+IOReturn NativeAdrenoMemory::declareSynchronized()
+{
+    if(!descriptor_ || system_ || imported_ || borrowed_ || !prepared_ || quarantined_ || device_references_ || !mapping_ || !span_count_)
+        return kIOReturnNotReady;
+    const IOReturn status=NativeAdrenoMaintainOwnedPages(mapping_,bytes_,NativeAdrenoCleanInvalidate);
+    if(status)return status;
+    NativeAdrenoNotePhase(NativeAdrenoPhaseAllocate,bytes_);
+    synchronized_=true;return kIOReturnSuccess;
+}
 /* Frees of an owned BO whose first pages a user task still maps: [0] count, [1] the last mapping's page number. */
 extern "C" {volatile uint32_t native_adreno_free_user_mapped[2];}
 extern "C" unsigned int native_pmap_user_mappings(ppnum_t,void **,uint64_t *,char *) __attribute__((weak_import));
@@ -419,7 +428,7 @@ IOReturn NativeAdrenoMemory::release()
     if(import_noted_) {noteImport(-(int64_t)bytes_,owner_pid_);import_noted_=false;}
     if(borrowed_) {borrowed_=false;prepared_=false;}
     if(spans_)IODeleteData(spans_,NativeAdrenoPhysicalSpan,span_capacity_);
-    mapping_=nullptr;spans_=nullptr;bytes_=span_count_=span_capacity_=0;read_only_=false;owner_uncached_=false;
+    mapping_=nullptr;spans_=nullptr;bytes_=span_count_=span_capacity_=0;read_only_=false;owner_uncached_=false;synchronized_=false;
     return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoMemory::releaseSystemInto(NativeAdrenoSystemPages *out)
@@ -447,10 +456,9 @@ IOReturn NativeAdrenoMemory::publishForDevice(size_t offset,size_t bytes,bool wr
     if(!backed() || !prepared_ || quarantined_)return kIOReturnNotReady;
     if(!bytes || ((offset|bytes)&4095) || offset>bytes_ || bytes>bytes_-offset)return kIOReturnBadArgument;
     /* Pages every CPU mapping holds non-cacheable carry no line to clean. */
-    if(imported_ && owner_uncached_)return kIOReturnSuccess;
+    if(!holdsCpuLines(include_write_combined))return kIOReturnSuccess;
     if(imported_) {NativeAdrenoNotePhase(phase,bytes);return maintainImported(offset,bytes,writes?NativeAdrenoCleanInvalidate:NativeAdrenoClean);}
     if(write_combined_) {  /* no CPU mapping should cache these pages; if one does, reach its lines through the physical pages */
-        if(!include_write_combined)return kIOReturnSuccess;
         NativeAdrenoNotePhase(phase,bytes);
         return maintainImported(offset,bytes,writes?NativeAdrenoCleanInvalidate:NativeAdrenoClean);
     }

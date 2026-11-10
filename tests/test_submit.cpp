@@ -108,6 +108,8 @@ static int exposed(Path &p,bool write_combined=false)
     return p.submit.attach(&p.vm,&p.ring);
 }
 void NativeAdrenoNotePhase(unsigned,size_t) {}
+extern "C" {extern volatile uint32_t native_adreno_submit_ibs[4],native_adreno_diag,native_adreno_ib_log[4][4+28],native_adreno_ib_log_count;
+    extern volatile uint64_t native_adreno_submit_us[8];}
 int main()
 {
     /* One validated indirect-buffer submission with exact ring bytes. */
@@ -382,6 +384,68 @@ int main()
         CHECK(switched && pauses<=8 && p.submit.preemptStats().triggers==1 && p.submit.preemptStats().completed==1);
         CHECK(p.submit.retireCompleted()==0 && p.submit.outstanding()==0);
         std::puts("PASS a pausing wait drives the ring switch for a low-ring job");
+    }
+    /* The driver's own synchronized buffers at a submission: not cleaned, and audited by the first 8 submissions and every 1024th. A
+     * dirty line the audit finds ends the trust: that submission and every later one clean them again, and the audits stop. */
+    {
+        Path p;CHECK(exposed(p)==kIOReturnSuccess);
+        NativeAdrenoMemory driver;
+        CHECK(driver.allocate(8192,40,true,8192)==kIOReturnSuccess && driver.declareSynchronized()==kIOReturnSuccess);
+        uint64_t mapped=0;
+        CHECK(p.vm.map(&driver,0,0x804000,3,0,2,&mapped)==kIOReturnSuccess);
+        NativeAdrenoSubmitBuffer buffer{p.handle,0x800000,4096};
+        static uint64_t dirty_page;static unsigned pages;dirty_page=0;pages=0;
+        native_adreno_line_audit=[](uint64_t physical,size_t bytes,uint32_t *dirty,uint32_t *) {
+            CHECK(bytes==4096);++pages;if(physical==dirty_page)*dirty+=1;return 0;};
+        native_adreno_submit_ibs[0]=0;native_adreno_sync_audit[4]=0;
+        const uint32_t audits=native_adreno_sync_audit[0],lines=native_adreno_sync_audit[1];
+        uint32_t fence=0,n=0;
+        auto run=[&](unsigned owned) {
+            const unsigned before=fixture.cache_calls;
+            CHECK(p.submit.submit(&buffer,1,0,&fence)==kIOReturnSuccess && fence==++n);
+            CHECK(fixture.cache_calls==before+owned);
+            fencemem[1]=n;CHECK(p.submit.wait(n,&ringclock,1000)==kIOReturnSuccess);
+        };
+        const unsigned physical=fixture.physical_calls;
+        for(unsigned i=0;i<10;++i)run(1);   /* the IB's own buffer alone (kernel memory nobody declared) */
+        CHECK(pages==16 && native_adreno_sync_audit[0]==audits+8 && native_adreno_sync_audit[1]==lines+8*128);
+        CHECK(fixture.physical_calls==physical+16);   /* each audited page's lines dropped again */
+        native_adreno_submit_ibs[0]=1023;run(1);
+        CHECK(pages==18 && native_adreno_sync_audit[0]==audits+9 && !native_adreno_sync_audit[4]);
+        native_adreno_submit_ibs[0]=2047;dirty_page=driver.spans()[0].physical+4096;
+        run(2);   /* found dirty: cleaned from this submission on */
+        CHECK(pages==20 && native_adreno_sync_audit[2]==1 && native_adreno_sync_audit[4]==native_adreno_sync_audit[0]);
+        native_adreno_submit_ibs[0]=3071;run(2);
+        CHECK(pages==20);
+        native_adreno_line_audit=nullptr;native_adreno_sync_audit[4]=0;native_adreno_sync_audit[2]=0;
+        run(1);   /* trusted again (the host's reset): left alone */
+        CHECK(p.vm.unmap(mapped)==kIOReturnSuccess && driver.release()==kIOReturnSuccess);
+        CHECK(p.submit.detach()==kIOReturnSuccess);
+        std::puts("PASS synchronized driver buffers at a submission, their audit and its distrust");
+    }
+    /* The submission log keeps the IB's address and size always and reads its words only with diag=1; the phases of a submission with
+     * a clock are timed. */
+    {
+        Path p;CHECK(exposed(p)==kIOReturnSuccess);
+        NativeAdrenoSubmitBuffer buffer{p.handle,0x800000,4096};
+        static_cast<volatile uint32_t *>(p.object.mapping())[0]=0x70970001u;
+        uint32_t fence=0;
+        native_adreno_diag=0;
+        CHECK(p.submit.submit(&buffer,1,0,&fence)==kIOReturnSuccess && fence==1);
+        const volatile uint32_t *row=native_adreno_ib_log[(native_adreno_ib_log_count-1)&3];
+        CHECK(row[0]==1 && row[1]==0x800000 && row[3]==4096 && row[4]==0);
+        fencemem[1]=1;CHECK(p.submit.wait(1,&ringclock,1000)==kIOReturnSuccess);
+        native_adreno_diag=1;
+        const uint64_t timed=native_adreno_submit_us[0],total=native_adreno_submit_us[6];
+        clock_us=50;
+        CHECK(p.submit.submit(&p.vm,&buffer,1,0,&fence,&ringclock)==kIOReturnSuccess && fence==2);
+        row=native_adreno_ib_log[(native_adreno_ib_log_count-1)&3];
+        CHECK(row[0]==2 && row[4]==0x70970001u);
+        CHECK(native_adreno_submit_us[0]==timed+1 && native_adreno_submit_us[6]==total);   /* the host's clock stands still */
+        native_adreno_diag=0;
+        fencemem[1]=2;CHECK(p.submit.wait(2,&ringclock,1000)==kIOReturnSuccess);
+        CHECK(p.submit.detach()==kIOReturnSuccess);
+        std::puts("PASS the submission log without and with diag=1, and the timed phases");
     }
     std::printf("PASS: 1 execbuf submission with exact IB packet and fence, 8 pre-reference refusals, 1 duplicate-buffer reference case and 1 poisoned-commit retention case over software SMMU/CP peers; 2 write-combine audit cases (trusted, dirty and failed); 1 hangcheck and 1 recovery with replay, 1 usable VM after recovery and 1 failed restart\n");
 }
