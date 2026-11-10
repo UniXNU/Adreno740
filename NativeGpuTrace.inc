@@ -13,7 +13,7 @@ static uint32_t gpuMetadataBusy;
 static void gpuTraceInit()
 {
     unsigned enabled=0;
-    PE_parse_boot_argn("sheng-gpu-trace",&enabled,sizeof(enabled));
+    PE_parse_boot_argn("gpu-trace",&enabled,sizeof(enabled));
     if(enabled!=1)return;
     gpuTrace.slots=static_cast<NativeGpuTraceSlot *>(IOMallocZero(sizeof(NativeGpuTraceSlot)*NativeGpuTraceCapacity));
     if(!gpuTrace.slots)return;
