@@ -34,6 +34,10 @@ bool NativeAdrenoPagesUncached(const NativeAdrenoPhysicalSpan *,size_t count);
 enum NativeAdrenoMaintenancePhase {NativeAdrenoPhaseUnused,NativeAdrenoPhaseAllocate,NativeAdrenoPhaseMap,NativeAdrenoPhaseSubmit,
     NativeAdrenoPhaseUnmap,NativeAdrenoPhaseComplete,NativeAdrenoPhaseTable,NativeAdrenoPhaseDiagnostic};
 void NativeAdrenoNotePhase(unsigned phase,size_t bytes);
+/* One holder's change in a table of 24 rows {pid, live KiB, live objects, peak KiB} (native_adreno_bo_owners and the tables shaped like
+ * it): bytes > 0 adds an object of that size to pid's row, bytes < 0 takes one away. The 24 largest holders are kept; a process that
+ * holds nothing gives its row up. The caller holds the driver's lock. */
+void NativeAdrenoNoteHolder(volatile uint32_t (*table)[4],int32_t pid,int64_t bytes);
 
 /* Native XNU backing store, not a Metal device or user ABI. No IOMMU mapper,
  * Linux fd/ioctl, hardware address, guessed PA or implicit destructor cleanup.
@@ -52,8 +56,9 @@ class NativeAdrenoMemory final {
     NativeAdrenoPhysicalSpan *spans_=nullptr;
     size_t bytes_=0,span_count_=0,span_capacity_=0;
     uint32_t device_references_=0;
-    int32_t owner_pid_=0;   /* the process that allocated a system BO, for the holders' table */
+    int32_t owner_pid_=0;   /* the process that allocated a system BO or made an import, for the holders' tables */
     bool prepared_=false,quarantined_=false,write_combined_=false,system_=false,borrowed_=false,owned_=false;
+    bool import_noted_=false;   /* an import counted in native_adreno_import_memory until release() */
     IOReturn takeSegments(IOBufferMemoryDescriptor *,size_t bytes,uint64_t limit,bool contiguous);
     IOReturn maintainImported(size_t offset,size_t bytes,NativeAdrenoCacheOperation);
 public:

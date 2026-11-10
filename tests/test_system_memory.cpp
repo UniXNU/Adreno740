@@ -6,6 +6,9 @@
 #include <cstdio>
 #define CHECK(x) do {if(!(x)){std::fprintf(stderr,"line %d: %s\n",__LINE__,#x);std::exit(1);}}while(0)
 extern "C" volatile uint32_t native_adreno_bo_memory[8];
+extern "C" volatile uint32_t native_adreno_bo_owners[24][4],native_adreno_import_memory[4],native_adreno_import_owners[24][4];
+static int self_pid=7;
+extern "C" int proc_selfpid() {return self_pid;}
 static unsigned attribute_calls,physical_calls;
 IOReturn NativeAdrenoQueryCpu4K(NativeAdrenoCpuState *out) {CHECK(out);*out={};return kIOReturnSuccess;}
 IOReturn NativeAdrenoMaintainOwnedPages(void *mapping,size_t bytes,NativeAdrenoCacheOperation)
@@ -66,6 +69,31 @@ int main()
     CHECK(!g.allocateSystem(128u<<10,40,128u<<10,true,&pages) && pages.descriptor && fixture.prepared==prepared+3);
     NativeAdrenoMemory::discardSystem(&pages);
     CHECK(!pages.descriptor && !f.release() && !g.release() && fixture.live.empty());
-    std::puts("PASS: system BOs: no task, no kernel mapping, write-combined entry, pressure, owned-page map, release, prepared pages");
+    /* Holders: every system BO above was pid 7's and is released, so its row holds nothing but the peak since it last held none
+     * (f and g together). */
+    CHECK(native_adreno_bo_owners[0][0]==7 && native_adreno_bo_owners[0][1]==0 && native_adreno_bo_owners[0][2]==0 &&
+          native_adreno_bo_owners[0][3]==192);
+    /* Imports: the bytes they keep wired, in all and by importing process, until each is released; a refused import counts nowhere. */
+    NativeAdrenoMemory i1,i2,i3,i4;
+    void *const task=reinterpret_cast<void *>(2);
+    CHECK(!i1.importTask(task,0x10000000,1u<<20,40,1u<<30) && i1.imported());
+    self_pid=9;
+    CHECK(!i2.importTask(task,0x20000000,3u<<20,40,1u<<30));
+    CHECK(native_adreno_import_memory[0]==2 && native_adreno_import_memory[1]==(4u<<10) && native_adreno_import_memory[2]==(4u<<10) &&
+          native_adreno_import_memory[3]==2);
+    CHECK(native_adreno_import_owners[0][0]==7 && native_adreno_import_owners[0][1]==(1u<<10) && native_adreno_import_owners[0][2]==1);
+    CHECK(native_adreno_import_owners[1][0]==9 && native_adreno_import_owners[1][1]==(3u<<10) && native_adreno_import_owners[1][2]==1);
+    fixture.prepare_fail=true;
+    CHECK(i3.importTask(task,0x30000000,1u<<20,40,1u<<30)==kIOReturnIOError && native_adreno_import_memory[0]==2 &&
+          native_adreno_import_memory[3]==2);
+    fixture.prepare_fail=false;
+    CHECK(i4.importTask(task,0x40000000,2u<<20,40,1u<<20)==kIOReturnNoResources && native_adreno_import_memory[1]==(4u<<10));
+    self_pid=1;   /* the release may run in any process: the row is the importer's */
+    CHECK(!i2.release() && native_adreno_import_memory[0]==1 && native_adreno_import_memory[1]==(1u<<10) &&
+          native_adreno_import_memory[2]==(4u<<10));
+    CHECK(native_adreno_import_owners[1][1]==0 && native_adreno_import_owners[1][2]==0 && native_adreno_import_owners[1][3]==(3u<<10));
+    CHECK(!i1.release() && native_adreno_import_memory[0]==0 && native_adreno_import_memory[1]==0 && native_adreno_import_owners[0][2]==0);
+    CHECK(fixture.imports_live==0);
+    std::puts("PASS: system BOs: no task, no kernel mapping, write-combined entry, pressure, owned-page map, release, prepared pages, holders and import accounting");
     return 0;
 }
