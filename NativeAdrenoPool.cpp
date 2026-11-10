@@ -4,7 +4,7 @@
 extern "C" boolean_t PE_parse_boot_argn(const char *,void *,int);
 extern "C" uint64_t gPhysBase,gPhysSize;   /* the kernel's own DRAM: what phystokv covers and the VM manages */
 extern "C" {volatile uint32_t native_adreno_pool_state[12]={0,0,0,0,0,0,0,0,0,0,~0u,0},native_adreno_pool_fallbacks[8];
-    volatile uint64_t native_adreno_pool_zero[4];}
+    volatile uint64_t native_adreno_pool_zero[4];volatile uint32_t native_adreno_pool_views[5];}
 namespace {
 /* One registered range: a bit a page in `used` (taken by a grant) and in `viewed` (free now, but a client could map it while it was
  * taken: its cache lines are dropped before it is zero-filled again). Ranges are appended under the gate and never removed. */
@@ -287,20 +287,33 @@ void NativeAdrenoPoolRelease(NativeAdrenoPoolGrant *grant)
      * then), but a copy of such a mapping made in the VM (mach_vm_remap, a memory entry) keeps the view's VM object, and nothing here
      * can see or revoke it. Such pages stay out of the pool unless the board chose gpu-pool=2. */
     const bool viewed=__atomic_load_n(&grant->viewed,__ATOMIC_RELAXED)!=0;
-    if(__atomic_load_n(&grant->retired,__ATOMIC_RELAXED) || (viewed && !recyclesViewed())) {
+    const bool untracked=__atomic_load_n(&grant->untracked,__ATOMIC_RELAXED)!=0;
+    /* Every reference is gone: the BO's, and each view's, a tracked view's only once the kernel reported that nothing maps it. */
+    if(__atomic_load_n(&grant->retired,__ATOMIC_RELAXED) || (untracked && !recyclesViewed())) {
         retiredPages+=pages;
         native_adreno_pool_state[8]=native_adreno_pool_state[8]+1;native_adreno_pool_state[9]=kib(retiredPages);
     } else {
         giveBack(grant,viewed);
         native_adreno_pool_state[7]=native_adreno_pool_state[7]+1;
+        if(viewed && !untracked)native_adreno_pool_views[3]=native_adreno_pool_views[3]+1;
         noteFree();
     }
     IOLockUnlock(poolGate);
     IOFree(grant,grantBytes(grant->capacity));
 }
-void NativeAdrenoPoolNoteView(NativeAdrenoPoolGrant *grant)
+void NativeAdrenoPoolNoteView(NativeAdrenoPoolGrant *grant,bool tracked)
 {
-    if(grant)__atomic_store_n(&grant->viewed,(uint8_t)1,__ATOMIC_RELAXED);
+    if(!grant)return;
+    __atomic_store_n(&grant->viewed,(uint8_t)1,__ATOMIC_RELAXED);
+    if(!tracked)__atomic_store_n(&grant->untracked,(uint8_t)1,__ATOMIC_RELAXED);
+    __atomic_fetch_add(&native_adreno_pool_views[tracked?0:1],1,__ATOMIC_RELAXED);
+}
+extern "C" void NativeAdrenoPoolViewClosed(void *grant)
+{
+    /* From the descriptor's free or from the VM's teardown of the last mapping, possibly under IOKit's memory lock: the release takes
+     * only the allocator's gate (a leaf) and frees the grant's own memory. */
+    __atomic_fetch_add(&native_adreno_pool_views[2],1,__ATOMIC_RELAXED);
+    NativeAdrenoPoolRelease(static_cast<NativeAdrenoPoolGrant *>(grant));
 }
 void NativeAdrenoPoolRetire(NativeAdrenoPoolGrant *grant)
 {
