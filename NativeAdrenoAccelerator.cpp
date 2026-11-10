@@ -13,7 +13,7 @@ extern "C" IOReturn native_adreno_new_user_client(IOService *,task_t,void *,UInt
 extern "C" boolean_t PE_parse_boot_argn(const char *,void *,int);
 extern "C" void native_adreno_note_property_read(const char *);
 
-class AGXAccelerator : public IOAcceleratorES {
+class AGXAccelerator : public NATIVE_ACCELERATOR_BASE {
     OSDeclareDefaultStructors(AGXAccelerator)
 public:
     IOReturn newUserClient(task_t owningTask,void *securityID,UInt32 type,OSDictionary *properties,
@@ -22,7 +22,7 @@ public:
     OSObject *copyProperty(const OSString *key) const APPLE_KEXT_OVERRIDE;
     OSObject *copyProperty(const char *key) const APPLE_KEXT_OVERRIDE;
 };
-OSDefineMetaClassAndStructors(AGXAccelerator,IOAcceleratorES)
+OSDefineMetaClassAndStructors(AGXAccelerator,NATIVE_ACCELERATOR_BASE)
 
 IOReturn AGXAccelerator::newUserClient(task_t owningTask,void *securityID,UInt32 type,OSDictionary *properties,
     IOUserClient **handler)
