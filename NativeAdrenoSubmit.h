@@ -131,6 +131,10 @@ private:
      * through it. */
     NativeAdrenoRing *ring(unsigned index=0) {return index<ring_count_?rings_[index]:ring_;}
     void driveSwitch(const NativeAdrenoRingClock *clock);
+    /* The ring's wait for wait(): held, a fence a job holds (NativeAdrenoRing::wait), otherwise an earlier one (observeFence). With
+     * two rings a wait that pauses drives the switch between them after every pause. */
+    NativeAdrenoRingFence waitOnRing(NativeAdrenoRing *r,bool held,uint32_t fence,const NativeAdrenoRingClock *clock,
+        uint32_t timeout_us,uint32_t *observed);
     NativeAdrenoSubmitStats stats_{};
     void noteStall(uint32_t observed,const NativeAdrenoRingClock *clock);   /* the CP's state for a fence that stopped advancing (native_adreno_stall) */
     bool attached_=false,poisoned_=false;
