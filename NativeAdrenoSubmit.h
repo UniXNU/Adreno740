@@ -136,7 +136,8 @@ private:
     NativeAdrenoRingFence waitOnRing(NativeAdrenoRing *r,bool held,uint32_t fence,const NativeAdrenoRingClock *clock,
         uint32_t timeout_us,uint32_t *observed);
     NativeAdrenoSubmitStats stats_{};
-    void noteStall(uint32_t observed,const NativeAdrenoRingClock *clock);   /* the CP's state for a fence that stopped advancing (native_adreno_stall) */
+    /* The CP's state for a fence that stopped advancing (native_adreno_stall); waited is the fence the timed-out wait was for. */
+    void noteStall(uint32_t observed,const NativeAdrenoRingClock *clock,uint32_t waited);
     bool attached_=false,poisoned_=false;
     uint32_t audit_tick_=0;   /* submissions since attach; every eighth one audits its IB lines */
     /* submit()'s distinct buffers and ring words: too large for the kernel stack at 128 IBs (callers serialize every method) */
