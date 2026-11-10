@@ -31,6 +31,14 @@ extern "C" {volatile uint32_t native_adreno_fence_wait[8];}
  * The last 4: the map handle that was next when the stalled job was submitted, then the handles of the mappings under the BR IB1, the BV IB1
  * and the BV IB2 (0: unmapped). A handle at or above the first was mapped after the submission: its memory was freed and reused under the GPU. */
 extern "C" {volatile uint32_t native_adreno_stall[2+NativeAdrenoRingStallWords];volatile uint32_t native_adreno_stall_mem[4+3*17+4];}
+/* Which ring that snapshot is about, taken with it. The registers of native_adreno_stall are those of the ring the CP runs, and the
+ * fence it names is the one after the waited ring's last written fence, which with two rings can be a fence of the other ring or one
+ * already retired: [0] the fence the snapshot names, [1] the fence the timed-out wait was for, [2] that fence's ring (0 high, 1 low),
+ * [3] the ring the CP runs, [4] a ring switch in flight, [5] jobs the CP has not finished on ring 0 and [6] on ring 1, [7] whether [0]
+ * has a job (bit 0), that job's ring << 8 and its priority + 1 << 16, [8] us since the waited fence's job was submitted (0: no job or
+ * no clock), [9] us the snapshot's fence had been pending. A waited fence on a ring the CP does not run, with the other ring busy or
+ * idle, is a job waiting for the switch, not a CP that stopped. */
+extern "C" {volatile uint32_t native_adreno_stall_ring[10];}
 /* 16 words of the IB at start, from 12 dwords before the dword the thread has reached (size minus what remains). */
 static void peekIb(const NativeAdrenoVm *vm,uint64_t start,uint32_t size,uint32_t remaining,volatile uint32_t *slot)
 {
@@ -568,7 +576,7 @@ static bool snapshot_due(uint32_t *taken,uint64_t pending)
     if(want<=*taken)return false;
     *taken=want;return true;
 }
-void NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingClock *clock)
+void NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingClock *clock,uint32_t waited)
 {
     const uint32_t next=observed+1;   /* the fence the CP is working on */
     const uint64_t now=clock && clock->now_us?clock->now_us(clock->cookie):0;
@@ -647,6 +655,23 @@ void NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingClock
         native_adreno_stall_mem[57]=(uint32_t)space->handleAt(bvIb);
         native_adreno_stall_mem[58]=(uint32_t)space->handleAt((uint64_t)words[21]<<32|words[20]);
     }
+    {
+        const Job *const asked=find(waited);
+        NativeAdrenoRing *const asked_ring=asked?ring(asked->ring):ringOfFence(waited);
+        uint32_t done[2]={},unfinished[2]={};
+        for(unsigned i=0;i<ring_count_ && i<2;++i)(void)ring(i)->fenceValue(&done[i]);
+        for(const auto &other:jobs_)if(other.active && other.ring<2 && (int32_t)(other.fence-done[other.ring])>0)++unfinished[other.ring];
+        native_adreno_stall_ring[1]=waited;
+        native_adreno_stall_ring[2]=ring_count_>1 && asked_ring==rings_[1]?1:0;
+        native_adreno_stall_ring[3]=preemption()?preempt_.loaded():0;
+        native_adreno_stall_ring[4]=preemption() && preempt_.inFlight()?1:0;
+        native_adreno_stall_ring[5]=unfinished[0];native_adreno_stall_ring[6]=unfinished[1];
+        native_adreno_stall_ring[7]=job?1u|(uint32_t)job->ring<<8|(uint32_t)uint8_t(job->priority+1)<<16:0;
+        native_adreno_stall_ring[8]=asked && asked->submit_us && now>asked->submit_us?
+            (now-asked->submit_us>UINT32_MAX?UINT32_MAX:(uint32_t)(now-asked->submit_us)):0;
+        native_adreno_stall_ring[9]=pending>UINT32_MAX?UINT32_MAX:(uint32_t)pending;
+        native_adreno_stall_ring[0]=next;
+    }
     for(uint32_t i=0;i<NativeAdrenoRingStallWords;++i)native_adreno_stall[2+i]=words[i];
     native_adreno_stall[1]=stall_timeouts;
     native_adreno_stall[0]=next;
@@ -690,7 +715,7 @@ IOReturn NativeAdrenoSubmit::wait(uint32_t fence,const NativeAdrenoRingClock *cl
             ++stats_.timeouts;
             native_adreno_fence_wait[1]=native_adreno_fence_wait[1]+1;native_adreno_fence_wait[2]=fence;native_adreno_fence_wait[3]=observed;
             native_adreno_fence_wait[4]=r->lastSubmitted();native_adreno_fence_wait[5]=r->completedFence();
-            noteStall(observed,clock);
+            noteStall(observed,clock,fence);
             return kIOReturnTimeout;
         }
         return kIOReturnSuccess;
@@ -702,7 +727,7 @@ IOReturn NativeAdrenoSubmit::wait(uint32_t fence,const NativeAdrenoRingClock *cl
         ++stats_.timeouts;
         native_adreno_fence_wait[1]=native_adreno_fence_wait[1]+1;native_adreno_fence_wait[2]=fence;native_adreno_fence_wait[3]=observed;
         native_adreno_fence_wait[4]=r->lastSubmitted();native_adreno_fence_wait[5]=r->completedFence();
-        noteStall(observed,clock);
+        noteStall(observed,clock,fence);
         return kIOReturnTimeout;
     }
     IOReturn status=release(*job);
