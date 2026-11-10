@@ -21,6 +21,11 @@ extern "C" {volatile uint32_t native_adreno_bo_contig[2];}
  * most kept (a process that released everything gives its row up); and the live BOs by size, {count, KiB} for sizes up to 64 KiB,
  * 1 MiB, 4 MiB, 16 MiB, 64 MiB and above. Both change under the driver's lock, as systemBytes does. */
 extern "C" {volatile uint32_t native_adreno_bo_owners[24][4];volatile uint32_t native_adreno_bo_sizes[6][2];int proc_selfpid(void);}
+/* Imported memory the driver keeps wired: an import pins another mapping's pages (prepare()) from importTask until release(), whether
+ * or not the GPU maps them. [0] imports alive, [1] KiB of them, [2] the peak KiB, [3] imports made so far. native_adreno_import_owners
+ * holds the importing processes as native_adreno_bo_owners holds the allocating ones: {pid, live KiB, live imports, peak KiB}. A range
+ * imported twice counts twice, although its pages are wired once. Both change under the driver's lock. */
+extern "C" {volatile uint32_t native_adreno_import_memory[4];volatile uint32_t native_adreno_import_owners[24][4];}
 namespace {
 uint64_t systemBytes,systemPeak;
 bool pressure;
@@ -30,31 +35,33 @@ unsigned sizeClass(uint64_t bytes)
     unsigned c=0;while(c<5 && bytes>limit[c])++c;
     return c;
 }
-void noteOwner(int32_t pid,int64_t bytes)
+}
+void NativeAdrenoNoteHolder(volatile uint32_t (*table)[4],int32_t pid,int64_t bytes)
 {
     const uint32_t kib=(uint32_t)((uint64_t)(bytes<0?-bytes:bytes)>>10);
     unsigned row=24,spare=24,least=0;
     for(unsigned i=0;i<24;++i) {
-        if(native_adreno_bo_owners[i][2] && native_adreno_bo_owners[i][0]==(uint32_t)pid) {row=i;break;}
-        if(!native_adreno_bo_owners[i][2] && spare==24)spare=i;
-        if(native_adreno_bo_owners[i][1]<native_adreno_bo_owners[least][1])least=i;
+        if(table[i][2] && table[i][0]==(uint32_t)pid) {row=i;break;}
+        if(!table[i][2] && spare==24)spare=i;
+        if(table[i][1]<table[least][1])least=i;
     }
     if(bytes<0) {
         if(row==24)return;
-        native_adreno_bo_owners[row][1]=native_adreno_bo_owners[row][1]>kib?native_adreno_bo_owners[row][1]-kib:0;
-        native_adreno_bo_owners[row][2]=native_adreno_bo_owners[row][2]-1;
+        table[row][1]=table[row][1]>kib?table[row][1]-kib:0;
+        table[row][2]=table[row][2]-1;
         return;
     }
     if(row==24) {
         /* A new holder takes a free row, else the row of the smallest holder once it holds more than that one. */
         row=spare!=24?spare:least;
-        if(spare==24 && native_adreno_bo_owners[least][1]>=kib)return;
-        native_adreno_bo_owners[row][0]=(uint32_t)pid;native_adreno_bo_owners[row][1]=0;native_adreno_bo_owners[row][2]=0;native_adreno_bo_owners[row][3]=0;
+        if(spare==24 && table[least][1]>=kib)return;
+        table[row][0]=(uint32_t)pid;table[row][1]=0;table[row][2]=0;table[row][3]=0;
     }
-    native_adreno_bo_owners[row][1]=native_adreno_bo_owners[row][1]+kib;
-    native_adreno_bo_owners[row][2]=native_adreno_bo_owners[row][2]+1;
-    if(native_adreno_bo_owners[row][1]>native_adreno_bo_owners[row][3])native_adreno_bo_owners[row][3]=native_adreno_bo_owners[row][1];
+    table[row][1]=table[row][1]+kib;
+    table[row][2]=table[row][2]+1;
+    if(table[row][1]>table[row][3])table[row][3]=table[row][1];
 }
+namespace {
 void noteSystem(int64_t bytes,int32_t pid)
 {
     systemBytes+=bytes;if(systemBytes>systemPeak)systemPeak=systemBytes;
@@ -66,7 +73,16 @@ void noteSystem(int64_t bytes,int32_t pid)
         native_adreno_bo_sizes[c][0]=native_adreno_bo_sizes[c][0]?native_adreno_bo_sizes[c][0]-1:0;
         native_adreno_bo_sizes[c][1]=native_adreno_bo_sizes[c][1]>kib?native_adreno_bo_sizes[c][1]-kib:0;
     }
-    noteOwner(pid,bytes);
+    NativeAdrenoNoteHolder(native_adreno_bo_owners,pid,bytes);
+}
+void noteImport(int64_t bytes,int32_t pid)
+{
+    static uint64_t importBytes,importPeak;
+    importBytes+=bytes;if(importBytes>importPeak)importPeak=importBytes;
+    if(bytes>0) {native_adreno_import_memory[0]=native_adreno_import_memory[0]+1;native_adreno_import_memory[3]=native_adreno_import_memory[3]+1;}
+    else native_adreno_import_memory[0]=native_adreno_import_memory[0]?native_adreno_import_memory[0]-1:0;
+    native_adreno_import_memory[1]=(uint32_t)(importBytes>>10);native_adreno_import_memory[2]=(uint32_t)(importPeak>>10);
+    NativeAdrenoNoteHolder(native_adreno_import_owners,pid,bytes);
 }
 }
 bool NativeAdrenoMemory::memoryPressure() {return pressure;}
@@ -323,6 +339,7 @@ IOReturn NativeAdrenoMemory::importTask(void *task,uint64_t address,size_t bytes
     owner_uncached_=NativeAdrenoPagesUncached(spans_,span_count_);
     native_adreno_pool_stats_uncached[owner_uncached_]=native_adreno_pool_stats_uncached[owner_uncached_]+1;
     native_adreno_bo_memory[7]=native_adreno_bo_memory[7]+(uint32_t)span_count_;
+    owner_pid_=proc_selfpid();import_noted_=true;noteImport((int64_t)bytes,owner_pid_);
     return kIOReturnSuccess;
 failed:
     (void)release();return status;
@@ -399,6 +416,7 @@ IOReturn NativeAdrenoMemory::release()
     }
     if(owned_) {noteOwned(spans_,span_count_,false);owned_=false;}
     if(system_) {noteSystem(-(int64_t)bytes_,owner_pid_);system_=false;}
+    if(import_noted_) {noteImport(-(int64_t)bytes_,owner_pid_);import_noted_=false;}
     if(borrowed_) {borrowed_=false;prepared_=false;}
     if(spans_)IODeleteData(spans_,NativeAdrenoPhysicalSpan,span_capacity_);
     mapping_=nullptr;spans_=nullptr;bytes_=span_count_=span_capacity_=0;read_only_=false;owner_uncached_=false;

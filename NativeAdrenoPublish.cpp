@@ -52,6 +52,11 @@ struct NativeAdrenoMetalDiag {
 /* BO CPU views (clientMemoryForType for a BO token): [0] calls, [1] new descriptors, [2] served from the view cache, [3] refused (not a BO / out of
  * resources), [4] last refusal's IOReturn, [5] threads inside now. int-115 showed a backboardd thread in IOConnectMapMemory64 ~650 times a second. */
 extern "C" {volatile uint32_t native_adreno_view_diag[6],native_adreno_view_kept;}   /* kept: BoCpuUnmap calls that left the view for another lease */
+/* The BO views each process holds, as native_adreno_bo_owners holds the BOs: {pid, live KiB, live views, peak KiB}. A view is an IOKit
+ * mapping of the BO's memory in the client, and the VM bills such a mapping to the task that maps it by its whole size (vm_map_enter's
+ * iokit_acct entries: the iokit_mapped ledger, which is part of the footprint the memory limits judge). A BO no process views is billed
+ * to none. A view mapped twice is billed twice and counted once here. */
+volatile uint32_t native_adreno_view_owners[24][4];
 }
 
 /* The open type the Adreno plugin passes to IOServiceOpen ('AG'); it lets the driver tell the plugin from the original IOGPU library
@@ -261,12 +266,13 @@ class AGXDeviceUserClient : public IOUserClient {
     NativeAdrenoUserClient *core_=nullptr;   /* own core; deleted in free(), so a call that raced the close sees live_ false, never freed memory */
     NativeAdrenoProcessVm *space_=nullptr;   /* a user connection's own address space */
     unsigned row_=4;
+    int32_t pid_=0;   /* the process that opened it, for the views' table */
     char name_[20]{};
     /* One user-view descriptor per BO token, reused by every clientMemoryForType call. IOConnectUnmapMemory64 asks clientMemoryForType for
      * the descriptor again and unmaps only a mapping that belongs to THAT descriptor (kIOMapReference); a fresh descriptor per call made the
      * unmap a silent no-op, the user PTEs outlived BoCpuUnmap, and BoFree handed pages with a live user mapping to the VM:
      * pmap_assert_free panicked the freeing core and the panic screen parked it (the "BoFree hang", dead touch). */
-    struct View {uint32_t token;IOMemoryDescriptor *descriptor;};
+    struct View {uint32_t token;IOMemoryDescriptor *descriptor;uint64_t bytes;};
     /* One view per live BO token. The cache holds every BO the client has (it grows with the tokens): a BO whose view is not cached makes
      * IOConnectUnmapMemory64 (which asks clientMemoryForType again) a no-op, the user mapping outlives BoFree and the freed pages panic
      * pmap_assert_free. A cache of 64 held until the render server's hundreds of mapped BOs (int-087). */
@@ -335,6 +341,7 @@ static NativeAdrenoClientRecord *clientRecord(const char *name)
 bool AGXDeviceUserClient::mount(bool kernel)
 {
     proc_selfname(name_,sizeof name_);
+    pid_=proc_selfpid();
     NativeAdrenoUserClient *core=new NativeAdrenoUserClient;
     if(!core)return false;
     IOLockLock(g.lock);
@@ -406,8 +413,10 @@ void AGXDeviceUserClient::dropViews(uint32_t token)
     for(;;) {
         IOMemoryDescriptor *view=nullptr;
         IOLockLock(g.lock);
-        if(token) {View *v=viewSlot(token);if(v && v->descriptor && v->token==token) {view=v->descriptor;v->descriptor=nullptr;v->token=0;}}
-        else if(views_)for(size_t i=0;i<view_capacity_;++i) {View &v=views_[i];if(v.descriptor) {view=v.descriptor;v.descriptor=nullptr;v.token=0;break;}}
+        uint64_t bytes=0;
+        if(token) {View *v=viewSlot(token);if(v && v->descriptor && v->token==token) {view=v->descriptor;bytes=v->bytes;v->descriptor=nullptr;v->token=0;v->bytes=0;}}
+        else if(views_)for(size_t i=0;i<view_capacity_;++i) {View &v=views_[i];if(v.descriptor) {view=v.descriptor;bytes=v.bytes;v.descriptor=nullptr;v.token=0;v.bytes=0;break;}}
+        if(view)NativeAdrenoNoteHolder(native_adreno_view_owners,pid_,-int64_t(bytes));
         IOLockUnlock(g.lock);
         if(!view)return;
         /* The returned reference is the last one outside the descriptor's own list: dropping it frees the map, which unmaps the user range. */
@@ -508,7 +517,8 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
         /* System memory: the view maps the BO's own descriptor, its VM object, as Metal's resources are mapped into their process. The
          * pages keep the object's attribute (no device-pager view sets them back, int-160) and live while the view does. */
         IOMemoryDescriptor *descriptor=backing->descriptor();
-        descriptor->retain();v->token=type;v->descriptor=descriptor;
+        descriptor->retain();v->token=type;v->descriptor=descriptor;v->bytes=backing->bytes();
+        NativeAdrenoNoteHolder(native_adreno_view_owners,pid_,int64_t(v->bytes));
         descriptor->retain();*memory=descriptor;
         *options=kIOMapAnywhere;
         native_adreno_view_diag[1]=native_adreno_view_diag[1]+1;
@@ -535,7 +545,10 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
                 if(!descriptor)status=kIOReturnNoMemory;
                 else {
                     bool cached=false;
-                    if(v && !v->descriptor) {v->token=type;v->descriptor=descriptor;descriptor->retain();cached=true;}
+                    if(v && !v->descriptor) {
+                        v->token=type;v->descriptor=descriptor;v->bytes=backing->bytes();descriptor->retain();cached=true;
+                        NativeAdrenoNoteHolder(native_adreno_view_owners,pid_,int64_t(v->bytes));
+                    }
                     if(!cached) {
                         /* Never hand out a view that cannot be torn down again. */
                         descriptor->release();
