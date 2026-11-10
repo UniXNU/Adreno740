@@ -856,7 +856,8 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
         lockTimed(lockWait);
         locked=mach_absolute_time();
         spans=native_adreno_bo_memory[1];
-        if(connection->live_)connection->core_->offerSystemPages(pages.held()?&pages:nullptr);
+        /* Offered for every BoAlloc, held or not: allocateSystem then knows it runs under the lock and leaves the pool alone. */
+        if(connection->live_)connection->core_->offerSystemPages(alloc?&pages:nullptr);
         if(connection->live_ && freeing)connection->core_->collectFreedPages(&freed);
         status=connection->live_?connection->core_->dispatch(method,input,input_size,output,output_size,&g.clock):kIOReturnNotReady;
         if(connection->live_)connection->core_->offerSystemPages(nullptr);

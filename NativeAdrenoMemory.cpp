@@ -280,7 +280,9 @@ IOReturn NativeAdrenoMemory::allocateSystem(size_t bytes,unsigned bits,size_t bu
     bool cleaned=false;
     if(prepared && prepared->held() && prepared->bytes==bytes && prepared->write_combined==write_combined) {
         descriptor_=prepared->descriptor;grant_=prepared->grant;cleaned=prepared->cleaned;*prepared=NativeAdrenoSystemPages{};
-    } else if(NativeAdrenoPoolAllocate(bytes,UINT64_C(1)<<bits,write_combined,&grant_)!=kIOReturnSuccess) {
+    } else if(prepared || NativeAdrenoPoolAllocate(bytes,UINT64_C(1)<<bits,write_combined,&grant_)!=kIOReturnSuccess) {
+        /* A caller that offers prepared pages holds the driver's lock: the pool's zero fill maps its run in the kernel map and is not
+         * done under it (prepareSystem already asked the pool, outside the lock). */
         grant_=nullptr;descriptor_=systemDescriptor(bytes,write_combined);
     }
     if(grant_) {
