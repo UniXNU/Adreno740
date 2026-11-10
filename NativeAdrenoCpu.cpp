@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 #include "NativeAdrenoMemory.h"
+#include "NativeAdrenoPool.h"
+#include <IOKit/IOMemoryDescriptor.h>
 #include <kern/cpu_data.h>
 #include <vm/vm_map.h>
 #include <mach/vm_param.h>
@@ -167,5 +169,36 @@ IOReturn NativeAdrenoReassertWriteCombined(const NativeAdrenoPhysicalSpan *spans
         }
     }
     __atomic_fetch_add(&native_adreno_reassert_ticks,mach_absolute_time()-began,__ATOMIC_RELAXED);
+    return kIOReturnSuccess;
+}
+/* A pool range's kernel mapping: an IOKit mapping of the physical range, write-combined (Normal non-cacheable), in the kernel map's
+ * ordinary address space. ml_io_map_wcomb is not used: it takes permanent addresses from the kernel's 1 GiB I/O range, which the
+ * registers of every device share and which panics when it runs out. The mapping is never removed; *owner keeps the object. */
+void *NativeAdrenoPoolMapRange(uint64_t physical,size_t bytes,void **owner)
+{
+    if(!owner || !physical || !bytes || ((physical|bytes)&4095))return nullptr;
+    IOMemoryDescriptor *range=IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress)physical,bytes,kIODirectionInOut);
+    if(!range)return nullptr;
+    IOMemoryMap *map=range->createMappingInTask(kernel_task,0,kIOMapAnywhere|kIOMapWriteCombineCache);
+    range->release();
+    if(!map)return nullptr;
+    void *const address=reinterpret_cast<void *>(map->getVirtualAddress());
+    if(!address || ((uintptr_t)address&4095) || map->getLength()!=bytes) {map->release();return nullptr;}
+    *owner=map;
+    return address;
+}
+/* Before a pool page goes to its next owner. A page a client could map may have lines in a CPU cache (the client chooses the cache
+ * mode of its own IOKit mapping): they are dropped first, by the range mapping's addresses, so none is written over the zeros or
+ * over the next owner's data later. The pages have no other mapping at this point, so nothing is lost with a dropped line. The zero
+ * fill goes through the write-combined mapping and the barrier completes it before the GPU or a client can read the pages. */
+IOReturn NativeAdrenoPoolScrub(void *mapping,size_t bytes,bool drop_lines)
+{
+    if(!mapping || !bytes || (((uintptr_t)mapping|bytes)&4095))return kIOReturnBadArgument;
+    if(drop_lines) {
+        const IOReturn dropped=maintainOwnedPages(mapping,bytes,NativeAdrenoInvalidate);
+        if(dropped)return dropped;
+    }
+    bzero(mapping,bytes);
+    __asm__ volatile("dsb sy":::"memory");
     return kIOReturnSuccess;
 }

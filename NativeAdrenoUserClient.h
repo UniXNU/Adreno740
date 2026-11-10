@@ -124,6 +124,8 @@ public:
     /* What prepareSystem needs before the lock: whether this client's BOs are write-combined, and its largest BO. */
     static bool systemWriteCombined();
     uint64_t boLimit() const {return maxBoBytes();}
+    /* The physical address width the client's GPU tables take: pool pages prepared before the lock lie below it. */
+    uint32_t outputBits() const {return output_bits_;}
     IOReturn allocBoInner(const NativeAdrenoAbiBoAlloc *,NativeAdrenoAbiBoAllocReply *);
     IOReturn mapBo(const NativeAdrenoAbiBoMap *,NativeAdrenoAbiBoMapReply *);
     /* BoImport: pins the caller's pages. Only the IOKit wrapper can call it, with the calling task; dispatch() refuses the method

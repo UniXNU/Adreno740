@@ -19,6 +19,11 @@ static bool importedUntouched(const NativeAdrenoMemory *memory) {return memory->
 extern "C" {volatile uint64_t native_adreno_maint_kind[8][3];volatile uint64_t native_adreno_maint_walk[8];
     volatile uint32_t native_adreno_sync_skips[2];volatile uint32_t native_adreno_sync_audit[6];volatile uint32_t native_adreno_maint_all=~0u;}
 extern "C" boolean_t PE_parse_boot_argn(const char *,void *,int);
+/* Whether the kernel's cacheable physical aperture covers a page. It does not for memory outside the kernel's DRAM (pool BOs, the
+ * firmware framebuffer): no CPU cache line of such a page is the kernel's to compare or maintain, and only the board's uncached
+ * reader may read it. */
+extern "C" uint64_t gPhysBase,gPhysSize;
+static bool kernelDram(uint64_t physical) {return physical>=gPhysBase && physical-gPhysBase<gPhysSize;}
 static bool maintainAll()
 {
     if(native_adreno_maint_all==~0u) {
@@ -602,6 +607,8 @@ IOReturn NativeAdrenoVm::sampleWord(uint64_t iova,uint32_t *cached,uint32_t *dra
             uint32_t value=0;
             /* DRAM first: the cached reader writes its line back, so read after it DRAM would always agree (int-099). */
             if(native_adreno_dram_read32 && !native_adreno_dram_read32(span.physical+(offset-span.offset),&value))*dram=value;
+            /* A page with no cacheable alias has no cached copy that could differ: both words are what DRAM holds. */
+            if(!kernelDram(span.physical+(offset-span.offset))) {*cached=*dram;break;}
             /* A write-combined BO's own mapping is non-cacheable: read the cacheable alias instead, so a dirty line is still seen. */
             if(native_adreno_cached_read32 && !native_adreno_cached_read32(span.physical+(offset-span.offset),&value))*cached=value;
             break;
@@ -679,12 +686,13 @@ IOReturn NativeAdrenoVm::headWords(uint64_t handle,uint64_t iova,uint32_t *out,s
         for(size_t k=0;k<count && offset+4*k+4<=bytes;++k)out[k]=static_cast<const volatile uint32_t *>(m->memory->mapping())[offset/4+k];
         return kIOReturnSuccess;
     }
-    int (*const read)(uint64_t,uint32_t *)=native_adreno_cached_read32?native_adreno_cached_read32:native_adreno_dram_read32;
-    if(!read)return kIOReturnUnsupported;
+    if(!native_adreno_cached_read32 && !native_adreno_dram_read32)return kIOReturnUnsupported;
     uint64_t physical=0;size_t run=0;
     for(size_t k=0;k<count && offset+4*k+4<=bytes;++k,physical+=4,run-=4) {
         if(run<4 && !physicalAt(*m->memory,offset+4*k,&physical,&run))return kIOReturnBadArgument;
-        if(read(physical,&out[k]))return kIOReturnUnsupported;
+        /* The cacheable reader only where the aperture has the page; a pool BO's words come through the uncached one. */
+        int (*const read)(uint64_t,uint32_t *)=native_adreno_cached_read32 && kernelDram(physical)?native_adreno_cached_read32:native_adreno_dram_read32;
+        if(!read || read(physical,&out[k]))return kIOReturnUnsupported;
     }
     return kIOReturnSuccess;
 }
@@ -712,6 +720,9 @@ IOReturn NativeAdrenoVm::auditRange(uint64_t iova,size_t bytes,uint32_t *lines,u
             size_t chunk=4096-(size_t)(physical&4095);
             if(chunk>span->offset+span->bytes-at)chunk=span->offset+span->bytes-at;
             if(chunk>end-at)chunk=(end-at+63)&~(size_t)63;
+            /* A page outside the kernel's DRAM (a pool BO) has no cacheable alias to compare with DRAM: nothing to audit, and no
+             * reason to end the trust in write-combined BOs. */
+            if(!kernelDram(physical)) {at+=chunk;continue;}
             if(native_adreno_line_audit(physical,chunk,dirty,stale))return kIOReturnIOError;
             *lines+=(uint32_t)(chunk/64);at+=chunk;
         }

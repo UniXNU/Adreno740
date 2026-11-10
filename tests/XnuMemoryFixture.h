@@ -23,6 +23,12 @@ constexpr unsigned kIODirectionOut=2,kIODirectionInOut=3,kIOMemoryMapperNone=0x8
 extern "C" {inline uint64_t gPhysBase=0,gPhysSize=UINT64_C(1)<<36;}
 inline void *IOMallocZero(size_t bytes) {return std::calloc(1,bytes);}
 inline void IOFree(void *p,size_t) {std::free(p);}
+/* A mutex that knows whether it is held: taking it twice or letting go of one not held ends the test (a leaf lock stays a leaf). */
+struct IOLock {bool held=false;};
+inline IOLock *IOLockAlloc() {return new IOLock;}
+inline void IOLockFree(IOLock *lock) {delete lock;}
+inline void IOLockLock(IOLock *lock) {if(!lock || lock->held)std::abort();lock->held=true;}
+inline void IOLockUnlock(IOLock *lock) {if(!lock || !lock->held)std::abort();lock->held=false;}
 inline void *kernel_task=reinterpret_cast<void *>(1);
 using task_t=void *;
 /* ScatterUnlessContiguous: what the tablet does, one physical page per span unless the caller asked for contiguous memory. */

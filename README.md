@@ -20,6 +20,14 @@ The GPU maps its own memory non-cacheable, so it sees what DRAM holds. User BOs 
 
 `native_adreno_bo_owners` and `native_adreno_bo_sizes` count the system BOs by allocating process and by size. `native_adreno_import_memory` and `native_adreno_import_owners` count the imported memory the driver keeps wired, in all and by importing process. `native_adreno_view_owners` counts the BO views each process maps; the VM bills a view to the mapping task by its size.
 
+## Pool of DRAM outside the kernel's
+
+A board whose kernel manages only a window of its DRAM registers the free runs outside that window with `native_adreno_pool_add(physical, bytes)`: whole pages, entirely outside `[gPhysBase, gPhysBase+gPhysSize)`, from any thread once IOKit runs, before or after the driver starts. A write-combined system BO then takes its pages from the pool instead of wiring the window's memory: one run that fits best, else the longest runs first, at most sixteen runs up to 1 MiB and one a 64 KiB above. Whatever the pool does not serve takes the descriptor path: no range, a BO that is not write-combined, a request above the client's physical address limit, not enough free pages, or free pages too scattered.
+
+The kernel has no `vm_page` and no cacheable mapping for these pages. Each range has one write-combined kernel mapping; every page is zero-filled through it before a BO gets it. A pool BO has no descriptor, is never cleaned or audited, and its client view maps its physical runs write-combined. The BO and each client view hold the pages; an import of a range that maps pool pages is refused. Pages a client had a view of do not return to the pool, because a copy of that mapping made in the VM cannot be seen or revoked; `gpu-pool=2` returns them after dropping their cache lines. `gpu-pool=0` turns the pool off.
+
+Counters: `native_adreno_pool_state` (ranges, KiB total, free and lowest free, grants alive and their KiB, served, freed, retired and their KiB, the boot argument, refused registrations), `native_adreno_pool_fallbacks` (by reason), `native_adreno_pool_zero` (zero-fill and cache-pass time and KiB).
+
 ## Frame diagnostics
 
 `gpu-trace=1` enables the kernel GPU ring: submission, retirement, display arrival, display fence and latch, build identity, and the render server's render, encode and completion thread identities, 65536 records. Repeated pending display queries are coalesced. See [GPU frame diagnostics](https://unixnu.com/porting/gpu-diagnostics) for fields and decoding.
