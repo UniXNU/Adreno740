@@ -130,6 +130,7 @@ class NativeAdrenoVm final {
      * map/unmap pay a full extra audit only every 64th operation (int-139: 4 full walks of the 2 GiB aperture made every map 70 ms). */
     ArmSmmu4KStatus observeStreamsOnly() const;
     ArmSmmu4KStatus observeCheap();
+    static ArmSmmu4KStatus notOurFault(ArmSmmu4KStatus,uint32_t word);
     unsigned since_audit_=0;
     IOReturn failAt(ArmSmmu4KStatus,unsigned line);
     Mapping *find(uint64_t);

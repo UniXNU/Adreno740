@@ -75,6 +75,43 @@ static void peekFetch(const NativeAdrenoVm *vm,uint64_t fetch,volatile uint32_t 
     slot[0]=0xffff0000u+before;
     for(unsigned i=0;i<16;++i)slot[1+i]=words[i];
 }
+/* Where the stalled job's command buffers name the IB2 the thread stopped in: every IB1 of the job (the CP_INDIRECT_BUFFER packets
+ * of its ring words) is read for a CP_INDIRECT_BUFFER whose low address word is the IB2 base register's. [0] how many were found,
+ * [1] the IB1's place in the job, [2..3] its address, [4] the packet's dword offset in it, [5..10] the packet's four words and the
+ * two before it, [11] IB1s read, [12] dwords read, [13] IB1s that could not be read. Nothing found with every IB1 read means the
+ * address did not come from the job's commands. */
+extern "C" {volatile uint32_t native_adreno_stall_find[14];}
+static bool indirectBuffer(uint32_t header) {return (header>>28)==7u && ((header>>16)&0x7fu)==0x3fu && (header&0x3fffu)==3;}
+static void findIb2(const NativeAdrenoVm *vm,const uint32_t *ring_words,size_t ring_count,uint32_t ib2_low)
+{
+    uint32_t out[14]={};
+    static uint32_t chunk[1024];
+    uint32_t index=0;
+    for(size_t i=0;i+3<ring_count && index<256;++i) {
+        if(!indirectBuffer(ring_words[i]))continue;
+        const uint64_t ib1=(uint64_t)ring_words[i+2]<<32|ring_words[i+1];
+        const uint32_t dwords=ring_words[i+3]&0xfffffu;
+        i+=3;++out[11];
+        uint32_t carry[2]={};
+        for(uint32_t at=0;at<dwords;at+=1024) {
+            const uint32_t take=dwords-at<1024?dwords-at:1024;
+            if(vm->peekWordsUncached(ib1+4ull*at,chunk,take)) {++out[13];break;}
+            out[12]+=take;
+            for(uint32_t k=0;k+3<take;++k) {
+                if(!indirectBuffer(chunk[k]) || chunk[k+1]!=ib2_low)continue;
+                if(!out[0]) {
+                    out[1]=index;out[2]=(uint32_t)ib1;out[3]=(uint32_t)(ib1>>32);out[4]=at+k;
+                    out[5]=k>=2?chunk[k-2]:carry[0];out[6]=k>=1?chunk[k-1]:carry[1];
+                    for(unsigned w=0;w<4;++w)out[7+w]=chunk[k+w];
+                }
+                ++out[0];
+            }
+            carry[0]=chunk[take>=2?take-2:0];carry[1]=chunk[take-1];
+        }
+        ++index;
+    }
+    for(unsigned i=0;i<14;++i)native_adreno_stall_find[i]=out[i];
+}
 static uint32_t stall_fence,stall_timeouts,stall_stage;   /* stage: 0 none yet, 1 write pointer given again, 2 translations dropped, 3 bus drained */
 static uint64_t stall_began_us,stall_last_us;   /* the fence's first and latest timed-out wait */
 /* How long fences stayed pending from their first timed-out wait to their last: [i] under 1 << i ms for i < 7, [7] 64 ms or more. */
@@ -841,6 +878,7 @@ void NativeAdrenoSubmit::snapshot(uint32_t next,uint32_t waited,uint64_t now,uin
     if(!stalled->ibBefore(words[16],&ib,&size))peekIb(space,ib,size,words[18],&native_adreno_stall_mem[4+17]);
     else peekFetch(space,(uint64_t)words[11]<<32|words[17],&native_adreno_stall_mem[4+17]);   /* BV IB1 base: the low word only */
     peekFetch(space,(uint64_t)words[21]<<32|words[20],&native_adreno_stall_mem[4+34]);
+    if(job && job->word_count)findIb2(space,job->words,job->word_count,words[13]);
     {
         uint64_t brIb=(uint64_t)words[11]<<32|words[10],bvIb=(uint64_t)words[11]<<32|words[17];
         if(!stalled->ibBefore(words[8],&ib,&size))brIb=ib;
