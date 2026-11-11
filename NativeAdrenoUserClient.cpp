@@ -28,7 +28,9 @@ static void noteImportState(uint64_t handle,uint64_t state)
 }
 extern "C" volatile uint32_t native_adreno_io_coherent;
 /* Per kernel method: [method][0] calls, [1] calls that returned non-zero, [2] last status, [3] total time (us, 32-bit). Method numbers are the ABI's (1..16). */
-extern "C" {extern uint64_t (*native_adreno_vm_now_us)(void);volatile uint32_t native_adreno_method_stats[20][4];volatile uint32_t native_adreno_map_fail[7][2];}
+extern "C" {extern uint64_t (*native_adreno_vm_now_us)(void);volatile uint32_t native_adreno_method_stats[20][4];volatile uint32_t native_adreno_map_fail[7][2];
+/* The last failed map: the bytes asked, and the mapping it met (address, bytes, handle, jobs, kind | imported 0x100 | upper 0x1000). */
+volatile uint64_t native_adreno_map_met[7];}
 static void noteImport(IOReturn status,uint32_t stage,uint64_t bytes,uint64_t address)
 {
     if(!status)return;
@@ -593,6 +595,15 @@ IOReturn NativeAdrenoUserClient::dispatch(uint32_t method,const void *input,
             native_adreno_map_fail[at][0]=(uint32_t)status;native_adreno_map_fail[at][1]=native_adreno_map_fail[at][1]+1;
             native_adreno_map_fail[5][0]=(uint32_t)vm_->spanCount();native_adreno_map_fail[5][1]=(uint32_t)vm_->objectCount();
             native_adreno_map_fail[6][0]=(uint32_t)(request.iova>>12);native_adreno_map_fail[6][1]=(uint32_t)(request.handle);
+            {
+                uint64_t met[5]={};
+                const bool found=vm_->occupant(request.iova,met);
+                Entry *asked=find(request.handle);
+                /* The bytes asked, with bit 63 where the handle itself was already mapped (the other source of this status). */
+                native_adreno_map_met[0]=request.iova;
+                native_adreno_map_met[1]=(asked?asked->memory.bytes():0)|(asked && asked->mapped_state?UINT64_C(1)<<63:0);
+                for(unsigned k=0;k<5;++k)native_adreno_map_met[2+k]=found?met[k]:~UINT64_C(0);
+            }
         }
         break;
     }

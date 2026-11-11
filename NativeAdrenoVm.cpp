@@ -237,6 +237,20 @@ IOReturn NativeAdrenoVm::findAddress(unsigned upper,size_t bytes,uint64_t alignm
         if(end>offset)offset=end;
     }
 }
+bool NativeAdrenoVm::occupant(uint64_t iova,uint64_t out[5]) const
+{
+    for(unsigned upper=0;upper<2;++upper) {
+        const ArmSmmu4KLiveArena *a=regions_[upper].arena;
+        if(!a || iova<a->iova || iova-a->iova>=a->bytes)continue;
+        const size_t i=orderAt(upper,iova);
+        if(i>=orderEnd(upper))return false;
+        const Mapping &m=mappings_[order_[i]];
+        out[0]=m.iova;out[1]=m.memory?m.memory->bytes():0;out[2]=m.handle;out[3]=m.jobs;
+        out[4]=(uint64_t)m.kind|(m.memory && m.memory->imported()?0x100u:0u)|(uint64_t)upper<<12;
+        return true;
+    }
+    return false;
+}
 IOReturn NativeAdrenoVm::preflight(const NativeAdrenoMemory *memory,unsigned upper,uint64_t iova,
     unsigned permissions,unsigned writeback,unsigned shareability,bool exclusive) const
 {
