@@ -94,19 +94,34 @@ bool NativeAdrenoMemory::memoryPressure() {return pressure;}
 extern "C" uint64_t gPhysBase,gPhysSize;
 namespace {
 uint64_t *ownedBits;
+/* The bits of the kernel's own range, then those of the first 4 GiB below it (DRAM a kernel adopts outside its range). */
+const uint64_t kOwnedLowPages=UINT64_C(1)<<20;
 uint64_t *ownedMap()
 {
     static bool tried;
-    if(!ownedBits && !tried) {tried=true;ownedBits=static_cast<uint64_t *>(IOMallocZero((size_t)((gPhysSize/4096+63)/64*8)));}
+    if(!ownedBits && !tried) {tried=true;ownedBits=static_cast<uint64_t *>(IOMallocZero((size_t)((gPhysSize/4096+kOwnedLowPages+63)/64*8)));}
     return ownedBits;
+}
+/* The page's bit; false for a page that has none (neither in the kernel's range nor below it within 4 GiB). */
+bool ownedIndex(uint64_t page,uint64_t *at)
+{
+    if(page>=gPhysBase) {
+        if(page-gPhysBase>=gPhysSize)return false;
+        *at=(page-gPhysBase)/4096;
+        return true;
+    }
+    if(page>>32)return false;
+    *at=gPhysSize/4096+page/4096;
+    return true;
 }
 void noteOwned(const NativeAdrenoPhysicalSpan *spans,size_t count,bool owned)
 {
     uint64_t *bits=ownedMap();
     if(!bits)return;
     for(size_t i=0;i<count;++i)for(uint64_t page=spans[i].physical;page<spans[i].physical+spans[i].bytes;page+=4096) {
-        if(page<gPhysBase || page-gPhysBase>=gPhysSize)continue;
-        const uint64_t at=(page-gPhysBase)/4096,bit=UINT64_C(1)<<(at%64);
+        uint64_t at=0;
+        if(!ownedIndex(page,&at))continue;
+        const uint64_t bit=UINT64_C(1)<<(at%64);
         if(owned)__atomic_fetch_or(&bits[at/64],bit,__ATOMIC_RELAXED);else __atomic_fetch_and(&bits[at/64],~bit,__ATOMIC_RELAXED);
     }
 }
@@ -116,8 +131,8 @@ bool NativeAdrenoMemory::ownsAnyPage(const NativeAdrenoPhysicalSpan *spans,size_
     const uint64_t *bits=ownedMap();
     if(!bits)return true;
     for(size_t i=0;i<count;++i)for(uint64_t page=spans[i].physical;page<spans[i].physical+spans[i].bytes;page+=4096) {
-        if(page<gPhysBase || page-gPhysBase>=gPhysSize)continue;
-        const uint64_t at=(page-gPhysBase)/4096;
+        uint64_t at=0;
+        if(!ownedIndex(page,&at))continue;
         if(__atomic_load_n(&bits[at/64],__ATOMIC_RELAXED)>>(at%64)&1)return true;
     }
     return false;
@@ -156,6 +171,15 @@ IOReturn NativeAdrenoMemory::takeRuns(const NativeAdrenoPoolGrant *grant,size_t 
     }
     return offset==bytes?kIOReturnSuccess:kIOReturnUnsupported;
 }
+/* The first kernel allocation that failed: [0] where (1 no descriptor, 2 prepare, 3 after it), [1] status, [2] bytes, [3] address
+ * bits, [4] contiguous, [5] failures so far. */
+extern "C" {volatile uint32_t native_adreno_kernel_alloc_fail[6];}
+static void noteKernelFailure(uint32_t where,IOReturn status,size_t bytes,unsigned bits,bool contiguous)
+{
+    volatile uint32_t *f=native_adreno_kernel_alloc_fail;
+    if(!f[5]) {f[0]=where;f[1]=(uint32_t)status;f[2]=(uint32_t)bytes;f[3]=bits;f[4]=contiguous;}
+    f[5]=f[5]+1;
+}
 IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous,size_t budget)
 {
     if(descriptor_ || grant_ || spans_ || quarantined_)return kIOReturnBusy;
@@ -168,9 +192,9 @@ IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous
     IOOptionBits options=static_cast<IOOptionBits>(kIODirectionInOut)|static_cast<IOOptionBits>(kIOMemoryMapperNone);
     if(contiguous)options|=kIOMemoryPhysicallyContiguous;
     descriptor_=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,options,bytes,(limit-1)&~UINT64_C(4095));
-    if(!descriptor_)return kIOReturnNoMemory;
+    if(!descriptor_) {noteKernelFailure(1,kIOReturnNoMemory,bytes,bits,contiguous);return kIOReturnNoMemory;}
     status=descriptor_->prepare();
-    if(status!=kIOReturnSuccess) {descriptor_->release();descriptor_=nullptr;return status;}
+    if(status!=kIOReturnSuccess) {noteKernelFailure(2,status,bytes,bits,contiguous);descriptor_->release();descriptor_=nullptr;return status;}
     prepared_=true;bytes_=bytes;mapping_=descriptor_->getBytesNoCopy();
     status=kIOReturnUnsupported;
     if(!mapping_ || ((uintptr_t)mapping_&4095) || bytes>UINTPTR_MAX-(uintptr_t)mapping_ ||
@@ -185,6 +209,7 @@ IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous
     native_adreno_bo_memory[6]=native_adreno_bo_memory[6]+1;
     return kIOReturnSuccess;
 failed:
+    noteKernelFailure(3,status,bytes,bits,contiguous);
     /* release() deliberately retains descriptor/metadata if complete fails.
      * Preserve the allocation's original failure instead of reporting cleanup
      * as success. No object has been exposed to a GPU or userspace yet. */

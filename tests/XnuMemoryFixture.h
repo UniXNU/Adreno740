@@ -21,6 +21,8 @@ constexpr unsigned kIODirectionOut=2,kIODirectionInOut=3,kIOMemoryMapperNone=0x8
  kIOMemoryPageable=0x20,kIOMapWriteCombineCache=0x400;
 /* The kernel's physical range (phystokv's), wide enough for every fixture address. */
 extern "C" {inline uint64_t gPhysBase=0,gPhysSize=UINT64_C(1)<<36;}
+/* The host kernel manages its own range only. */
+extern "C" inline int pmap_valid_address(uint64_t physical) {return physical>=gPhysBase && physical-gPhysBase<gPhysSize;}
 inline void *IOMallocZero(size_t bytes) {return std::calloc(1,bytes);}
 inline void IOFree(void *p,size_t) {std::free(p);}
 /* A mutex that knows whether it is held: taking it twice or letting go of one not held ends the test (a leaf lock stays a leaf). */
