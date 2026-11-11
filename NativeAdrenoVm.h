@@ -231,6 +231,9 @@ public:
     /* TLBIASID of this VM's ASID (its translations only), for an ASID about to be given to another table. */
     IOReturn invalidateAsid();
     size_t objectCount() const {return objects_;}
+    /* The mapping a new one at iova would meet first (the first whose last byte is at or past iova), for the map failure record:
+     * its address, bytes, handle, jobs in flight and kind. False when the address lies in no region or nothing is there. */
+    bool occupant(uint64_t iova,uint64_t out[5]) const;
     size_t spanCount() const {return lower_count_+upper_count_;}
     NativeAdrenoVmResult lastResult() const {return result_;}
 };
