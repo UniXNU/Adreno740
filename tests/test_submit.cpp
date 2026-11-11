@@ -328,6 +328,27 @@ int main()
         CHECK(p.submit.recover([](void *,NativeAdrenoRing *,uint32_t)->IOReturn {return kIOReturnIOError;},nullptr,&ringclock,&result)==kIOReturnIOError);
         CHECK(p.submit.poisoned());
     }
+    /* The BV thread's progress counts as the CP's: with concurrent binning BR waits for the visibility pass, so BR's own words stand
+     * still while BV's dwords left go down. Three such checks are progress; with BV still too the fence is hung. */
+    {
+        Path p;CHECK(exposed(p)==kIOReturnSuccess);
+        NativeAdrenoSubmitBuffer buffer{p.handle,0x800000,4096};
+        uint32_t fence=0;
+        CHECK(p.submit.submit(&buffer,1,0,&fence)==kIOReturnSuccess && fence==1);
+        uint32_t bv[5]={};
+        cp.regs[0x0a66]=0x21;cp.regs[0x0a6d]=0x5000;cp.regs[0x0a71]=0x7000;cp.regs[0x0a70]=40;cp.regs[0x0a74]=9;cp.regs[0x0a90]=3u<<16;cp.regs[0x0a91]=2u<<16;
+        CHECK(p.ring.bvProgressState(bv)==kIOReturnSuccess && bv[0]==0x21 && bv[1]==0x5000 && bv[2]==0x7000 && bv[3]==43 && bv[4]==11);
+        CHECK(p.ring.bvProgressState(nullptr)==kIOReturnBadArgument);
+        bool hung=true;
+        CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && !hung);   /* the first check records both threads' words */
+        CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && hung);    /* neither thread moved */
+        cp.regs[0x0a70]=39;   /* CP_BV_IB1_REM_SIZE moves, BR's words do not */
+        CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && !hung);
+        cp.regs[0x0a66]=0x25;   /* the BV read pointer */
+        CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && !hung);
+        CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && hung);    /* still again */
+        for(uint32_t reg:{0x0a66u,0x0a6du,0x0a70u,0x0a71u,0x0a74u,0x0a90u,0x0a91u})cp.regs[reg]=0;
+    }
     {
         Path p;CHECK(exposed(p)==kIOReturnSuccess);NativeAdrenoRing low;
         uint32_t lowmem[8192]{},lowfence[1024]{};uint8_t rec[2][64]{},info[2][32]{};

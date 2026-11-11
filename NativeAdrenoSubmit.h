@@ -34,7 +34,8 @@ extern "C" volatile uint64_t native_adreno_long_jobs[8][8],native_adreno_slow_jo
 /* The first stage of a stall (write pointer given again, translations dropped) and what the CP did before it: [0] the fence, [1] us
  * it had been pending, [2..7] the CP's progress (NativeAdrenoRing::progressState: IB1 base lo/hi, IB2 base lo/hi, IB1 and IB2 dwords
  * left) at the fence's first timed-out wait, [8..13] at the stage, [14..19] 500 us later, just before the stage acts, [20] bit 0: the
- * CP moved between the first wait and the stage, bit 1: it moved in the 500 us, [21] us from the stage to the job's retirement seen
+ * CP moved between the first wait and the stage, bit 1: it moved in the 500 us, bits 2 and 3: the same for the BV thread alone (its
+ * read pointer, IB bases and dwords left: BR can stand still at a wait for BV while the visibility pass runs), [21] us from the stage to the job's retirement seen
  * (0: not yet), [22] the job's pid, [23] its IBs | ring << 16 | (priority + 1) << 24, [24] its IB bytes, [25] stages recorded. */
 extern "C" volatile uint32_t native_adreno_stall_kick[26];
 /* A GPU restart after a hang (NativeAdrenoSubmit::recover): the board resets the GPU and brings the CP up again on the same ring (a6xx_recover
@@ -104,8 +105,9 @@ private:
         It begin() const {return {items};}
         It end() const {return {items+count};}
     } jobs_;
-    /* msm hangcheck state: the fence seen at the last check, the progress retries spent on it and the CP state then (a6xx_progress). */
-    uint32_t hang_fence_=0,progress_retries_=0,last_cp_[6]{};
+    /* msm hangcheck state: the fence seen at the last check, the progress retries spent on it and the CP state then (a6xx_progress),
+     * with the BV thread's (NativeAdrenoRing::bvProgressState): a visibility pass that BR waits for is progress too. */
+    uint32_t hang_fence_=0,progress_retries_=0,last_cp_[6]{},last_bv_[5]{};
     bool madeProgress();
     NativeAdrenoVm *vm_=nullptr;   /* the default VM: the kernel's table, installed at bring-up */
     /* Page table switching between processes: mode 0 none (one table for everything), 1 the CPU writes TTBR0 while the GPU is idle,
@@ -162,6 +164,7 @@ private:
     /* noteStall's CP snapshot (native_adreno_stall, _stall_mem, _stall_ring), taken before the first stage acts. */
     void snapshot(uint32_t next,uint32_t waited,uint64_t now,uint64_t pending,NativeAdrenoRing *stalled);
     uint32_t stall_begin_cp_[6]{};   /* the CP's progress at the stalled fence's first timed-out wait */
+    uint32_t stall_begin_bv_[5]{};   /* and the BV thread's */
     uint64_t ring_retired_us_[2]{};uint32_t ring_retired_fence_[2]{};   /* the newest retirement seen on each ring */
     bool attached_=false,poisoned_=false;
     uint32_t audit_tick_=0;   /* submissions since attach; every eighth one audits its IB lines */

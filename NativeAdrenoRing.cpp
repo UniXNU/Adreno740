@@ -520,6 +520,20 @@ IOReturn NativeAdrenoRing::progressState(uint32_t out[6])
     out[4]+=roq1>>16;out[5]+=roq2>>16;
     return kIOReturnSuccess;
 }
+IOReturn NativeAdrenoRing::bvProgressState(uint32_t out[5])
+{
+    /* a6xx.xml (A7XX): CP_BV_RB_RPTR 0x0a66, CP_BV_IB1_BASE 0x0a6d, CP_BV_IB1_REM_SIZE 0x0a70, CP_BV_IB2_BASE 0x0a71,
+     * CP_BV_IB2_REM_SIZE 0x0a74, CP_BV_ROQ_AVAIL_IB1 0x0a90, CP_BV_ROQ_AVAIL_IB2 0x0a91. */
+    enum : uint32_t {BvRptr=0x0a66,BvIb1Base=0x0a6d,BvIb1Rem=0x0a70,BvIb2Base=0x0a71,BvIb2Rem=0x0a74,BvRoqAvailIb1=0x0a90,BvRoqAvailIb2=0x0a91};
+    if(!out)return kIOReturnBadArgument;
+    if(!attached_)return kIOReturnNotReady;
+    uint32_t roq1=0,roq2=0;
+    if(io_.read32(io_.cookie,BvRptr,&out[0]) || io_.read32(io_.cookie,BvIb1Base,&out[1]) || io_.read32(io_.cookie,BvIb2Base,&out[2]) ||
+        io_.read32(io_.cookie,BvIb1Rem,&out[3]) || io_.read32(io_.cookie,BvIb2Rem,&out[4]) ||
+        io_.read32(io_.cookie,BvRoqAvailIb1,&roq1) || io_.read32(io_.cookie,BvRoqAvailIb2,&roq2))return kIOReturnIOError;
+    out[3]+=roq1>>16;out[4]+=roq2>>16;
+    return kIOReturnSuccess;
+}
 IOReturn NativeAdrenoRing::busHalt(bool gx_off,unsigned spins)
 {
     enum : uint32_t {RbbmGbifHalt=0x0016,RbbmGbifHaltAck=0x0017,GbifHalt=0x3c45,GbifHaltAck=0x3c46,ClientHalt=1u,ArbHalt=2u};
