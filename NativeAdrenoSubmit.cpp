@@ -56,6 +56,7 @@ extern "C" {volatile uint32_t native_adreno_stall[2+NativeAdrenoRingStallWords];
  * no clock), [9] us the snapshot's fence had been pending. A waited fence on a ring the CP does not run, with the other ring busy or
  * idle, is a job waiting for the switch, not a CP that stopped. */
 extern "C" {volatile uint32_t native_adreno_stall_ring[10];}
+extern "C" {volatile uint32_t native_adreno_switch_timeout[2][30];volatile uint32_t native_adreno_switch_timeouts;}
 /* 16 words of the IB at start, from 12 dwords before the dword the thread has reached (size minus what remains). */
 static void peekIb(const NativeAdrenoVm *vm,uint64_t start,uint32_t size,uint32_t remaining,volatile uint32_t *slot)
 {
@@ -285,6 +286,19 @@ void NativeAdrenoSubmit::driveSwitch(const NativeAdrenoRingClock *clock)
             if(preempt_.timedOut(PreemptSwitchTimeoutUs)) {
                 uint32_t progress[6]={};
                 (void)ring(0)->progressState(progress);
+                {
+                    /* The CP's state at a switch it never finished, for the first two: the stall words (as native_adreno_stall), then
+                     * the ring's progress words. */
+                    const uint32_t n=native_adreno_switch_timeouts;
+                    if(n<2) {
+                        uint32_t words[NativeAdrenoRingStallWords]={};
+                        (void)ring(0)->stallState(words);
+                        volatile uint32_t *row=native_adreno_switch_timeout[n];
+                        for(uint32_t i=0;i<NativeAdrenoRingStallWords && i<24;++i)row[i]=words[i];
+                        for(uint32_t i=0;i<6;++i)row[24+i]=progress[i];
+                    }
+                    native_adreno_switch_timeouts=n+1;
+                }
                 preempt_.noteTimeout(progress);
                 markPreemptDead(2);
             }
