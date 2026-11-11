@@ -39,6 +39,7 @@ IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,uns
          * them. Every process table maps all of them: cleaning their 8548 KiB at each submission was 351 of a submission's 579 us
          * (macOS run61). */
         if(!status)status=buffers_[i].declareSynchronized();
+        buffers_[i].declareShared();
     }
     if(!status) {
         step(Prepare);

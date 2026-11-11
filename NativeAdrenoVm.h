@@ -131,7 +131,7 @@ class NativeAdrenoVm final {
     ArmSmmu4KStatus observeStreamsOnly() const;
     ArmSmmu4KStatus observeCheap();
     unsigned since_audit_=0;
-    IOReturn fail(ArmSmmu4KStatus);
+    IOReturn failAt(ArmSmmu4KStatus,unsigned line);
     Mapping *find(uint64_t);
     const Mapping *find(uint64_t) const;
     size_t orderBegin(unsigned upper) const {return upper?order_count_[0]:0;}

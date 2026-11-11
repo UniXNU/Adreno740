@@ -141,6 +141,7 @@ private:
     bool preempt_dead_=false,stranded_=false,aging_grant_=false;
     uint64_t low_service_us_=0,low_slice_until_=0;
     uint32_t dead_reason_=0,rescues_=0;
+    uint32_t dropped_jobs_=0;   /* jobs ended without retiring: their process's address space was out of use */
     void markPreemptDead(uint32_t reason);
     NativeAdrenoRing *ringOfFence(uint32_t fence) const;
     unsigned ringForPriority() const;

@@ -64,6 +64,7 @@ class NativeAdrenoMemory final {
     size_t bytes_=0,span_count_=0,span_capacity_=0;
     uint32_t device_references_=0;
     int32_t owner_pid_=0;   /* the process that allocated a system BO or made an import, for the holders' tables */
+    bool shared_=false;
     bool prepared_=false,quarantined_=false,write_combined_=false,system_=false,borrowed_=false,owned_=false;
     bool import_noted_=false;   /* an import counted in native_adreno_import_memory until release() */
     bool synchronized_=false;   /* declareSynchronized(): its writers keep the device's view current themselves */
@@ -159,7 +160,10 @@ public:
     IOReturn releaseSystemInto(struct NativeAdrenoSystemPages *out);
     IOReturn holdForDevice();
     IOReturn retireAfterQuiescence();
-    void quarantine() {quarantined_=true;}
+    /* A buffer every address space maps for the device's whole life (the context's shared buffers) is not taken out of use when
+     * one of those address spaces fails: the others still run on it, and the failed one's reference keeps it from being released. */
+    void declareShared() {shared_=true;}
+    void quarantine() {if(!shared_)quarantined_=true;}
     /* Requires real CPU/device exclusion and retained ownership. Before GPU
      * writes, clean+invalidate; after genuine completion, invalidate only.
      * CPU must not dirty these pages while the device owns access. */

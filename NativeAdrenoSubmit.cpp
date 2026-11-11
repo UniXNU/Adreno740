@@ -425,6 +425,9 @@ IOReturn NativeAdrenoSubmit::release(Job &job)
 {
     IOReturn status=kIOReturnSuccess;
     NativeAdrenoVm *vm=job.vm?job.vm:vm_;
+    /* A process's address space that was taken out of use keeps every buffer it mapped (NativeAdrenoVm::failAt), so its job has
+     * nothing to give back; the job ends here and the other processes go on. The kernel's own address space failing stops all. */
+    if(vm!=vm_ && vm->poisoned()) {++dropped_jobs_;native_adreno_recover_trace[0]=20;native_adreno_recover_trace[1]=dropped_jobs_;job={};return kIOReturnSuccess;}
     for(size_t i=0;i<job.count;++i) {
         IOReturn retired=vm->retireJobAfterCompletion(job.handles[i]);
         if(retired)status=retired;else ++stats_.references_retired;
@@ -1033,7 +1036,7 @@ IOReturn NativeAdrenoSubmit::recover(NativeAdrenoRestart restart,void *cookie,co
             uint32_t done=0;
             NativeAdrenoRing *const r=ringOfFence(job.fence)?ringOfFence(job.fence):ring(0);
             if(!r->fenceValue(&done) && (int32_t)(done-job.fence)>=0) {
-                IOReturn status=release(job);if(status)return status;
+                IOReturn status=release(job);if(status) {native_adreno_recover_trace[0]=7;native_adreno_recover_trace[1]=uint32_t(status);return status;}
                 ++stats_.completed;
             }
         }
@@ -1050,7 +1053,7 @@ IOReturn NativeAdrenoSubmit::recover(NativeAdrenoRestart restart,void *cookie,co
             uint32_t done=0;
             NativeAdrenoRing *const r=ringOfFence(job.fence)?ringOfFence(job.fence):ring(0);
             if(!r->fenceValue(&done) && (int32_t)(done-job.fence)>=0) {
-                IOReturn status=release(job);if(status)return status;
+                IOReturn status=release(job);if(status) {native_adreno_recover_trace[0]=8;native_adreno_recover_trace[1]=uint32_t(status);return status;}
                 ++stats_.completed;
             } else if(!any || (int32_t)(job.fence-oldest)<0) {oldest=job.fence;any=true;}
         }
@@ -1080,7 +1083,7 @@ IOReturn NativeAdrenoSubmit::recover(NativeAdrenoRestart restart,void *cookie,co
     out->status=status;
     if(status) {native_adreno_recover_trace[0]=2;native_adreno_recover_trace[1]=uint32_t(status);return poison();}
     poisoned_=false;hang_fence_=hung;progress_retries_=0;
-    if(guilty) {status=release(*guilty);if(status)return status;}
+    if(guilty) {status=release(*guilty);if(status) {native_adreno_recover_trace[0]=9;native_adreno_recover_trace[1]=uint32_t(status);return status;}}
     /* The GPU is idle after the restart's CP init: the CPU installs the kernel table, and each replayed job switches to its own. */
     if(table_mode_) {
         if(!write_table_) {native_adreno_recover_trace[0]=3;native_adreno_recover_trace[1]=0;return poison();}
@@ -1098,7 +1101,7 @@ IOReturn NativeAdrenoSubmit::recover(NativeAdrenoRestart restart,void *cookie,co
         ring(1)->setCurrent(false);
         for(unsigned i=0;i<ring_count_;++i) {
             ring(i)->tableInstalled(vm_->ttbr0());
-            if(ring(i)->resetExecutedTable(vm_->ttbr0()))return poison();
+            if(ring(i)->resetExecutedTable(vm_->ttbr0())) {native_adreno_recover_trace[0]=10;native_adreno_recover_trace[1]=i;return poison();}
         }
     }
     uint32_t nop=0;

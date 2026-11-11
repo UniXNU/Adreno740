@@ -117,8 +117,12 @@ ArmSmmu4KStatus NativeAdrenoVm::observeCheap()
     }
     return ArmSmmu4KSuccess;
 }
-IOReturn NativeAdrenoVm::fail(ArmSmmu4KStatus status)
+/* Address spaces taken out of use (failAt): how many, then the last one's status, source line and whether it was a process's. */
+extern "C" {volatile uint32_t native_adreno_vm_fail[4];}
+IOReturn NativeAdrenoVm::failAt(ArmSmmu4KStatus status,unsigned line)
 {
+    native_adreno_vm_fail[0]=native_adreno_vm_fail[0]+1;native_adreno_vm_fail[1]=uint32_t(status);native_adreno_vm_fail[2]=line;
+    native_adreno_vm_fail[3]=regions_[0].state && regions_[0].state->detached?1u:0u;
     poisoned_=true;result_.operation=status;result_.complete=false;
     for(size_t i=0;mappings_ && i<high_;++i)if(mappings_[i].memory)mappings_[i].memory->quarantine();
     for(auto &r:regions_)if(r.arena) {r.tables->quarantine();r.state->poisoned=1;}
@@ -128,6 +132,7 @@ IOReturn NativeAdrenoVm::fail(ArmSmmu4KStatus status)
     }
     return kIOReturnIOError;
 }
+#define fail(status) failAt((status),__LINE__)
 IOReturn NativeAdrenoVm::attach(const ArmSmmu4KIo *io,ArmSmmu4KContextConfig *context,
     ArmSmmu4KStreamState *streams,const NativeAdrenoVmRegion *lower,const NativeAdrenoVmRegion *upper,
     size_t capacity,unsigned budget)
