@@ -746,6 +746,7 @@ void NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingClock
     /* Before the first stage acts: where the CP is now and 500 us later. Unchanged since the first wait and over the 500 us, the CP
      * stopped; changed, it is still working through the job (a long job, not a lost write pointer). The snapshot below is taken
      * before the stage too, so its registers are the stall's and not the stage's result. */
+    bool working=false;
     if(kick_due) {
         uint32_t at[6]={},later[6]={};
         if(stalled->progressState(at))for(unsigned k=0;k<6;++k)at[k]=~0u;
@@ -765,6 +766,13 @@ void NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingClock
         native_adreno_stall_kick[1]=pending>UINT32_MAX?UINT32_MAX:(uint32_t)pending;
         native_adreno_stall_kick[0]=stall_fence;
         native_adreno_stall_kick[25]=native_adreno_stall_kick[25]+1;
+        /* The CP moved: a long job, not a stop (every kick of four runs found it moving, tiled passes of 100 to 160 ms). Nothing is
+         * done to a working GPU: the stages below count their time from this sample, so they act only after that long without
+         * progress. */
+        if(moved) {
+            working=true;stall_began_us=now;
+            for(unsigned k=0;k<6;++k)stall_begin_cp_[k]=later[k];
+        }
     }
     ++stall_timeouts;
     if(now && snapshot_due(&stall_snapshots,pending))snapshot(next,waited,now,pending,stalled);
@@ -776,7 +784,7 @@ void NativeAdrenoSubmit::noteStall(uint32_t observed,const NativeAdrenoRingClock
      * 5 ms against 1 ms waits, so most "stalls" are ordinary jobs still running; the write pointer is never dropped (fenced writes saw no
      * drop) and invalidating at map time changed nothing. i553: the handler ran on 6712 of 6911 jobs. It now waits for 50 ms without
      * progress, measured in time (a timed-out wait is one poll, 100 us or less), and so does the snapshot below. */
-    if(kick_due) {
+    if(kick_due && !working) {
         native_adreno_unstick[0]=native_adreno_unstick[0]+1;native_adreno_unstick[1]=stall_fence;stall_stage=1;
         const uint32_t r0=stalled->readPointer(),w0=stalled->writePointer()&0xffff;
         (void)vm_->invalidateTlb();(void)stalled->kick();
