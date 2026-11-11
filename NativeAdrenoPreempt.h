@@ -108,6 +108,7 @@ public:
     bool releaseKeepalive();
     bool inFlight() const {return armed_;}
     uint32_t loaded() const {return loaded_;}
+    uint32_t next() const {return next_;}   /* the ring the switch in flight loads */
     /* A switch triggered more than `limit_us` ago and still not complete. */
     bool timedOut(uint32_t limit_us) const;
     /* The switch in flight did not finish: the log row takes the CP's IB state (progress) and the registers, and the switch ends as timed out. */

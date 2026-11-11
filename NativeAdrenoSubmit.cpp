@@ -287,14 +287,17 @@ void NativeAdrenoSubmit::driveSwitch(const NativeAdrenoRingClock *clock)
                 uint32_t progress[6]={};
                 (void)ring(0)->progressState(progress);
                 {
-                    /* The CP's state at a switch it never finished, for the first two: the stall words (as native_adreno_stall), then
-                     * the ring's progress words. */
+                    /* The CP's state at a switch it never finished, for the first two: the stall words (as native_adreno_stall), the
+                     * switch control word and rings, then the ring's progress words. */
                     const uint32_t n=native_adreno_switch_timeouts;
                     if(n<2) {
                         uint32_t words[NativeAdrenoRingStallWords]={};
                         (void)ring(0)->stallState(words);
                         volatile uint32_t *row=native_adreno_switch_timeout[n];
                         for(uint32_t i=0;i<NativeAdrenoRingStallWords && i<24;++i)row[i]=words[i];
+                        /* and CP_CONTEXT_SWITCH_CNTL as it reads now (bit 0 set: the CP still says the switch runs), with the ring the
+                         * CP was leaving and the one it was asked to load */
+                        row[22]=preempt_.readCntl();row[23]=0x80000000u|preempt_.loaded()<<8|preempt_.next();
                         for(uint32_t i=0;i<6;++i)row[24+i]=progress[i];
                     }
                     native_adreno_switch_timeouts=n+1;
@@ -985,15 +988,17 @@ IOReturn NativeAdrenoSubmit::hangCheck(bool *hung)
     const uint32_t last0=ring(0)->lastSubmitted(),last1=preemption()?ring(1)->lastSubmitted():0;
     const uint32_t last=(int32_t)(last1-last0)>0?last1:last0;
     if(!last)return kIOReturnSuccess;
-    /* A job on the second ring that the CP cannot reach: the ring was given up (dead), or it has waited so long that the switch is
-     * not coming. The first ring's progress hides this from the check below, so it is judged on its own. */
+    /* A job on a ring that the CP cannot reach: switching was given up (dead), or a second-ring job has waited so long that the
+     * switch is not coming. The first ring's progress hides this from the check below, so it is judged on its own. */
     if(preemption()) {
         const uint64_t now=clock_now_?clock_now_(clock_cookie_):0;
         /* A busy high ring starves the low one by design (driveSwitch lets it through after PreemptAgingUs); only a low-ring job that waits
          * with the high ring idle and no switch in flight is a CP that cannot be reached. */
         const bool reachable=!preempt_.inFlight() && !pendingOn(0);
-        for(auto &job:jobs_)if(job.active && job.ring==1 && job.ring!=preempt_.loaded()) {
-            const bool aged=reachable && now && job.submit_us && now-job.submit_us>PreemptStrandedUs;
+        /* The same holds for a first-ring job once switching is given up with the CP left on the second ring (a switch back that
+         * the CP never finished): the job waits for a CP that will not come, and is not to blame for it. */
+        for(auto &job:jobs_)if(job.active && job.ring!=preempt_.loaded() && (job.ring==1 || preempt_dead_)) {
+            const bool aged=job.ring==1 && reachable && now && job.submit_us && now-job.submit_us>PreemptStrandedUs;
             if(preempt_dead_ || aged) {
                 markPreemptDead(preempt_dead_?dead_reason_:3);
                 stranded_=true;*hung=true;++stats_.hangs;
