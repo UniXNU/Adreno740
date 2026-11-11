@@ -104,6 +104,20 @@ static unsigned failures()
     CHECK(memory.release()==kIOReturnBusy && !fixture.completed && !fixture.released);
     CHECK(memory.acquireDeviceWrites(0,4096)==kIOReturnNotReady);
     discardFixtureAfterQuarantine();++controls;
+    /* A buffer declared shared stays in use when an address space that mapped it is taken out of use: the others still run on
+     * it, and the failed one's reference keeps it from being released. */
+    {
+        reset();NativeAdrenoMemory shared;
+        CHECK(shared.allocate(16384,32,false,16384)==kIOReturnSuccess);
+        shared.declareShared();
+        CHECK(shared.holdForDevice()==kIOReturnSuccess && shared.holdForDevice()==kIOReturnSuccess);
+        shared.quarantine();
+        CHECK(!shared.quarantined() && shared.deviceReferences()==2);
+        CHECK(shared.holdForDevice()==kIOReturnSuccess && shared.retireAfterQuiescence()==kIOReturnSuccess);
+        CHECK(shared.release()==kIOReturnBusy);
+        CHECK(shared.retireAfterQuiescence()==kIOReturnSuccess && shared.retireAfterQuiescence()==kIOReturnSuccess);
+        CHECK(shared.release()==kIOReturnSuccess);++controls;
+    }
     return controls;
 }
 static unsigned arguments()
