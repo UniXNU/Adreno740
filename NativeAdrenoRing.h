@@ -182,6 +182,10 @@ public:
     /* a6xx_progress's CP state: IB1 base (lo, hi), IB2 base (lo, hi), IB1 remaining and IB2 remaining dwords, each remaining count plus
      * what the ROQ fetched but the SQE has not consumed (CP_ROQ_AVAIL_IB1/IB2 bits 31:16). */
     IOReturn progressState(uint32_t out[6]);
+    /* The same for the BV thread (the visibility pass of concurrent binning, which a6xx_progress does not read): CP_BV_RB_RPTR,
+     * CP_BV_IB1_BASE low, CP_BV_IB2_BASE low, and the IB1 and IB2 dwords left, each plus what the BV ROQ fetched but has not consumed
+     * (CP_BV_ROQ_AVAIL_IB1/IB2 bits 31:16). While BR waits for BV (CP_BV_BR_COUNT_OPS, a wait on a BV timestamp) only these move. */
+    IOReturn bvProgressState(uint32_t out[5]);
     /* a6xx_bus_clear_pending_transactions(gx_off): with gx_off the GX side of GBIF first (RBBM_GBIF_HALT), then new client requests and
      * all AXI requests, each until acknowledged (spin_until: bounded here by `spins` reads), then the halt cleared. */
     IOReturn busHalt(bool gx_off,unsigned spins);
