@@ -8,7 +8,10 @@
 #include <kern/clock.h>
 #include <vm/memory_types.h>
 extern "C" vm_offset_t phystokv(uint64_t pa);
-extern "C" uint64_t gPhysBase,gPhysSize;   /* the physical range phystokv covers (the kernel's own DRAM); anything else panics in phystokv */
+/* Whether a physical page is memory the kernel manages (and phystokv covers): its own range, and on a kernel that adopts DRAM
+ * outside that range (a second bank) the adopted pages too. Device memory and memory the firmware keeps are not. */
+extern "C" boolean_t pmap_valid_address(uint64_t physical);
+static inline bool kernelPage(uint64_t physical) {return pmap_valid_address(physical)!=0;}
 extern "C" void pmap_set_cache_attributes(ppnum_t pn,unsigned int cacheattr);
 extern "C" unsigned int pmap_cache_attributes(ppnum_t pn);
 /* Time and bytes of every CPU cache maintenance pass (the board page shows them per submission), and the pages user BOs made
@@ -29,7 +32,7 @@ bool NativeAdrenoPagesUncached(const NativeAdrenoPhysicalSpan *spans,size_t coun
         for(uint64_t offset=0;offset<spans[i].bytes;offset+=4096) {
             const uint64_t page=spans[i].physical+offset;
             /* Outside the kernel's DRAM (device memory such as the firmware framebuffer): never cached. */
-            if(page<gPhysBase || page-gPhysBase>=gPhysSize)continue;
+            if(!kernelPage(page))continue;
             /* Write-combined, device, posted and real-time attributes all carry VM_MEM_NOT_CACHEABLE; write-through does not. */
             if(!(pmap_cache_attributes((ppnum_t)(page>>12))&VM_MEM_NOT_CACHEABLE))return false;
         }
@@ -115,7 +118,7 @@ IOReturn NativeAdrenoMaintainPhysicalPages(uint64_t physical,size_t bytes,Native
              * uncached (kIOMapInhibitCache), no cache line of it exists to maintain, and phystokv would panic on it (int-080: illegal PA
              * 0xb8000000). */
             const uint64_t page=physical+offset;
-            if(page<gPhysBase || page-gPhysBase>=gPhysSize)continue;
+            if(!kernelPage(page))continue;
             const vm_offset_t alias=phystokv(page);
             if(!alias) {__asm__ volatile("dsb sy":::"memory");enable_preemption();return kIOReturnUnsupported;}
             for(uintptr_t address=alias,end=alias+4096;address<end;address+=line) {
@@ -143,7 +146,7 @@ IOReturn NativeAdrenoSetPagesCacheMode(const NativeAdrenoPhysicalSpan *spans,siz
     for(size_t i=0;i<count;++i) {
         const NativeAdrenoPhysicalSpan &span=spans[i];
         if(!span.bytes || ((span.physical|span.bytes)&4095) || span.physical>UINT64_MAX-span.bytes ||
-            span.physical<gPhysBase || span.physical+span.bytes-gPhysBase>gPhysSize)return kIOReturnBadArgument;
+            !kernelPage(span.physical) || !kernelPage(span.physical+span.bytes-4096))return kIOReturnBadArgument;
         pages+=span.bytes/4096;
     }
     for(size_t i=0;i<count;++i)
@@ -160,7 +163,7 @@ IOReturn NativeAdrenoReassertWriteCombined(const NativeAdrenoPhysicalSpan *spans
     for(size_t i=0;i<count;++i) {
         const NativeAdrenoPhysicalSpan &span=spans[i];
         if(!span.bytes || ((span.physical|span.bytes)&4095) || span.physical>UINT64_MAX-span.bytes ||
-            span.physical<gPhysBase || span.physical+span.bytes-gPhysBase>gPhysSize)return kIOReturnBadArgument;
+            !kernelPage(span.physical) || !kernelPage(span.physical+span.bytes-4096))return kIOReturnBadArgument;
         for(uint64_t offset=0;offset<span.bytes;offset+=4096) {
             const ppnum_t pn=(ppnum_t)((span.physical+offset)>>12);
             /* From the default attribute the pmap also cleans and invalidates the page (pmap_sync_wimg), so lines a cacheable view
@@ -185,6 +188,10 @@ void *NativeAdrenoPoolMapRange(uint64_t physical,size_t bytes,void **owner)
  * the next owner's data later. The pages have no other mapping at this point, so nothing is lost with a dropped line. The zero fill
  * goes through a write-combined mapping of the run made for it, and the barrier completes it before the GPU or a client can read
  * the pages; the mapping is gone again before the call returns. */
+/* The run each CPU is zero-filling (physical address, bytes), 0 between fills: a store the system refuses panics in the fill, and
+ * the board's panic record names the run. */
+extern "C" {volatile uint64_t native_adreno_pool_scrubbing[16][2];}
+extern "C" int cpu_number(void);
 IOReturn NativeAdrenoPoolScrub(void *mapping,size_t bytes,bool drop_lines)
 {
     const uint64_t physical=reinterpret_cast<uintptr_t>(mapping);
@@ -198,8 +205,11 @@ IOReturn NativeAdrenoPoolScrub(void *mapping,size_t bytes,bool drop_lines)
     IOReturn status=(!address || ((uintptr_t)address&4095) || map->getLength()!=bytes)?kIOReturnNoMemory:kIOReturnSuccess;
     if(!status && drop_lines)status=maintainOwnedPages(address,bytes,NativeAdrenoInvalidate);
     if(!status) {
+        volatile uint64_t *const mine=native_adreno_pool_scrubbing[(unsigned)cpu_number()&15];
+        mine[1]=bytes;mine[0]=physical;
         bzero(address,bytes);
         __asm__ volatile("dsb sy":::"memory");
+        mine[0]=0;
     }
     map->release();
     return status;

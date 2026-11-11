@@ -22,8 +22,9 @@ extern "C" boolean_t PE_parse_boot_argn(const char *,void *,int);
 /* Whether the kernel's cacheable physical aperture covers a page. It does not for memory outside the kernel's DRAM (pool BOs, the
  * firmware framebuffer): no CPU cache line of such a page is the kernel's to compare or maintain, and only the board's uncached
  * reader may read it. */
-extern "C" uint64_t gPhysBase,gPhysSize;
-static bool kernelDram(uint64_t physical) {return physical>=gPhysBase && physical-gPhysBase<gPhysSize;}
+extern "C" boolean_t pmap_valid_address(uint64_t physical);
+/* Memory the kernel manages: its own range and DRAM it adopted outside it. */
+static bool kernelDram(uint64_t physical) {return pmap_valid_address(physical)!=0;}
 static bool maintainAll()
 {
     if(native_adreno_maint_all==~0u) {
