@@ -446,6 +446,37 @@ int main()
         CHECK(p.submit.retireCompleted()==0 && p.submit.outstanding()==0);
         std::puts("PASS a pausing wait drives the ring switch for a low-ring job");
     }
+    {
+        /* A switch back to the first ring that the CP never finishes: the first-ring job behind it is stranded, not guilty. Its
+         * client keeps its device, and the job runs again after the restart. */
+        Path p;CHECK(exposed(p)==kIOReturnSuccess);NativeAdrenoRing low;
+        static uint32_t lowfence[1024];std::memset(lowfence,0,sizeof(lowfence));
+        uint32_t lowmem[8192]{};uint8_t rec[2][64]{},info[2][32]{};
+        CHECK(low.attachSecondary(&ringio,&ringcache,lowmem,sizeof(lowmem),0x200000,lowfence,sizeof(lowfence),0x208000)==0);
+        CHECK(p.ring.setPreempt(0x300000,0x400000,0x108008)==0 && low.setPreempt(0x500000,0x600000,0x208008)==0);
+        NativeAdrenoSubmit::PreemptSetup setup{};setup.io={&cp,cwrite,cread,cbarrier,nullptr,nullptr};
+        setup.pages={{0x300000,0x500000},{0x400000,0x600000},{rec[0],rec[1]},{info[0],info[1]}};
+        setup.now=cnow;setup.clock=&cp;setup.mode=2;
+        CHECK(p.submit.setPreemption(&p.ring,&low,setup,true)==0);
+        auto write=[](void *,uint64_t)->IOReturn{return 0;};
+        CHECK(p.submit.setTableSwitching(2,write,nullptr)==0);
+        p.ring.tableInstalled(0xaaaa000);low.tableInstalled(0xbbbb000);
+        NativeAdrenoSubmitBuffer buffer{p.handle,0x800000,4096};uint32_t low_fence=0,high_fence=0;
+        clock_us=1;p.submit.nextPriority(1);CHECK(p.submit.submit(&p.vm,&buffer,1,7,&low_fence,&ringclock)==0);
+        CHECK(cp.regs[0x08a0]&1);cp.regs[0x08a0]&=~1u;CHECK(p.submit.preemptIrq());   /* the CP is on the second ring */
+        lowfence[1]=low_fence;CHECK(p.submit.retireCompleted()==0 && p.submit.outstanding()==0);
+        p.submit.nextPriority(0);CHECK(p.submit.submit(&p.vm,&buffer,1,8,&high_fence,&ringclock)==0);
+        CHECK(cp.regs[0x08a0]&1);                                                    /* the switch back, which never finishes */
+        clock_us+=1100000;CHECK(p.submit.retireCompleted()==0);
+        bool hung=false;
+        for(unsigned i=0;i<4 && !hung;++i) {clock_us+=1000;CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess);}
+        CHECK(hung && p.submit.deadReason()==2);
+        NativeAdrenoRecovery result{};
+        auto restart=[](void *,NativeAdrenoRing *ring,uint32_t completed)->IOReturn {return ring->restart(completed);};
+        CHECK(p.submit.recover(restart,nullptr,&ringclock,&result)==kIOReturnSuccess);
+        CHECK(!result.guilty && p.submit.lastRecoveryStranded() && p.submit.outstanding()==1);
+        std::puts("PASS a first-ring job behind a switch the CP never finished is replayed, with no job blamed");
+    }
     /* The driver's own synchronized buffers at a submission: not cleaned, and audited by the first 8 submissions and every 1024th. A
      * dirty line the audit finds ends the trust: that submission and every later one clean them again, and the audits stop. */
     {
