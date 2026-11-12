@@ -606,11 +606,13 @@ IOReturn NativeAdrenoUserClient::dispatch(uint32_t method,const void *input,
              * held and the failed request asked for the last time. */
             unsigned at=0;while(at<5 && native_adreno_map_fail[at][0] && native_adreno_map_fail[at][0]!=(uint32_t)status)++at;
             native_adreno_map_fail[at][0]=(uint32_t)status;native_adreno_map_fail[at][1]=native_adreno_map_fail[at][1]+1;
-            native_adreno_map_fail[5][0]=(uint32_t)vm_->spanCount();native_adreno_map_fail[5][1]=(uint32_t)vm_->objectCount();
+            /* A connection whose address space recovery took away (or never had one) answers kIOReturnNotReady with vm_ null;
+             * reading through it here panicked (far 0x298). */
+            native_adreno_map_fail[5][0]=vm_?(uint32_t)vm_->spanCount():0;native_adreno_map_fail[5][1]=vm_?(uint32_t)vm_->objectCount():0;
             native_adreno_map_fail[6][0]=(uint32_t)(request.iova>>12);native_adreno_map_fail[6][1]=(uint32_t)(request.handle);
             {
                 uint64_t met[5]={};
-                const bool found=vm_->occupant(request.iova,met);
+                const bool found=vm_ && vm_->occupant(request.iova,met);
                 Entry *asked=find(request.handle);
                 /* The bytes asked, with bit 63 where the handle itself was already mapped (the other source of this status). */
                 native_adreno_map_met[0]=request.iova;
