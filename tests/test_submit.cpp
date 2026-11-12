@@ -8,6 +8,11 @@
 #define CHECK(x) do {if(!(x)){std::fprintf(stderr,"line %d: %s\n",__LINE__,#x);std::exit(1);}}while(0)
 #define SMMU_BYTES 0x40000
 #define CB 0x22000
+extern "C" {
+extern volatile uint32_t native_adreno_stall_hang;
+extern volatile uint32_t native_adreno_stall[24];
+extern volatile uint32_t native_adreno_stall_fault[32];
+}
 IOReturn NativeAdrenoQueryCpu4K(NativeAdrenoCpuState *out)
 {CHECK(out);*out={};return kIOReturnSuccess;}
 IOReturn NativeAdrenoMaintainOwnedPages(void *mapping,size_t bytes,NativeAdrenoCacheOperation op)
@@ -295,6 +300,22 @@ int main()
         CHECK(submit.detach()==kIOReturnNotReady);
         CHECK(submit.submit(nullptr,1,0,nullptr)==kIOReturnBadArgument);
     }
+    /* A low-word SMMU fault is searched in the hung job's own command memory. */
+    {
+        Path p;CHECK(exposed(p)==kIOReturnSuccess);
+        auto *words=static_cast<uint32_t *>(p.object.mapping());
+        std::memset(words,0,4096);
+        words[8]=0x123456;words[16]=0x123416;
+        NativeAdrenoSubmitBuffer buffer{p.handle,0x800000,4096};uint32_t fence=0;
+        CHECK(p.submit.submit(&buffer,1,0,&fence)==kIOReturnSuccess);
+        mmio[(CB+0x58)/4]=0x80000402;mmio[(CB+0x60)/4]=0x123456;
+        bool hung=false;
+        for(unsigned i=0;i<4 && !hung;++i)CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess);
+        CHECK(hung && native_adreno_stall_fault[0]==1 && native_adreno_stall_fault[1]==1);
+        CHECK(native_adreno_stall_fault[2]==1 && native_adreno_stall_fault[3]==0x800000 && native_adreno_stall_fault[5]==8);
+        CHECK(native_adreno_stall_fault[16]==0x123416 && native_adreno_stall_fault[17]==64 && native_adreno_stall_fault[30]==1);
+        std::puts("PASS hang snapshot searches the job's fault address and nearest base");
+    }
     /* msm hangcheck: no fence progress with work pending is a hang once the CP state stops moving or after three progress retries; recovery
      * marks the guilty job's VM, moves the fence past it, restarts the ring and replays the later jobs with their own fences. */
     {
@@ -308,7 +329,9 @@ int main()
             CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && !hung);
         }
         cp.regs[0x0928]=0x9000;
+        native_adreno_stall_fault[30]=123;   /* an older address search must not survive a hang without an SMMU fault */
         CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && hung);   /* three retries spent */
+        CHECK(native_adreno_stall_hang==1 && native_adreno_stall[12]==0x9000 && !native_adreno_stall_fault[30]);
         CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && !hung);   /* progress retries start again: one retry for the changed state */
         static uint32_t restarted;restarted=~0u;
         auto restart=[](void *,NativeAdrenoRing *ring,uint32_t completed)->IOReturn {restarted=completed;return ring->restart(completed);};
@@ -342,11 +365,14 @@ int main()
         bool hung=true;
         CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && !hung);   /* the first check records both threads' words */
         CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && hung);    /* neither thread moved */
+        CHECK(native_adreno_stall_hang==1 && native_adreno_stall[18]==0x21);
         cp.regs[0x0a70]=39;   /* CP_BV_IB1_REM_SIZE moves, BR's words do not */
         CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && !hung);
         cp.regs[0x0a66]=0x25;   /* the BV read pointer */
         CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && !hung);
+        CHECK(native_adreno_stall[18]==0x21);   /* progress leaves the hung CP's snapshot intact */
         CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess && hung);    /* still again */
+        CHECK(native_adreno_stall_hang==2 && native_adreno_stall[18]==0x25);
         for(uint32_t reg:{0x0a66u,0x0a6du,0x0a70u,0x0a71u,0x0a74u,0x0a90u,0x0a91u})cp.regs[reg]=0;
     }
     {

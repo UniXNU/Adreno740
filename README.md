@@ -34,4 +34,6 @@ Counters: `native_adreno_pool_state` (ranges, KiB total, free and lowest free, g
 
 `native_adreno_stall_ring` holds, with each stall snapshot, the ring of the waited fence, the ring the CP runs, a switch in flight and the unfinished jobs of each ring.
 
+The hang check takes a CP snapshot before recovery and retains it until the next hang. `native_adreno_stall_hang` identifies that hang. For a fault with a zero upper address word, `native_adreno_stall_fault` searches the job's IB1s and up to 512 referenced IB2s for the low word and a nearby base followed by zero. Matches are diagnostic candidates, not decoded address operands. Each new snapshot clears the previous search.
+
 `NativeGpuPerfCounters.h` defines the opt-in 19-counter A7XX BR plan used by sheng diagnostics. Capture records selector readback, unstable 64-bit reads, reset masks and preemption epochs. The host check verifies the register plan against pinned Mesa XML.
