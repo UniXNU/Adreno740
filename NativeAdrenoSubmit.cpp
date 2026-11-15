@@ -369,7 +369,7 @@ void NativeAdrenoSubmit::driveSwitch(const NativeAdrenoRingClock *clock)
     if(preempt_.inFlight()) {
         if(!completeSwitch()) {
             /* The CP never finished a switch: no more are tried (the restart in recover() brings the CP back). */
-            if(preempt_.timedOut(PreemptSwitchTimeoutUs)) {
+            if(!preempt_dead_ && preempt_.timedOut(PreemptSwitchTimeoutUs)) {
                 uint32_t progress[6]={};
                 (void)ring(0)->progressState(progress);
                 {
@@ -1112,7 +1112,7 @@ IOReturn NativeAdrenoSubmit::hangCheck(bool *hung)
     return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoSubmit::recover(NativeAdrenoRestart restart,void *cookie,const NativeAdrenoRingClock *clock,
-    NativeAdrenoRecovery *out)
+    NativeAdrenoRecovery *out,uint32_t fault_status)
 {
     if(!out)return kIOReturnBadArgument;*out={};
     if(!attached_)return kIOReturnNotReady;
@@ -1121,7 +1121,8 @@ IOReturn NativeAdrenoSubmit::recover(NativeAdrenoRestart restart,void *cookie,co
     const uint32_t last0=ring(0)->lastSubmitted(),last1=preemption()?ring(1)->lastSubmitted():0;
     const uint32_t last=(int32_t)(last1-last0)>0?last1:last0;
     uint32_t fence=0;
-    const bool stranded=stranded_;
+    const bool stranded=stranded_ && !fault_status;
+    out->fault_status=fault_status;
     stranded_=false;last_stranded_=stranded;
     if(stranded) {
         /* No job is to blame: the second ring's work never got a CP. What each ring finished retires by that ring's own fence, and the
@@ -1173,7 +1174,9 @@ IOReturn NativeAdrenoSubmit::recover(NativeAdrenoRestart restart,void *cookie,co
     /* A hang inside a second-ring job is blamed on the second ring: it is given up (reason 4), the replay and everything after run on the first. */
     if(guilty && guilty->ring==1)markPreemptDead(4);
     recovery_info_[0]=guilty?uint32_t(guilty->ring):9;recovery_info_[1]=last0;recovery_info_[2]=last1;recovery_info_[3]=preemption()?preempt_.loaded():0;
-    IOReturn status=restart(cookie,ring(0),hung);
+    const uint32_t completed=stranded?fence:hung;
+    out->completed=completed;
+    IOReturn status=restart(cookie,ring(0),completed);
     out->status=status;
     if(status) {native_adreno_recover_trace[0]=2;native_adreno_recover_trace[1]=uint32_t(status);return poison();}
     poisoned_=false;hang_fence_=hung;progress_retries_=0;
@@ -1191,7 +1194,7 @@ IOReturn NativeAdrenoSubmit::recover(NativeAdrenoRestart restart,void *cookie,co
     if(preemption()) {
         preempt_.restart(0);low_service_us_=low_slice_until_=0;aging_grant_=false;
         ring(0)->setCurrent(true);
-        (void)ring(1)->restartSecondary(hung);
+        (void)ring(1)->restartSecondary(completed);
         ring(1)->setCurrent(false);
         for(unsigned i=0;i<ring_count_;++i) {
             ring(i)->tableInstalled(vm_->ttbr0());
@@ -1200,7 +1203,7 @@ IOReturn NativeAdrenoSubmit::recover(NativeAdrenoRestart restart,void *cookie,co
     }
     uint32_t nop=0;
     if(AdrenoPM4Type7(0x10,0,&nop)!=AdrenoPM4Success) {native_adreno_recover_trace[0]=4;return poison();}   /* CP_NOP */
-    for(uint32_t next=hung+1;next && next<=last;++next) {
+    for(uint32_t next=completed+1;next && next<=last;++next) {
         Job *job=find(next);
         NativeAdrenoVm *vm=job && job->vm?job->vm:vm_;
         const bool run=job && !vm->unusable() && job->word_count;
