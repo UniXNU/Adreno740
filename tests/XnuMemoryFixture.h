@@ -10,6 +10,7 @@ typedef int boolean_t;   /* the kernel's PE_parse_boot_argn declaration in Nativ
 #include <algorithm>
 #include <vector>
 using IOReturn=int;
+enum {PRIO_DARWIN_GPU_DENY=2,PRIO_DARWIN_GPU_BACKGROUND=3,PRIO_DARWIN_GPU_UTILITY=4};
 using IOOptionBits=unsigned;
 using IOByteCount=size_t;
 using addr64_t=uint64_t;
