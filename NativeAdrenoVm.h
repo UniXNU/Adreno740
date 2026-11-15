@@ -166,8 +166,7 @@ public:
     /* Before every submission: cleans and invalidates the CPU caches over every mapped BO a CPU cache can hold a line of that the GPU
      * would not see (whole objects; imported ones through their physical pages). Lines are physically tagged, so this also reaches
      * lines a user mapping of the same pages left behind. Left alone: coherent mappings, memory no CPU mapping caches (write-combined
-     * while trusted, imports their owner maps non-cacheable), every import once IO coherence is proved (the GPU-written ones were
-     * cleaned when mapped and the CPU leaves them alone while the GPU owns them), and the driver's own synchronized buffers, whose
+     * while trusted, imports their owner maps non-cacheable), and the driver's own synchronized buffers, whose
      * writers cleaned what they stored. Only the mappings with such work are visited. */
     IOReturn publishMapped();
     /* The submit path saw a CPU-cached word that DRAM did not hold yet in a client's BO: from now on write-combined BOs are maintained
