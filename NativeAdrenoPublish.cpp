@@ -162,7 +162,7 @@ extern "C" {volatile uint32_t native_adreno_cp_aperture[4];
 /* The CP switch check: the bank's image (NativeAdrenoGpuContext::observeContext) before the switch [0..7] and after it [8..15], and the
  * kit status of each [16], [17]; a fault the switch left latched: FAR lo, hi, FSYNR0 [18..20] and the status after clearing it [21]. */
 volatile uint32_t native_adreno_cp_image[22];
-/* The newest 8 GPU restarts: [0] sequence, [1..2] time (us), [3] the fence it hung on, [4] status, [5] jobs replayed, [6] stranded << 0 | guilty << 1,
+/* The newest 8 GPU restarts: [0] sequence, [1..2] time (us), [3] the fence it hung on, [4] status, [5] jobs replayed, [6] stranded << 0 | guilty << 1 | SMMU fault << 2,
  * [7] why the second ring was given up (0 not). */
 volatile uint32_t native_adreno_recover_log[8][12];volatile uint32_t native_adreno_recover_log_count;
 /* checkCpSwitch's step results: createVm, probeBuffer, submit, waitAll, readTtbr0 (each 0 when it passed, ffffffff when not reached). */
@@ -279,13 +279,14 @@ static void nativeAdrenoHangcheck(void *,wait_result_t)
         if(g.submit && !g.submit->hangCheck(&hung) && hung) {
             native_adreno_recovery[0]=native_adreno_recovery[0]+1;
             if(g.restart) {
-                uint32_t fault[4]={};
+                uint32_t fault[4]={};uint64_t fault_table=0;
+                if(g.context)(void)g.context->readTtbr0(&fault_table);
                 if(g.context && !g.context->endFault(fault) && fault[0]) {
                     native_adreno_recovery_fault[0]=native_adreno_recovery_fault[0]+1;
                     for(unsigned i=0;i<4;++i)native_adreno_recovery_fault[1+i]=fault[i];
                 }
                 NativeAdrenoRecovery result{};
-                const IOReturn status=g.submit->recover(g.restart,g.restart_cookie,&g.clock,&result);
+                const IOReturn status=g.submit->recover(g.restart,g.restart_cookie,&g.clock,&result,fault[0]);
                 native_adreno_recovery[3]=result.fence;native_adreno_recovery[4]=uint32_t(status?status:result.status);
                 native_adreno_recovery[5]=native_adreno_recovery[5]+result.replayed;
                 if(result.guilty)native_adreno_recovery[6]=native_adreno_recovery[6]+1;
@@ -297,9 +298,12 @@ static void nativeAdrenoHangcheck(void *,wait_result_t)
                     const uint32_t n=native_adreno_recover_log_count;volatile uint32_t *row=native_adreno_recover_log[n&7];
                     const uint64_t now=g.clock.now_us?g.clock.now_us(g.clock.cookie):0;
                     row[0]=n+1;row[1]=uint32_t(now);row[2]=uint32_t(now>>32);row[3]=result.fence;row[4]=uint32_t(status?status:result.status);
-                    row[5]=result.replayed;row[6]=(g.submit->lastRecoveryStranded()?1u:0u)|(result.guilty?2u:0u);row[7]=g.submit->deadReason();
+                    row[5]=result.replayed;row[6]=(g.submit->lastRecoveryStranded()?1u:0u)|(result.guilty?2u:0u)|(result.fault_status?4u:0u);row[7]=g.submit->deadReason();
                     for(unsigned i=0;i<4;++i)row[8+i]=g.submit->recoveryInfo(i);
                     native_adreno_recover_log_count=n+1;
+                    gpuTraceEvent(GpuTraceRecovery,0,result.fence,result.completed,result.replayed,row[6],row[7],
+                        row[8],row[11],uint32_t(status?status:result.status),result.fault_status,
+                        uint64_t(fault[2])<<32|fault[1],fault[3],fault_table);
                 }
                 if(status)g.status.noteFault();
                 if(!status)g.status.noteSuspend();

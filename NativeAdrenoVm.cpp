@@ -12,10 +12,6 @@ extern "C" {int (*native_adreno_dram_read32)(uint64_t,uint32_t *);int (*native_a
  * coherent mappings at map, unmap, submission and completion. */
 extern "C" {volatile uint32_t native_adreno_io_coherent;volatile uint32_t native_adreno_coherent_skips[4];}
 static bool coherentMapping(unsigned writeback) {return writeback && native_adreno_io_coherent;}
-/* GPU-written imports (render targets) are mapped non-coherent (the GPU stopped inside its end-of-pass clean writing them through
- * write-back mappings), and the CPU never touches their pixels while the GPU owns them: they were cleaned when mapped and need no
- * maintenance per submission, which cost about 60 ms per frame. */
-static bool importedUntouched(const NativeAdrenoMemory *memory) {return memory->imported() && native_adreno_io_coherent;}
 extern "C" {volatile uint64_t native_adreno_maint_kind[8][3];volatile uint64_t native_adreno_maint_walk[8];
     volatile uint32_t native_adreno_sync_skips[2];volatile uint32_t native_adreno_sync_audit[6];volatile uint32_t native_adreno_maint_all=~0u;}
 extern "C" boolean_t PE_parse_boot_argn(const char *,void *,int);
@@ -524,7 +520,7 @@ uint32_t NativeAdrenoVm::mode() const
 void NativeAdrenoVm::enlist(Mapping *m)
 {
     const NativeAdrenoMemory *memory=m->memory;
-    const bool coherent=coherentMapping(m->writeback) || importedUntouched(memory);
+    const bool coherent=coherentMapping(m->writeback);
     const bool written=memory->imported() && (m->permissions&ArmSmmu4KWrite);
     unsigned work=0;
     /* As publishMapped, acquireImported and reassertWriteCombined decide for one mapping. */
@@ -574,7 +570,7 @@ IOReturn NativeAdrenoVm::publishMapped()
         for(size_t i=0;i<high_;++i) {
             const Mapping &m=mappings_[i];
             if(!m.memory)continue;
-            if(coherentMapping(m.writeback) || importedUntouched(m.memory)) {
+            if(coherentMapping(m.writeback)) {
                 native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+1;
                 native_adreno_maint_kind[m.kind][2]=native_adreno_maint_kind[m.kind][2]+1;continue;
             }
@@ -607,7 +603,7 @@ IOReturn NativeAdrenoVm::acquireImported()
         for(size_t i=0;i<high_;++i) {
             const Mapping &m=mappings_[i];
             if(!m.memory || !m.memory->imported() || !(m.permissions&ArmSmmu4KWrite))continue;
-            if(coherentMapping(m.writeback) || importedUntouched(m.memory)) {native_adreno_coherent_skips[3]=native_adreno_coherent_skips[3]+1;continue;}
+            if(coherentMapping(m.writeback)) {native_adreno_coherent_skips[3]=native_adreno_coherent_skips[3]+1;continue;}
             if(m.memory->acquireDeviceWrites(0,m.memory->bytes(),NativeAdrenoPhaseComplete))return fail(ArmSmmu4KIoError);
         }
         return kIOReturnSuccess;
