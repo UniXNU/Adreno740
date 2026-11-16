@@ -12,6 +12,7 @@ extern "C" {
 extern volatile uint32_t native_adreno_stall_hang;
 extern volatile uint32_t native_adreno_stall[24];
 extern volatile uint32_t native_adreno_stall_fault[32];
+extern volatile uint32_t native_adreno_switch_timeouts;
 }
 IOReturn NativeAdrenoQueryCpu4K(NativeAdrenoCpuState *out)
 {CHECK(out);*out={};return kIOReturnSuccess;}
@@ -472,7 +473,7 @@ int main()
         CHECK(p.submit.retireCompleted()==0 && p.submit.outstanding()==0);
         std::puts("PASS a pausing wait drives the ring switch for a low-ring job");
     }
-    {
+    for(bool faulted:{false,true}) {
         /* A switch back to the first ring that the CP never finishes: the first-ring job behind it is stranded, not guilty. Its
          * client keeps its device, and the job runs again after the restart. */
         Path p;CHECK(exposed(p)==kIOReturnSuccess);NativeAdrenoRing low;
@@ -493,15 +494,25 @@ int main()
         lowfence[1]=low_fence;CHECK(p.submit.retireCompleted()==0 && p.submit.outstanding()==0);
         p.submit.nextPriority(0);CHECK(p.submit.submit(&p.vm,&buffer,1,8,&high_fence,&ringclock)==0);
         CHECK(cp.regs[0x08a0]&1);                                                    /* the switch back, which never finishes */
-        clock_us+=1100000;CHECK(p.submit.retireCompleted()==0);
+        const uint32_t timeouts=native_adreno_switch_timeouts;
+        clock_us+=1100000;
+        for(unsigned i=0;i<3;++i)CHECK(p.submit.retireCompleted()==0);
+        CHECK(native_adreno_switch_timeouts==timeouts+1);
         bool hung=false;
         for(unsigned i=0;i<4 && !hung;++i) {clock_us+=1000;CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess);}
         CHECK(hung && p.submit.deadReason()==2);
         NativeAdrenoRecovery result{};
         auto restart=[](void *,NativeAdrenoRing *ring,uint32_t completed)->IOReturn {return ring->restart(completed);};
-        CHECK(p.submit.recover(restart,nullptr,&ringclock,&result)==kIOReturnSuccess);
-        CHECK(!result.guilty && p.submit.lastRecoveryStranded() && p.submit.outstanding()==1);
-        std::puts("PASS a first-ring job behind a switch the CP never finished is replayed, with no job blamed");
+        CHECK(p.submit.recover(restart,nullptr,&ringclock,&result,faulted?0x80000002u:0)==kIOReturnSuccess);
+        if(faulted) {
+            CHECK(result.guilty==&p.vm && !p.submit.lastRecoveryStranded() && !result.replayed &&
+                result.completed==high_fence && p.submit.outstanding()==0 && p.vm.hangs()==1);
+        } else {
+            CHECK(!result.guilty && p.submit.lastRecoveryStranded() && result.replayed==1 &&
+                result.completed==high_fence-1 && fencemem[1]==high_fence-1 && p.ring.lastSubmitted()==high_fence && p.submit.outstanding()==1);
+        }
+        std::puts(faulted?"PASS SMMU fault selects guilty recovery during a stranded switch":
+            "PASS a stranded switch is counted once and replays the oldest pending job");
     }
     /* The driver's own synchronized buffers at a submission: not cleaned, and audited by the first 8 submissions and every 1024th. A
      * dirty line the audit finds ends the trust: that submission and every later one clean them again, and the audits stop. */
