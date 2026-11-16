@@ -245,9 +245,7 @@ int main()
         CHECK(wc.release()==kIOReturnSuccess && cached.release()==kIOReturnSuccess && contiguous.release()==kIOReturnSuccess);
         teardown(s);
     }
-    /* Imports. Without IO coherence a submission cleans every import and a completion invalidates the GPU-written ones. Once the
-     * board proved IO coherence the passes leave them alone and count them without a visit; the mappings are classified again when the
-     * proof arrives. */
+    /* Noncoherent imports publish CPU updates and acquire GPU writes even when write-back mappings are coherent. */
     {
         Space s;CHECK(exposed(s)==kIOReturnSuccess);
         NativeAdrenoMemory read,written;
@@ -265,17 +263,17 @@ int main()
         native_adreno_io_coherent=1;
         Counters b;
         CHECK(s.vm.publishMapped()==kIOReturnSuccess && s.vm.acquireImported()==kIOReturnSuccess);
-        CHECK(fixture.physical_calls==b.physical && native_adreno_maint_walk[5]==b.walk[5]+1);
-        CHECK(native_adreno_maint_walk[1]==b.walk[1] && native_adreno_maint_walk[4]==b.walk[4]);
-        CHECK(native_adreno_coherent_skips[2]==b.coherent[2]+2 && native_adreno_coherent_skips[3]==b.coherent[3]+1);
-        CHECK(native_adreno_maint_kind[NativeAdrenoKindImportRead][2]==b.kind[NativeAdrenoKindImportRead][2]+1 &&
-            native_adreno_maint_kind[NativeAdrenoKindImportWritten][2]==b.kind[NativeAdrenoKindImportWritten][2]+1);
+        CHECK(fixture.physical_calls==b.physical+6 && native_adreno_maint_walk[5]==b.walk[5]+1);
+        CHECK(native_adreno_maint_walk[1]==b.walk[1]+2 && native_adreno_maint_walk[4]==b.walk[4]+2);
+        CHECK(native_adreno_coherent_skips[2]==b.coherent[2] && native_adreno_coherent_skips[3]==b.coherent[3]);
+        CHECK(native_adreno_maint_kind[NativeAdrenoKindImportRead][0]==b.kind[NativeAdrenoKindImportRead][0]+1 &&
+            native_adreno_maint_kind[NativeAdrenoKindImportWritten][0]==b.kind[NativeAdrenoKindImportWritten][0]+1);
         /* The comparison's passes count the same. */
         native_adreno_maint_all=1;
         Counters c;
         CHECK(s.vm.publishMapped()==kIOReturnSuccess && s.vm.acquireImported()==kIOReturnSuccess);
-        CHECK(fixture.physical_calls==c.physical);
-        CHECK(native_adreno_coherent_skips[2]==c.coherent[2]+2 && native_adreno_coherent_skips[3]==c.coherent[3]+1);
+        CHECK(fixture.physical_calls==c.physical+6);
+        CHECK(native_adreno_coherent_skips[2]==c.coherent[2] && native_adreno_coherent_skips[3]==c.coherent[3]);
         CHECK(native_adreno_maint_walk[1]==c.walk[1]+2 && native_adreno_maint_walk[4]==c.walk[4]+2);
         native_adreno_maint_all=0;native_adreno_io_coherent=0;
         CHECK(s.vm.unmap(r)==kIOReturnSuccess && s.vm.unmap(w)==kIOReturnSuccess);
