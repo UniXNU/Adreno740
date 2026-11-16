@@ -43,6 +43,8 @@ extern "C" volatile uint32_t native_adreno_stall_kick[26];
 typedef IOReturn (*NativeAdrenoRestart)(void *cookie,NativeAdrenoRing *ring,uint32_t completed);
 struct NativeAdrenoRecovery {
     uint32_t fence;            /* the fence the GPU hung on */
+    uint32_t completed;        /* completed prefix installed before replay */
+    uint32_t fault_status;     /* SMMU fault status captured before reset */
     uint32_t replayed;         /* submissions given to the ring again after the restart */
     NativeAdrenoVm *guilty;    /* the VM of the hung submission, null when no job held that fence */
     IOReturn status;
@@ -263,10 +265,10 @@ public:
      * since the last check while work is pending and the CP made no progress either (a6xx_progress: IB1/IB2 base and remaining words, at
      * most DRM_MSM_HANGCHECK_PROGRESS_RETRIES (3) checks in a row on one fence). */
     IOReturn hangCheck(bool *hung);
-    /* msm's recover_worker: the job on the hung fence is the guilty one (its VM is marked, NativeAdrenoVm::noteHang), the ring fence
-     * moves past it, restart resets the GPU, the guilty job is retired, then every later job is submitted again with its own fence
-     * (a job of an unusable VM without its buffers). Callers serialize this with every other method. A failed restart poisons. */
-    IOReturn recover(NativeAdrenoRestart restart,void *cookie,const NativeAdrenoRingClock *,NativeAdrenoRecovery *);
+    /* A fault or hang retires the guilty fence and replays later jobs. A scheduling rescue replays every unfinished job from
+     * oldest onward. fault_status selects fault recovery even when a ring switch stranded pending work. The guilty VM receives
+     * noteHang; an unusable VM gets empty commands on replay. Callers serialize this with every other method. */
+    IOReturn recover(NativeAdrenoRestart restart,void *cookie,const NativeAdrenoRingClock *,NativeAdrenoRecovery *,uint32_t fault_status=0);
     bool poisoned() const {return poisoned_;}
     size_t outstanding() const;
     NativeAdrenoSubmitStats stats() const {return stats_;}
