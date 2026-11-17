@@ -558,6 +558,11 @@ void NativeAdrenoVm::sync()
     for(size_t i=0;mappings_ && i<high_;++i)if(mappings_[i].memory && mappings_[i].mapped_spans)enlist(&mappings_[i]);
     native_adreno_maint_walk[5]=native_adreno_maint_walk[5]+1;
 }
+static bool containsHandle(uint64_t handle,const uint64_t *handles,size_t count)
+{
+    for(size_t i=0;i<count;++i)if(handles[i]==handle)return true;
+    return false;
+}
 IOReturn NativeAdrenoVm::publishMapped()
 {
     if(!attached_ || poisoned_)return kIOReturnNotReady;
@@ -593,6 +598,34 @@ IOReturn NativeAdrenoVm::publishMapped()
         native_adreno_maint_kind[k][2]=native_adreno_maint_kind[k][2]+(kind_count_[k]-kind_work_[k]);
     return kIOReturnSuccess;
 }
+IOReturn NativeAdrenoVm::publishMappedScoped(const uint64_t *import_handles,size_t import_count)
+{
+    if(!attached_ || poisoned_)return kIOReturnNotReady;
+    if(import_count && !import_handles)return kIOReturnBadArgument;
+    if(maintainAll())return publishMapped();
+    sync();
+    native_adreno_maint_walk[0]=native_adreno_maint_walk[0]+1;
+    native_adreno_maint_walk[2]=native_adreno_maint_walk[2]+objects_;
+    size_t visited=0,skipped_imports=0;
+    for(size_t i=0;i<care_count_;++i) {
+        const Mapping &m=mappings_[care_[i]];
+        if(!(m.work&WorkSubmit)) {++visited;continue;}
+        if(m.memory->imported() && !containsHandle(m.handle,import_handles,import_count)) {
+            ++skipped_imports;
+            native_adreno_maint_kind[m.kind][2]=native_adreno_maint_kind[m.kind][2]+1;
+            continue;
+        }
+        ++visited;
+        if(m.memory->publishForDevice(0,m.memory->bytes(),true,distrust_write_combined_,NativeAdrenoPhaseSubmit))return fail(ArmSmmu4KIoError);
+        noteKind(m.kind,m.memory->bytes());
+    }
+    native_adreno_maint_walk[1]=native_adreno_maint_walk[1]+visited;
+    (void)skipped_imports;
+    native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+(uint32_t)submit_skips_;
+    for(unsigned k=0;k<NativeAdrenoKindCount;++k)
+        native_adreno_maint_kind[k][2]=native_adreno_maint_kind[k][2]+(kind_count_[k]-kind_work_[k]);
+    return kIOReturnSuccess;
+}
 IOReturn NativeAdrenoVm::acquireImported()
 {
     if(!attached_ || poisoned_)return kIOReturnNotReady;
@@ -614,6 +647,25 @@ IOReturn NativeAdrenoVm::acquireImported()
         if(!(m.work&WorkComplete))continue;
         if(m.memory->acquireDeviceWrites(0,m.memory->bytes(),NativeAdrenoPhaseComplete))return fail(ArmSmmu4KIoError);
     }
+    native_adreno_coherent_skips[3]=native_adreno_coherent_skips[3]+(uint32_t)complete_skips_;
+    return kIOReturnSuccess;
+}
+IOReturn NativeAdrenoVm::acquireImportedScoped(const uint64_t *write_handles,size_t write_count)
+{
+    if(!attached_ || poisoned_)return kIOReturnNotReady;
+    if(write_count && !write_handles)return kIOReturnBadArgument;
+    if(maintainAll())return acquireImported();
+    sync();
+    native_adreno_maint_walk[3]=native_adreno_maint_walk[3]+1;
+    size_t visited=0;
+    for(size_t i=0;i<care_count_;++i) {
+        const Mapping &m=mappings_[care_[i]];
+        if(!(m.work&WorkComplete)) {++visited;continue;}
+        if(!containsHandle(m.handle,write_handles,write_count))continue;
+        ++visited;
+        if(m.memory->acquireDeviceWrites(0,m.memory->bytes(),NativeAdrenoPhaseComplete))return fail(ArmSmmu4KIoError);
+    }
+    native_adreno_maint_walk[4]=native_adreno_maint_walk[4]+visited;
     native_adreno_coherent_skips[3]=native_adreno_coherent_skips[3]+(uint32_t)complete_skips_;
     return kIOReturnSuccess;
 }

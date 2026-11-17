@@ -72,6 +72,7 @@ class NativeAdrenoUserClient final {
     int32_t priority_foreground_=-1,priority_background_=-1;
     uint32_t priority_told_=0;
     NativeAdrenoSubmitBuffer submit_buffers_[NativeAdrenoAbiMaxBuffers]{};   /* submit()'s list: too large for the kernel stack */
+    NativeAdrenoSubmitImport submit_imports_[NativeAdrenoAbiMaxBuffers]{};
     NativeAdrenoAbiSubmit submit_request_{};   /* the submit request as copied in, for the same reason */
     uint64_t window_start_=0,window_bytes_=0,window_peak_=0;
     uint64_t next_handle_=1;

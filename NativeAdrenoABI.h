@@ -12,7 +12,7 @@
  * rather than ignored. */
 enum {
     NativeAdrenoAbiVersion = 2,
-    NativeAdrenoAbiMaxBuffers = 128,   /* a frame's IBs in one submission (Turnip splits a larger one) */
+    NativeAdrenoAbiMaxBuffers = 160,   /* IBs and optional trailing scoped host-import descriptors (fits 4096-byte inband MIG limit with 8-byte tunnel header) */
     NativeAdrenoMethodQuery = 1,
     NativeAdrenoMethodBoAlloc = 2,
     NativeAdrenoMethodBoMap = 3,
@@ -74,14 +74,21 @@ struct NativeAdrenoAbiBoMapReply {
 struct NativeAdrenoAbiBoFree {
     uint64_t handle;
 };
+#if defined(__cplusplus)
+static constexpr uint32_t NativeAdrenoSubmitScopedImports = 0x80000000u;   /* reserved flag: buffers[buffer_count .. +import_count-1] describe touched host imports */
+static constexpr uint32_t NativeAdrenoSubmitScopedImportMask = 0x0000ffffu;
+#else
+#define NativeAdrenoSubmitScopedImports 0x80000000u
+#define NativeAdrenoSubmitScopedImportMask 0x0000ffffu
+#endif
 struct NativeAdrenoAbiSubmitBuffer {
     uint64_t handle;
     uint64_t iova;
-    uint64_t bytes;               /* 4-byte multiple, dword count = bytes/4 */
+    uint64_t bytes;               /* 4-byte multiple, dword count = bytes/4; or access mode (1 read, 3 read+write) for trailing scoped import entries */
 };
 struct NativeAdrenoAbiSubmit {
     uint32_t buffer_count;        /* 1..NativeAdrenoAbiMaxBuffers */
-    uint32_t reserved;            /* zero */
+    uint32_t reserved;            /* zero (legacy full-VM import maintenance), or NativeAdrenoSubmitScopedImports | import_count */
     uint64_t queue;               /* open queue; 0 is created by open() */
     uint64_t wait_fence;          /* zero or an earlier fence of this client */
     uint64_t wait_timeout_ns;     /* used only when wait_fence is nonzero */
@@ -170,6 +177,7 @@ static_assert(sizeof(NativeAdrenoAbiBoMap) == 32, "ABI map layout");
 static_assert(sizeof(NativeAdrenoAbiBoImport) == 16, "ABI import layout");
 static_assert(sizeof(NativeAdrenoAbiSubmitBuffer) == 24, "ABI buffer layout");
 static_assert(sizeof(NativeAdrenoAbiSubmit) == 32 + 24 * NativeAdrenoAbiMaxBuffers, "ABI submit layout");
+static_assert(sizeof(NativeAdrenoAbiSubmit) + 8 <= 4096, "ABI submit plus tunnel header fits XNU io_struct_inband_t");
 static_assert(sizeof(NativeAdrenoAbiBoCpuMap) == 8, "ABI cpu map layout");
 static_assert(sizeof(NativeAdrenoAbiBoCpuMapReply) == 16, "ABI cpu map reply layout");
 static_assert(sizeof(NativeAdrenoAbiBoCpuUnmap) == 16, "ABI cpu unmap layout");

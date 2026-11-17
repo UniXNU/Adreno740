@@ -663,6 +663,57 @@ int main()
         NativeAdrenoAbiQueueReply after{};
         CHECK(p.client.createQueue(&after)==kIOReturnNotReady);
     }
+    /* Scoped import ABI: reserved carries NativeAdrenoSubmitScopedImports | import_count, maintaining only submitted surfaces and rejecting invalid descriptors. */
+    {
+        Path p;CHECK(exposed(p)==kIOReturnSuccess);
+        static_assert(NativeAdrenoAbiMaxBuffers==160,"ABI buffer limit");
+        static_assert(sizeof(NativeAdrenoAbiSubmit)+8<=4096,"inband MIG size");
+        void *task=reinterpret_cast<void *>(0x77);
+        NativeAdrenoAbiBoAllocReply imp[3]{},ib{};
+        for(unsigned i=0;i<3;++i) {
+            NativeAdrenoAbiBoImport req{0x10000000+0x10000ull*i,2*4096};
+            CHECK(p.client.importBo(&req,task,&imp[i])==kIOReturnSuccess);
+            NativeAdrenoAbiBoMap m{imp[i].handle,0x804000+0x2000ull*i,3,0,2,0};
+            NativeAdrenoAbiBoMapReply mr{};
+            CHECK(p.client.mapBo(&m,&mr)==kIOReturnSuccess);
+        }
+        NativeAdrenoAbiBoAlloc iba{4096,12,1};
+        CHECK(p.client.allocBo(&iba,&ib)==kIOReturnSuccess);
+        NativeAdrenoAbiBoMap ibm{ib.handle,0x800000,3,0,2,0};NativeAdrenoAbiBoMapReply ibmr{};
+        CHECK(p.client.mapBo(&ibm,&ibmr)==kIOReturnSuccess);
+        NativeAdrenoAbiSubmit s{};s.buffer_count=1;s.buffers[0]={ib.handle,0x800000,256};
+        NativeAdrenoAbiSubmitReply reply{};
+        s.reserved=NativeAdrenoSubmitScopedImports|0x00010001u;   /* unknown reserved bit */
+        CHECK(p.client.submit(&s,&reply,&ringclock)==kIOReturnBadArgument);
+        s.reserved=NativeAdrenoSubmitScopedImports|uint32_t(NativeAdrenoAbiMaxBuffers);   /* overflows buffer_count + import_count */
+        CHECK(p.client.submit(&s,&reply,&ringclock)==kIOReturnBadArgument);
+        s.reserved=NativeAdrenoSubmitScopedImports|1u;
+        s.buffers[1]={imp[0].handle,4096,3};   /* iova must be 0 */
+        CHECK(p.client.submit(&s,&reply,&ringclock)==kIOReturnBadArgument);
+        s.buffers[1]={imp[0].handle,0,2};      /* mode must be 1 or 3 */
+        CHECK(p.client.submit(&s,&reply,&ringclock)==kIOReturnBadArgument);
+        s.buffers[1]={ib.handle,0,3};          /* non-imported BO rejected as scoped import */
+        CHECK(p.client.submit(&s,&reply,&ringclock)==kIOReturnBadArgument);
+        /* Frame writes imp[0] (mode 3) and reads imp[1] (mode 1), leaving imp[2] untouched. */
+        s.reserved=NativeAdrenoSubmitScopedImports|2u;
+        s.buffers[1]={imp[0].handle,0,3};
+        s.buffers[2]={imp[1].handle,0,1};
+        const size_t before=fixture.physical_bytes;
+        CHECK(p.client.submit(&s,&reply,&ringclock)==kIOReturnSuccess);
+        CHECK(fixture.physical_bytes==before+4*4096);   /* imp[0] + imp[1] only */
+        fencemem[1]=reply.fence;
+        NativeAdrenoAbiWaitFence w{reply.fence,UINT64_C(1000000)};
+        CHECK(p.client.waitFence(&w,&ringclock)==kIOReturnSuccess);
+        CHECK(fixture.physical_bytes==before+6*4096);   /* acquire only on mode 3 (imp[0]) */
+        /* 0-import scoped submit skips all RW imports. */
+        s.reserved=NativeAdrenoSubmitScopedImports;
+        CHECK(p.client.submit(&s,&reply,&ringclock)==kIOReturnSuccess);
+        CHECK(fixture.physical_bytes==before+6*4096);
+        fencemem[1]=reply.fence;w.fence=reply.fence;
+        CHECK(p.client.waitFence(&w,&ringclock)==kIOReturnSuccess);
+        CHECK(fixture.physical_bytes==before+6*4096);
+        CHECK(p.client.releaseAll(&ringclock,1000)==kIOReturnSuccess);
+    }
     std::printf("PASS: 1 complete user-client transaction with pre-submit wait, 1 CPU mapping lease block, 1 queue lifecycle block, 3 metadata refusals, 1 dispatched transaction, 6 dispatch size/argument refusals, 6 allocation refusals, 7 map refusals and 1 poisoned-commit retention case, 1 two-client shared-ring block with 8 scope/window refusals, 1 late-client first-scope block over software SMMU/CP peers\n");
 }
 /* Physical-page maintenance (imported BOs): record it; no host page is touched. */

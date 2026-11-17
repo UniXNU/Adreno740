@@ -66,7 +66,7 @@ int timeread(void *,uint32_t address,uint32_t *value) {
     if(address==0x0980)ticks+=1000;
     *value=address==0x0980?uint32_t(ticks):(address==0x0981?uint32_t(ticks>>32):0);return 0;
 }
-const NativeAdrenoAbiDeviceInfo info={0x43050a01u,3u<<20,0x1000000ull,0x1fffffffff000ull,0x20000000ull,0x60000000ull,
+const NativeAdrenoAbiDeviceInfo info={0x43050a01u,3u<<20,0x1000000ull,0x1fffffffff000ull,GpuClientVaStart,0x60000000ull,
     16,6,1,4,NativeAdrenoDeviceClientIova,0};
 const NativeAdrenoRingIo ringio{nullptr,cwrite,cread,cbarrier};
 const NativeAdrenoRingCache ringcache{nullptr,cpublish,cacquire};
@@ -118,7 +118,7 @@ int proc_selfpid(void) {return getpid();}
 int host_gpu_open() {
     std::lock_guard<std::recursive_mutex> guard(serviceLock);
     if(!build() || opened)return kIOReturnBusy;
-    const IOReturn st=client.open(NativeAdrenoAbiVersion,context->vm(),&execbuf,&ring,31,40);
+    const IOReturn st=client.open(NativeAdrenoAbiVersion,context->vm(),&execbuf,&ring,context->inputBits(),40);
     if(st) {std::fprintf(stderr,"host gpu: client open failed %d\n",st);return kIOReturnNotReady;}
     std::setvbuf(stderr,nullptr,_IONBF,0);
     client.attachTimer(&timer);
