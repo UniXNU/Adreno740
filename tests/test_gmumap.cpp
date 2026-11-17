@@ -19,7 +19,7 @@ static uint32_t mmio[SMMU_BYTES/4];
 static struct {unsigned calls,fail_call,after;} mf;
 static ArmSmmu4KIo io;
 static ArmSmmu4KStreamState streams;
-static ArmSmmu4KStream routes[1]={{2,0}}; /* slot 0 holds an unrelated route */
+static ArmSmmu4KStream routes[1]={{2,0,0}}; /* slot 0 holds an unrelated route */
 static ArmSmmu4KStreamResult route_result;
 static ArmSmmu4KContextConfig context;
 static ArmSmmu4KContextImage image;

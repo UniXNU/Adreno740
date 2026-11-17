@@ -21,7 +21,7 @@ static uint32_t memory[BYTES/4];
 static struct {unsigned calls,fail_call,after;} f;
 static ArmSmmu4KIo io;
 static ArmSmmu4KStreamState streams;
-static ArmSmmu4KStream routes[2]={{2,0},{4,1}};
+static ArmSmmu4KStream routes[2]={{2,0,0},{4,1,0}};
 static ArmSmmu4KStreamResult route_result;
 static ArmSmmu4KContextConfig context;
 static ArmSmmu4KContextImage image;
