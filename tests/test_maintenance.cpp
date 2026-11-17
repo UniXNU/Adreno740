@@ -339,6 +339,40 @@ int main()
         CHECK(mapped.release()==kIOReturnSuccess && system.release()==kIOReturnSuccess);
         teardown(s);
     }
+    /* Scoped import maintenance: only named imported handles are published/acquired, while non-imported BOs stay maintained and gpu-maint-all=1 overrides. */
+    {
+        Space s;CHECK(exposed(s)==kIOReturnSuccess);
+        NativeAdrenoMemory imp0,imp1,imp2,plain;
+        void *task=reinterpret_cast<void *>(0x77);
+        CHECK(imp0.importTask(task,0x10000000,2*4096,40,2*4096)==kIOReturnSuccess);
+        CHECK(imp1.importTask(task,0x20000000,2*4096,40,2*4096)==kIOReturnSuccess);
+        CHECK(imp2.importTask(task,0x30000000,2*4096,40,2*4096)==kIOReturnSuccess);
+        CHECK(buffer(plain,4096)==kIOReturnSuccess);
+        uint64_t h0=0,h1=0,h2=0,hp=0;
+        CHECK(s.vm.map(&imp0,0,0x800000,3,0,2,&h0)==kIOReturnSuccess && s.vm.map(&imp1,0,0x810000,3,0,2,&h1)==kIOReturnSuccess &&
+            s.vm.map(&imp2,0,0x820000,3,0,2,&h2)==kIOReturnSuccess && s.vm.map(&plain,0,0x830000,3,0,2,&hp)==kIOReturnSuccess);
+        Counters a;
+        const uint64_t touched[2]={h0,h2};
+        CHECK(s.vm.publishMappedScoped(touched,2)==kIOReturnSuccess);
+        CHECK(tracked_calls==a.owned+1 && fixture.physical_calls==a.physical+4);   /* imp0+imp2 (2 spans each), imp1 skipped */
+        CHECK(native_adreno_maint_kind[NativeAdrenoKindImportWritten][2]==a.kind[NativeAdrenoKindImportWritten][2]+1);
+        Counters b;
+        CHECK(s.vm.publishMappedScoped(nullptr,0)==kIOReturnSuccess);   /* 0 imports still maintains plain kernel BO */
+        CHECK(tracked_calls==b.owned+1 && fixture.physical_calls==b.physical);
+        CHECK(native_adreno_maint_kind[NativeAdrenoKindImportWritten][2]==b.kind[NativeAdrenoKindImportWritten][2]+3);
+        Counters c;
+        CHECK(s.vm.acquireImportedScoped(&h1,1)==kIOReturnSuccess && fixture.physical_calls==c.physical+2);
+        CHECK(s.vm.acquireImportedScoped(nullptr,0)==kIOReturnSuccess && fixture.physical_calls==c.physical+2);
+        native_adreno_maint_all=1;
+        CHECK(s.vm.publishMappedScoped(nullptr,0)==kIOReturnSuccess && fixture.physical_calls==c.physical+8);
+        CHECK(s.vm.acquireImportedScoped(nullptr,0)==kIOReturnSuccess && fixture.physical_calls==c.physical+14);
+        native_adreno_maint_all=0;
+        CHECK(s.vm.unmap(h0)==kIOReturnSuccess && s.vm.unmap(h1)==kIOReturnSuccess &&
+            s.vm.unmap(h2)==kIOReturnSuccess && s.vm.unmap(hp)==kIOReturnSuccess);
+        CHECK(imp0.release()==kIOReturnSuccess && imp1.release()==kIOReturnSuccess &&
+            imp2.release()==kIOReturnSuccess && plain.release()==kIOReturnSuccess);
+        teardown(s);
+    }
     std::printf("PASS: synchronized driver buffers left out of map, submission and unmap; gpu-maint-all and the audit's distrust restore "
         "their maintenance; passes visit only mappings with work (304 objects, 3 visited); system memory by attribute; imports with and "
         "without IO coherence; the synchronized audit's pages; the submission log's readers\n");

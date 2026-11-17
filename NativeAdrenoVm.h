@@ -169,6 +169,9 @@ public:
      * while trusted, imports their owner maps non-cacheable), and the driver's own synchronized buffers, whose
      * writers cleaned what they stored. Only the mappings with such work are visited. */
     IOReturn publishMapped();
+    /* Scoped variant: maintains non-imported WorkSubmit mappings as publishMapped(), and among non-coherent
+     * imported mappings only those whose mapping handle appears in import_handles[0..import_count-1]. */
+    IOReturn publishMappedScoped(const uint64_t *import_handles,size_t import_count);
     /* The submit path saw a CPU-cached word that DRAM did not hold yet in a client's BO: from now on write-combined BOs are maintained
      * like any other (sticky; the safe behaviour of int-070..097). */
     void distrustWriteCombined() {distrust_write_combined_=true;}
@@ -177,6 +180,8 @@ public:
      * (an IOSurface) reads what the GPU wrote, not a line prefetched while the GPU ran. Jobs name only their IBs, so every such BO
      * is covered. int-071: an imported render target read back 672 of 4096 texels stale. */
     IOReturn acquireImported();
+    /* Scoped variant: invalidates only WorkComplete imported mappings whose mapping handle appears in write_handles[0..write_count-1]. */
+    IOReturn acquireImportedScoped(const uint64_t *write_handles,size_t write_count);
     /* Diagnostic, never a proof of coherence: the 32-bit word at a mapped GPU address as the kernel's cacheable alias reads it
      * and, when the board installed native_adreno_dram_read32, as DRAM reads it through an uncached mapping (else ~0). */
     IOReturn sampleWord(uint64_t iova,uint32_t *cached,uint32_t *dram) const;

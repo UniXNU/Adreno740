@@ -6,11 +6,15 @@
 #include "NativeAdrenoVm.h"
 
 /* IBs of one submission: a whole frame, so the ring prologue (cache flush, idle wait, thread switch) runs once per frame. */
-enum : size_t {NativeAdrenoSubmitMaxBuffers=128};
+enum : size_t {NativeAdrenoSubmitMaxBuffers=160};
 struct NativeAdrenoSubmitBuffer {
     uint64_t handle;
     uint64_t iova;
     size_t bytes;      /* Complete indirect-buffer range in bytes. */
+};
+struct NativeAdrenoSubmitImport {
+    uint64_t handle;   /* VM mapping handle from NativeAdrenoVm::map */
+    uint32_t mode;     /* 1 = read, 3 = read+write */
 };
 /* Coherence samples (int-070): [0] submissions sampled; [1..3] the last one's first IB word through the kernel's cacheable alias,
  * through DRAM before and through DRAM after the CPU cache maintenance of every mapped BO (~0 when unreadable); [4] samples whose
@@ -82,6 +86,8 @@ private:
         uint32_t fence=0;
         size_t count=0;
         uint64_t handles[NativeAdrenoSubmitMaxBuffers]{};
+        uint8_t handle_write_import[NativeAdrenoSubmitMaxBuffers]{};   /* nonzero for GPU-writable scoped host imports */
+        bool scoped_imports=false;
         uint64_t queue=0;
         bool active=false;
         uint64_t vm_next=0;   /* NativeAdrenoVm::nextHandle() at submission: a mapping with a handle from it on came later */
@@ -171,12 +177,15 @@ private:
     uint64_t ring_retired_us_[2]{};uint32_t ring_retired_fence_[2]{};   /* the newest retirement seen on each ring */
     bool attached_=false,poisoned_=false;
     uint32_t audit_tick_=0;   /* submissions since attach; every eighth one audits its IB lines */
-    /* submit()'s distinct buffers and ring words: too large for the kernel stack at 128 IBs (callers serialize every method) */
+    /* submit()'s distinct buffers and ring words: too large for the kernel stack at 160 IBs (callers serialize every method) */
     uint64_t scratch_handles_[NativeAdrenoSubmitMaxBuffers]{};
+    uint8_t scratch_write_imports_[NativeAdrenoSubmitMaxBuffers]{};
+    uint64_t scratch_import_handles_[NativeAdrenoSubmitMaxBuffers]{};
+    uint64_t retire_handles_[NativeAdrenoSubmitMaxBuffers]{};
     uint32_t scratch_words_[NativeAdrenoSubmitMaxBuffers*4]{};
     Job *find(uint32_t fence);
     Job *free();
-    IOReturn release(Job &);
+    IOReturn release(Job &,bool skip_acquire=false);
     IOReturn poison();
     int32_t next_owner_=0;
     /* The clock of the last submission, for the time a job is seen retired (release has no clock of its own). */
@@ -237,6 +246,8 @@ public:
      * VM's table. The clock is for the CPU switch's wait for the GPU to go idle. */
     IOReturn submit(NativeAdrenoVm *,const NativeAdrenoSubmitBuffer *,size_t,uint64_t queue,uint32_t *fence,
         const NativeAdrenoRingClock *);
+    IOReturn submit(NativeAdrenoVm *,const NativeAdrenoSubmitBuffer *,size_t,uint64_t queue,uint32_t *fence,
+        const NativeAdrenoRingClock *,bool scoped_imports,const NativeAdrenoSubmitImport *imports,size_t import_count);
     /* Turns on table switching (mode 1 or 2, see table_mode_); write installs a TTBR0 from the CPU (used by mode 1 and to leave a
      * table that is about to be freed). Only with no job outstanding. */
     IOReturn setTableSwitching(unsigned mode,IOReturn (*write)(void *,uint64_t),void *cookie);

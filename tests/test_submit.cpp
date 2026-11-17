@@ -576,6 +576,37 @@ int main()
         CHECK(p.submit.detach()==kIOReturnSuccess);
         std::puts("PASS the submission log without and with diag=1, and the timed phases");
     }
+    /* Scoped import submissions: only named imports are cleaned/invalidated, and retireCompleted() coalesces per-VM acquireImportedScoped across multiple jobs. */
+    {
+        Path p;CHECK(exposed(p)==kIOReturnSuccess);
+        NativeAdrenoMemory s0,s1,s2;
+        void *task=reinterpret_cast<void *>(0x77);
+        CHECK(s0.importTask(task,0x10000000,4096,40,4096)==kIOReturnSuccess);
+        CHECK(s1.importTask(task,0x20000000,4096,40,4096)==kIOReturnSuccess);
+        CHECK(s2.importTask(task,0x30000000,4096,40,4096)==kIOReturnSuccess);
+        uint64_t h0=0,h1=0,h2=0;
+        CHECK(p.vm.map(&s0,0,0x804000,3,0,2,&h0)==kIOReturnSuccess &&
+            p.vm.map(&s1,0,0x808000,3,0,2,&h1)==kIOReturnSuccess &&
+            p.vm.map(&s2,0,0x80c000,3,0,2,&h2)==kIOReturnSuccess);
+        NativeAdrenoSubmitBuffer ib{p.handle,0x800000,4096};
+        NativeAdrenoSubmitImport bad_mode{h0,2};
+        uint32_t f1=0,f2=0;
+        CHECK(p.submit.submit(&p.vm,&ib,1,0,&f1,&ringclock,true,&bad_mode,1)==kIOReturnBadArgument);
+        const NativeAdrenoSubmitImport imp1[2]={{h0,1},{h1,3}},imp2[1]={{h1,3}};   /* s2 untouched; h0 read-only */
+        const unsigned phys0=fixture.physical_calls;
+        CHECK(p.submit.submit(&p.vm,&ib,1,0,&f1,&ringclock,true,imp1,2)==kIOReturnSuccess);
+        CHECK(fixture.physical_calls==phys0+2);   /* s0+s1 only */
+        CHECK(p.submit.submit(&p.vm,&ib,1,0,&f2,&ringclock,true,imp2,1)==kIOReturnSuccess);
+        CHECK(fixture.physical_calls==phys0+3);   /* s1 only */
+        fencemem[1]=f2;
+        const unsigned phys_before_retire=fixture.physical_calls;
+        CHECK(p.submit.retireCompleted()==kIOReturnSuccess && p.submit.outstanding()==0);
+        CHECK(fixture.physical_calls==phys_before_retire+1);   /* h1 invalidated ONCE across both jobs; h0 (mode 1) and h2 skipped */
+        CHECK(p.vm.unmap(h0)==kIOReturnSuccess && p.vm.unmap(h1)==kIOReturnSuccess && p.vm.unmap(h2)==kIOReturnSuccess);
+        CHECK(s0.release()==kIOReturnSuccess && s1.release()==kIOReturnSuccess && s2.release()==kIOReturnSuccess);
+        CHECK(p.submit.detach()==kIOReturnSuccess);
+        std::puts("PASS scoped import maintenance and coalesced retireCompleted");
+    }
     std::printf("PASS: 1 execbuf submission with exact IB packet and fence, 8 pre-reference refusals, 1 duplicate-buffer reference case and 1 poisoned-commit retention case over software SMMU/CP peers; 2 write-combine audit cases (trusted, dirty and failed); 1 hangcheck and 1 recovery with replay, 1 usable VM after recovery and 1 failed restart\n");
 }
 /* Physical-page maintenance (imported BOs): record it; no host page is touched. */

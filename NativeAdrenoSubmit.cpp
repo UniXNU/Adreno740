@@ -507,7 +507,7 @@ IOReturn NativeAdrenoSubmit::setPreemption(NativeAdrenoRing *high,NativeAdrenoRi
     preempt_on_=true;
     return kIOReturnSuccess;
 }
-IOReturn NativeAdrenoSubmit::release(Job &job)
+IOReturn NativeAdrenoSubmit::release(Job &job,bool skip_acquire)
 {
     IOReturn status=kIOReturnSuccess;
     NativeAdrenoVm *vm=job.vm?job.vm:vm_;
@@ -519,7 +519,15 @@ IOReturn NativeAdrenoSubmit::release(Job &job)
         if(retired)status=retired;else ++stats_.references_retired;
     }
     if(status)return poison();
-    if(vm->acquireImported())return poison();
+    if(!skip_acquire) {
+        if(job.scoped_imports) {
+            size_t write_count=0;
+            for(size_t i=0;i<job.count;++i)if(job.handle_write_import[i])retire_handles_[write_count++]=job.handles[i];
+            if(vm->acquireImportedScoped(retire_handles_,write_count))return poison();
+        } else if(vm->acquireImported()) {
+            return poison();
+        }
+    }
     {
         uint64_t start=0,end=0;
         NativeAdrenoRing *r=ringOfFence(job.fence);
@@ -566,6 +574,12 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
 IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitBuffer *buffers,size_t count,
     uint64_t queue,uint32_t *fence,const NativeAdrenoRingClock *clock)
 {
+    return submit(vm,buffers,count,queue,fence,clock,false,nullptr,0);
+}
+IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitBuffer *buffers,size_t count,
+    uint64_t queue,uint32_t *fence,const NativeAdrenoRingClock *clock,
+    bool scoped_imports,const NativeAdrenoSubmitImport *imports,size_t import_count)
+{
     if(!fence)return kIOReturnBadArgument;*fence=0;
     if(!vm)vm=vm_;
     NativeAdrenoVm *const vm_=vm;   /* this submission's VM: every vm_ below is the job's own */
@@ -573,6 +587,7 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
     /* msm_ioctl_gem_submit refuses a VM a hang made unusable. */
     if(vm->unusable())return kIOReturnNotPermitted;
     if(!buffers || !count || count>SubmitMaxBuffers)return kIOReturnBadArgument;
+    if(scoped_imports && (import_count>SubmitMaxBuffers-count || (import_count && !imports)))return kIOReturnBadArgument;
     /* The phases' clock: each lap takes the time since the one before; an accepted submission adds them to native_adreno_submit_us. */
     uint64_t lap_us=clock && clock->now_us?clock->now_us(clock->cookie):0,laps[6]={};
     const uint64_t began_us=lap_us;
@@ -586,6 +601,8 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
     if(count>16)native_adreno_submit_ibs[3]=native_adreno_submit_ibs[3]+1;
     /* Every buffer is validated against the live VM before any reference. */
     uint64_t *handles=scratch_handles_;size_t handle_count=0;
+    uint8_t *write_imports=scratch_write_imports_;
+    uint64_t *import_handles=scratch_import_handles_;size_t import_handle_count=0;
     uint32_t *words=scratch_words_;size_t word_count=0;
     uint64_t ib_bytes=0;
     static_assert(sizeof(scratch_words_)/sizeof(scratch_words_[0])>=SubmitMaxBuffers*(1+SubmitIbWords),"ring words");
@@ -608,7 +625,30 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
         ib_bytes+=buffer.bytes;
         bool known=false;
         for(size_t j=0;j<handle_count;++j)if(handles[j]==buffer.handle) {known=true;break;}
-        if(!known)handles[handle_count++]=buffer.handle;
+        if(!known) {write_imports[handle_count]=0;handles[handle_count++]=buffer.handle;}
+    }
+    if(scoped_imports) {
+        for(size_t i=0;i<import_count;++i) {
+            const NativeAdrenoSubmitImport &imp=imports[i];
+            if(!imp.handle || (imp.mode!=1u && imp.mode!=3u))return kIOReturnBadArgument;
+            uint64_t iova=0;size_t bytes=0;unsigned permissions=0;
+            IOReturn status=vm_->describe(imp.handle,&iova,&bytes,&permissions);
+            if(status)return status;
+            if(!(permissions&ArmSmmu4KRead))return kIOReturnBadArgument;
+            bool known_imp=false;
+            for(size_t j=0;j<import_handle_count;++j)if(import_handles[j]==imp.handle) {known_imp=true;break;}
+            if(!known_imp)import_handles[import_handle_count++]=imp.handle;
+            size_t slot=handle_count;
+            for(size_t j=0;j<handle_count;++j)if(handles[j]==imp.handle) {slot=j;break;}
+            if(slot==handle_count) {
+                if(handle_count>=SubmitMaxBuffers)return kIOReturnBadArgument;
+                handles[handle_count]=imp.handle;
+                write_imports[handle_count]=(imp.mode&2u)?1u:0u;
+                ++handle_count;
+            } else if(imp.mode&2u) {
+                write_imports[slot]=1u;
+            }
+        }
     }
     IOReturn swept=retireCompleted();
     if(swept)return swept;
@@ -685,7 +725,7 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
     static uint32_t coherence_turn;
     const bool sample=!(coherence_turn++&63);
     if(sample)(void)vm_->sampleWord(buffers[0].iova,&cached,&before);
-    IOReturn status=vm_->publishMapped();
+    IOReturn status=scoped_imports?vm_->publishMappedScoped(import_handles,import_handle_count):vm_->publishMapped();
     if(!status && sample) {
         (void)vm_->sampleWord(buffers[0].iova,&ignored,&after);
         native_adreno_coherence[0]=native_adreno_coherence[0]+1;
@@ -740,7 +780,8 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
          * referenced buffers cannot be retired here. */
         if(target->poisoned()) {
             *job=Job{};++stats_.poisoned_jobs;
-            for(size_t i=0;i<handle_count;++i)job->handles[i]=handles[i];
+            for(size_t i=0;i<handle_count;++i){job->handles[i]=handles[i];job->handle_write_import[i]=write_imports[i];}
+            job->scoped_imports=scoped_imports;
             job->count=handle_count;job->queue=queue;job->active=true;job->vm_next=vm_->nextHandle();job->vm=vm;
             return poison();
         }
@@ -748,7 +789,8 @@ IOReturn NativeAdrenoSubmit::submit(NativeAdrenoVm *vm,const NativeAdrenoSubmitB
         /* No room in the ring yet: the caller waits for an earlier job and submits again. */
         return status==kIOReturnNoResources?kIOReturnBusy:status;
     }
-    for(size_t i=0;i<handle_count;++i)job->handles[i]=handles[i];
+    for(size_t i=0;i<handle_count;++i){job->handles[i]=handles[i];job->handle_write_import[i]=write_imports[i];}
+    job->scoped_imports=scoped_imports;
     job->count=handle_count;job->fence=value;job->queue=queue;job->active=true;job->vm_next=vm_->nextHandle();job->vm=vm;
     job->context=target->context();job->word_count=word_count;job->ring=uint8_t(index);
     job->priority=int8_t(next_priority_);job->role=uint8_t(next_role_);
@@ -1045,15 +1087,42 @@ IOReturn NativeAdrenoSubmit::waitRange(uint64_t first,uint64_t count,const Nativ
 IOReturn NativeAdrenoSubmit::retireCompleted()
 {
     if(!attached_ || poisoned_)return kIOReturnNotReady;
-    for(auto &job:jobs_) {
-        if(!job.active)continue;
-        NativeAdrenoRing *const r=ringOfFence(job.fence);
-    const NativeAdrenoRingFence state=r?r->observeFence(job.fence,nullptr,0,nullptr):NativeAdrenoRingFenceArgument;
-        if(state==NativeAdrenoRingFencePoisoned)return poison();
-        if(state!=NativeAdrenoRingFenceComplete)continue;
-        const IOReturn status=release(job);
-        if(status)return status;
-        ++stats_.completed;
+    for(;;) {
+        NativeAdrenoVm *target_vm=nullptr;
+        bool vm_poisoned=false,all_scoped=true;
+        uint64_t *write_handles=retire_handles_;
+        size_t write_count=0;
+        for(auto &job:jobs_) {
+            if(!job.active)continue;
+            NativeAdrenoVm *const vm=job.vm?job.vm:vm_;
+            if(target_vm && vm!=target_vm)continue;
+            NativeAdrenoRing *const r=ringOfFence(job.fence);
+            const NativeAdrenoRingFence state=r?r->observeFence(job.fence,nullptr,0,nullptr):NativeAdrenoRingFenceArgument;
+            if(state==NativeAdrenoRingFencePoisoned)return poison();
+            if(state!=NativeAdrenoRingFenceComplete)continue;
+            if(!target_vm)target_vm=vm;
+            if(vm!=vm_ && vm->poisoned())vm_poisoned=true;
+            if(!job.scoped_imports)all_scoped=false;
+            else if(all_scoped) {
+                for(size_t i=0;i<job.count;++i) {
+                    if(!job.handle_write_import[i])continue;
+                    bool known=false;
+                    for(size_t k=0;k<write_count;++k)if(write_handles[k]==job.handles[i]){known=true;break;}
+                    if(!known) {
+                        if(write_count>=SubmitMaxBuffers){all_scoped=false;break;}
+                        write_handles[write_count++]=job.handles[i];
+                    }
+                }
+            }
+            const IOReturn status=release(job,true);
+            if(status)return status;
+            ++stats_.completed;
+        }
+        if(!target_vm)break;
+        if(!vm_poisoned) {
+            const IOReturn acquired=all_scoped?target_vm->acquireImportedScoped(write_handles,write_count):target_vm->acquireImported();
+            if(acquired)return poison();
+        }
     }
     /* A ring that went idle leaves the CP to the other ring's queued work (driveSwitch decides by priority). */
     driveSwitch(nullptr);

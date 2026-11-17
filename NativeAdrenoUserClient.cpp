@@ -415,8 +415,13 @@ IOReturn NativeAdrenoUserClient::submit(const NativeAdrenoAbiSubmit *request,
 {
     if(!request || !reply)return kIOReturnBadArgument;reply->fence=0;
     if(!open_)return kIOReturnNotReady;
-    if(!request->buffer_count || request->buffer_count>NativeAdrenoAbiMaxBuffers ||
-        request->reserved)return kIOReturnBadArgument;
+    const bool scoped_imports=(request->reserved&NativeAdrenoSubmitScopedImports)!=0;
+    const uint32_t import_count=scoped_imports?(request->reserved&NativeAdrenoSubmitScopedImportMask):0;
+    if(!scoped_imports && request->reserved)return kIOReturnBadArgument;
+    if(scoped_imports && (request->reserved&~(NativeAdrenoSubmitScopedImports|NativeAdrenoSubmitScopedImportMask)))
+        return kIOReturnBadArgument;
+    if(!request->buffer_count || request->buffer_count>NativeAdrenoAbiMaxBuffers)return kIOReturnBadArgument;
+    if(scoped_imports && import_count>NativeAdrenoAbiMaxBuffers-request->buffer_count)return kIOReturnBadArgument;
     if(request->queue>=queue_capacity_ || !queues_[request->queue].active)
         return kIOReturnBadArgument;
     if(request->wait_fence) {
@@ -435,6 +440,14 @@ IOReturn NativeAdrenoUserClient::submit(const NativeAdrenoAbiSubmit *request,
         if(!entry || !entry->mapped_state)return kIOReturnBadArgument;
         buffers[i]={entry->mapped,wire.iova,(size_t)wire.bytes};
     }
+    NativeAdrenoSubmitImport *imports=submit_imports_;
+    for(uint32_t i=0;i<import_count;++i) {
+        const NativeAdrenoAbiSubmitBuffer &wire=request->buffers[request->buffer_count+i];
+        if(wire.iova || (wire.bytes!=1u && wire.bytes!=3u))return kIOReturnBadArgument;
+        Entry *entry=find(wire.handle);
+        if(!entry || !entry->mapped_state || !entry->imported)return kIOReturnBadArgument;
+        imports[i]={entry->mapped,(uint32_t)wire.bytes};
+    }
     uint32_t fence=0;
     used_=true;
     ring_->useContext(context_);
@@ -442,7 +455,7 @@ IOReturn NativeAdrenoUserClient::submit(const NativeAdrenoAbiSubmit *request,
     submit_->nextPriority(submitPriority());
     submit_->nextRole(task_get_gpu_role(current_task()));
     const IOReturn status=submit_->submit(vm_,buffers,request->buffer_count,
-        queue_base_+request->queue,&fence,clock);
+        queue_base_+request->queue,&fence,clock,scoped_imports,imports,import_count);
     if(status)return status;
     reply->fence=fence;
     return kIOReturnSuccess;
