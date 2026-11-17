@@ -2,6 +2,7 @@
 #include "NativeGpuTrace.h"
 /* SPDX-License-Identifier: MIT */
 #include "NativeAdrenoUserClient.h"
+#include "NativeAdrenoSubmitDiagnostic.h"
 #include <kern/task.h>
 #include <sys/resource_private.h>   /* PRIO_DARWIN_GPU_*: the process's GPU role, set by the system */
 extern "C" volatile uint32_t native_adreno_trace_stage;
@@ -416,23 +417,29 @@ IOReturn NativeAdrenoUserClient::submit(const NativeAdrenoAbiSubmit *request,
     if(!request || !reply)return kIOReturnBadArgument;reply->fence=0;
     if(!open_)return kIOReturnNotReady;
     if(!request->buffer_count || request->buffer_count>NativeAdrenoAbiMaxBuffers ||
-        request->reserved)return kIOReturnBadArgument;
+        request->reserved)return nativeAdrenoSubmitRejected(kIOReturnBadArgument,NativeAdrenoSubmitRequest,
+            UINT32_MAX,0,0,request->buffer_count,0,0,request->reserved);
     if(request->queue>=queue_capacity_ || !queues_[request->queue].active)
-        return kIOReturnBadArgument;
+        return nativeAdrenoSubmitRejected(kIOReturnBadArgument,NativeAdrenoSubmitQueue,
+            UINT32_MAX,0,0,request->buffer_count,0,queue_capacity_,request->queue);
     if(request->wait_fence) {
         if(!clock)return kIOReturnBadArgument;
         const uint32_t wait_us=request->wait_timeout_ns==0?0:
             (request->wait_timeout_ns>UINT64_C(0xffffffff)*1000u?0xffffffffu:
             (uint32_t)(request->wait_timeout_ns/1000));
         const IOReturn waited=submit_->observeFence((uint32_t)request->wait_fence,clock,wait_us);
-        if(waited)return waited;
+        if(waited)return nativeAdrenoSubmitRejected(waited,NativeAdrenoSubmitDependency,
+            UINT32_MAX,0,0,0,0,request->wait_timeout_ns,request->wait_fence);
     }
     NativeAdrenoSubmitBuffer *buffers=submit_buffers_;
     for(uint32_t i=0;i<request->buffer_count;++i) {
         const NativeAdrenoAbiSubmitBuffer &wire=request->buffers[i];
-        if(!wire.bytes || (wire.bytes&3))return kIOReturnBadArgument;
+        if(!wire.bytes || (wire.bytes&3))return nativeAdrenoSubmitRejected(kIOReturnBadArgument,
+            NativeAdrenoSubmitWireSize,i,wire.handle,wire.iova,wire.bytes);
         Entry *entry=find(wire.handle);
-        if(!entry || !entry->mapped_state)return kIOReturnBadArgument;
+        if(!entry || !entry->mapped_state)return nativeAdrenoSubmitRejected(kIOReturnBadArgument,
+            NativeAdrenoSubmitHandle,i,wire.handle,wire.iova,wire.bytes,
+            entry?entry->iova:0,entry?entry->memory.bytes():0,entry?1:0);
         buffers[i]={entry->mapped,wire.iova,(size_t)wire.bytes};
     }
     uint32_t fence=0;
@@ -443,7 +450,8 @@ IOReturn NativeAdrenoUserClient::submit(const NativeAdrenoAbiSubmit *request,
     submit_->nextRole(task_get_gpu_role(current_task()));
     const IOReturn status=submit_->submit(vm_,buffers,request->buffer_count,
         queue_base_+request->queue,&fence,clock);
-    if(status)return status;
+    if(status)return nativeAdrenoSubmitRejected(status,NativeAdrenoSubmitBackend,
+        UINT32_MAX,0,0,request->buffer_count,0,0,queue_base_+request->queue);
     reply->fence=fence;
     return kIOReturnSuccess;
 }
@@ -561,7 +569,12 @@ IOReturn NativeAdrenoUserClient::dispatch(uint32_t method,const void *input,
     Tally tally(method,&tally_result,clock);
     const size_t expected_in=inputSize(method),expected_out=outputSize(method);
     if(expected_in==SIZE_MAX || expected_out==SIZE_MAX)return kIOReturnUnsupported;
-    if(input_size!=expected_in || output_size!=expected_out)return kIOReturnBadArgument;
+    if(input_size!=expected_in || output_size!=expected_out) {
+        if(method==NativeAdrenoMethodSubmit)
+            return nativeAdrenoSubmitRejected(kIOReturnBadArgument,NativeAdrenoSubmitTransport,
+                UINT32_MAX,0,0,input_size,expected_in,expected_out,output_size);
+        return kIOReturnBadArgument;
+    }
     if((expected_in && !input) || (expected_out && !output))return kIOReturnBadArgument;
     IOReturn status=kIOReturnSuccess;
     switch(method) {

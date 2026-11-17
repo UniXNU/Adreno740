@@ -24,11 +24,35 @@
 #include <kern/thread_call.h>
 #include <kern/clock.h>
 #include "NativeAdrenoUserClient.h"
+#include "NativeAdrenoSubmitDiagnostic.h"
 #include "NativeAdrenoGpuContext.h"
 #include "NativeAdrenoPool.h"
 #include "NativeGpuTrace.inc"
 
 extern "C" void proc_selfname(char *, int);
+extern "C" int proc_selfpid(void);
+/* Submission callers hold g.lock. Keep the first failures outside the rolling
+ * trace so a later snapshot still identifies the rejected IB. */
+extern "C" {
+volatile uint64_t native_adreno_submit_rejections[16][12];
+volatile uint32_t native_adreno_submit_rejection_count;
+}
+extern "C" void native_adreno_submit_rejected(uint32_t stage,uint32_t index,
+    uint32_t status,uint64_t handle,uint64_t iova,uint64_t bytes,
+    uint64_t mapped_iova,uint64_t mapped_bytes,uint64_t detail)
+{
+    const uint32_t slot=native_adreno_submit_rejection_count;
+    if(slot>=16)return;
+    const uint32_t pid=uint32_t(proc_selfpid());
+    const uint64_t words[12]={pid,stage,index,status,handle,iova,bytes,mapped_iova,mapped_bytes,detail};
+    for(unsigned i=0;i<12;++i)native_adreno_submit_rejections[slot][i]=words[i];
+    __atomic_store_n(&native_adreno_submit_rejection_count,slot+1,__ATOMIC_RELEASE);
+    IOLog("[gpu submit rejected] pid=%u stage=%u ib=%u status=0x%x handle=%llx iova=%llx bytes=%llx mapped=%llx+%llx detail=%llx\n",
+        pid,stage,index,status,(unsigned long long)handle,(unsigned long long)iova,
+        (unsigned long long)bytes,(unsigned long long)mapped_iova,
+        (unsigned long long)mapped_bytes,(unsigned long long)detail);
+    gpuTraceEvent(GpuTraceSubmitRejected,pid,stage,index,status,handle,iova,bytes,mapped_iova,mapped_bytes,detail);
+}
 /* The system's render server, the process that composes the display: backboardd on iPadOS, WindowServer on macOS. It gets the
  * reserved row 0 and its mailbox page, the cache export and its own report line. */
 #if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
@@ -261,6 +285,17 @@ extern "C" {volatile uint32_t native_adreno_recovery[8];}
 /* SMMU context faults ended before a restart (NativeAdrenoGpuContext::endFault): [0] how many, then the last one's FSR, FAR lo, FAR hi,
  * FSYNR0. A latched FSR fails every later table operation's proof of the bank, so a restart that left it would poison the tables. */
 extern "C" {volatile uint32_t native_adreno_recovery_fault[5];}
+extern "C" volatile uint32_t native_adreno_stall[2+NativeAdrenoRingStallWords];
+extern "C" volatile uint32_t native_adreno_stall_capture_status;
+/* The first recoveries retain their pre-reset state in the persistent GPU
+ * metadata as well as the kernel log. Never issue GPU work from this path. */
+static void recoveryLine(const char *text)
+{
+    IOLog("[adreno recovery] %s\n",text);
+    uint64_t values[12]={};
+    strlcpy(reinterpret_cast<char *>(&values[1]),text,sizeof(values)-sizeof(values[0]));
+    native_gpu_trace_record(GpuTraceProblem,0,values,12);
+}
 /* The board's GPU restart (a6xx_recover's reset and hw_init), installed before or after publication. */
 extern "C" void native_adreno_set_restart(NativeAdrenoRestart restart,void *cookie)
 {
@@ -276,17 +311,55 @@ static void nativeAdrenoHangcheck(void *,wait_result_t)
         IOSleep(500);
         IOLockLock(g.lock);
         bool hung=false;
-        if(g.submit && !g.submit->hangCheck(&hung) && hung) {
+        const IOReturn checked=g.submit?g.submit->hangCheck(&hung):kIOReturnSuccess;
+        static IOReturn last_check=0;
+        if(checked && checked!=last_check) {
+            char text[88];
+            snprintf(text,sizeof text,"hangcheck failed st=%x reason=%u",uint32_t(checked),g.submit->deadReason());
+            recoveryLine(text);
+        }
+        last_check=checked;
+        if(g.submit && !checked && hung) {
             native_adreno_recovery[0]=native_adreno_recovery[0]+1;
+            const uint32_t recovery=native_adreno_recovery[0];
+            const bool record=recovery<=16;
+            if(record) {
+                char text[88];
+                const uint64_t now=g.clock.now_us?g.clock.now_us(g.clock.cookie):0;
+                snprintf(text,sizeof text,"hang #%u us=%llu fence=%u reason=%u cp-st=%x hook=%u",
+                         recovery,now,native_adreno_stall[0],g.submit->deadReason(),native_adreno_stall_capture_status,g.restart?1:0);
+                recoveryLine(text);
+                for(unsigned at=0;at<NativeAdrenoRingStallWords;at+=6) {
+                    const unsigned count=NativeAdrenoRingStallWords-at;
+                    uint32_t words[6]={};
+                    for(unsigned i=0;i<6 && i<count;++i)words[i]=native_adreno_stall[2+at+i];
+                    snprintf(text,sizeof text,"hang #%u cp[%u] %x %x %x %x %x %x",recovery,at,
+                             words[0],words[1],words[2],words[3],words[4],words[5]);
+                    recoveryLine(text);
+                }
+            }
             if(g.restart) {
                 uint32_t fault[4]={};uint64_t fault_table=0;
                 if(g.context)(void)g.context->readTtbr0(&fault_table);
-                if(g.context && !g.context->endFault(fault) && fault[0]) {
+                const IOReturn fault_status=g.context?g.context->endFault(fault):kIOReturnNotReady;
+                if(!fault_status && fault[0]) {
                     native_adreno_recovery_fault[0]=native_adreno_recovery_fault[0]+1;
                     for(unsigned i=0;i<4;++i)native_adreno_recovery_fault[1+i]=fault[i];
                 }
+                if(record) {
+                    char text[88];
+                    snprintf(text,sizeof text,"hang #%u smmu st=%x fsr=%x far=%x:%x fsynr=%x",recovery,
+                             uint32_t(fault_status),fault[0],fault[2],fault[1],fault[3]);
+                    recoveryLine(text);
+                }
                 NativeAdrenoRecovery result{};
                 const IOReturn status=g.submit->recover(g.restart,g.restart_cookie,&g.clock,&result,fault[0]);
+                if(record) {
+                    char text[88];
+                    snprintf(text,sizeof text,"hang #%u end st=%x restart=%x fence=%u replay=%u guilty=%u",
+                             recovery,uint32_t(status),uint32_t(result.status),result.fence,result.replayed,result.guilty?1:0);
+                    recoveryLine(text);
+                }
                 native_adreno_recovery[3]=result.fence;native_adreno_recovery[4]=uint32_t(status?status:result.status);
                 native_adreno_recovery[5]=native_adreno_recovery[5]+result.replayed;
                 if(result.guilty)native_adreno_recovery[6]=native_adreno_recovery[6]+1;
