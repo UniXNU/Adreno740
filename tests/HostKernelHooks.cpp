@@ -12,6 +12,8 @@ extern "C" __attribute__((weak)) int proc_selfpid() {return 1;}
 extern "C" __attribute__((weak)) uint64_t native_adreno_now_us() {return 0;}
 
 extern "C" __attribute__((weak)) void native_gpu_trace_record(uint32_t,uint32_t,const uint64_t *,uint32_t) {}
+extern "C" __attribute__((weak)) void native_adreno_submit_rejected(uint32_t,uint32_t,uint32_t,
+    uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t) {}
 
 // The pool's kernel services: a range's "kernel mapping" is host memory that stands for its pages, filled with a pattern no test
 // writes, so a page handed out without its zero fill shows. The scrub is the kernel's: lines dropped (counted), then zeros.

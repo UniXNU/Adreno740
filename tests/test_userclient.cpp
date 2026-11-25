@@ -2,12 +2,19 @@
 /* Real user-client body over software SMMU/CP register peers. No IOKit. */
 #include "XnuMemoryFixture.h"
 #include "NativeAdrenoUserClient.h"
+#include "NativeAdrenoSubmitDiagnostic.h"
 #include <cstdio>
 #include <cstring>
 #include <vector>
 extern "C" volatile uint32_t native_adreno_io_coherent;
 extern "C" volatile uint32_t native_adreno_coherent_skips[4];
 #define CHECK(x) do {if(!(x)){std::fprintf(stderr,"line %d: %s\n",__LINE__,#x);std::exit(1);}}while(0)
+static std::vector<std::vector<uint64_t>> rejected;
+extern "C" void native_adreno_submit_rejected(uint32_t stage,uint32_t index,uint32_t status,
+    uint64_t handle,uint64_t iova,uint64_t bytes,uint64_t mapped_iova,uint64_t mapped_bytes,uint64_t detail)
+{
+    rejected.push_back({stage,index,status,handle,iova,bytes,mapped_iova,mapped_bytes,detail});
+}
 #define SMMU_BYTES 0x40000
 #define CB 0x22000
 IOReturn NativeAdrenoQueryCpu4K(NativeAdrenoCpuState *out)
@@ -107,6 +114,39 @@ static int exposed(Path &p)
 }
 int main()
 {
+    /* A bad IB late in a multi-buffer request is identified before submission.
+     * The same client must remain usable after the caller corrects it. */
+    {
+        Path p;CHECK(exposed(p)==kIOReturnSuccess);rejected.clear();
+        NativeAdrenoAbiBoAlloc alloc{4096,12,0};NativeAdrenoAbiBoAllocReply bo{};
+        CHECK(p.client.allocBo(&alloc,&bo)==kIOReturnSuccess);
+        NativeAdrenoAbiBoMap map{bo.handle,0x800000,3,0,2,0};NativeAdrenoAbiBoMapReply mapped{};
+        CHECK(p.client.mapBo(&map,&mapped)==kIOReturnSuccess);
+        NativeAdrenoAbiSubmit request{};request.buffer_count=36;
+        const unsigned published=cp.publish;
+        for(unsigned i=0;i<36;++i)request.buffers[i]={bo.handle,0x800000,256};
+        request.buffers[30].handle=bo.handle+1;
+        NativeAdrenoAbiSubmitReply reply{99};
+        CHECK(p.client.submit(&request,&reply,&ringclock)==kIOReturnBadArgument && !reply.fence);
+        CHECK(rejected.size()==1 && rejected[0][0]==NativeAdrenoSubmitHandle && rejected[0][1]==30);
+        CHECK(rejected[0][3]==bo.handle+1 && p.execbuf.outstanding()==0 && cp.publish==published);
+        request.buffers[30].handle=bo.handle;request.buffers[35].iova=UINT64_MAX-3;
+        CHECK(p.client.submit(&request,&reply,&ringclock)==kIOReturnBadArgument && !reply.fence);
+        CHECK(rejected.size()==3 && rejected[1][0]==NativeAdrenoSubmitRange && rejected[1][1]==35);
+        CHECK(rejected[1][4]==UINT64_MAX-3 && rejected[1][6]==0x800000 && rejected[1][7]==4096);
+        CHECK(rejected[2][0]==NativeAdrenoSubmitBackend && !p.execbuf.outstanding() && cp.publish==published);
+        request.buffers[35].iova=0x800000;
+        CHECK(p.client.submit(&request,&reply,&ringclock)==kIOReturnSuccess && reply.fence==1);
+        CHECK(rejected.size()==3);
+        reply.fence=99;
+        CHECK(p.client.dispatch(NativeAdrenoMethodSubmit,&request,sizeof(request)-1,
+            &reply,sizeof(reply),&ringclock)==kIOReturnBadArgument && reply.fence==99);
+        CHECK(rejected.size()==4 && rejected[3][0]==NativeAdrenoSubmitTransport);
+        CHECK(rejected[3][5]==sizeof(request)-1 && rejected[3][6]==sizeof(request));
+        fencemem[1]=1;CHECK(p.execbuf.retireCompleted()==kIOReturnSuccess);
+        NativeAdrenoAbiBoFree free{bo.handle};CHECK(p.client.freeBo(&free)==kIOReturnSuccess);
+        CHECK(p.client.close()==kIOReturnSuccess);
+    }
     /* Full client transaction: query, allocate, map, submit, wait, free, close. */
     {
         Path p;CHECK(exposed(p)==kIOReturnSuccess);

@@ -8,6 +8,16 @@ Two priority rings preserve queue FIFO and per-ring page tables. Context switchi
 
 Build and interface details: [documentation](https://unixnu.com/drivers/adreno740). Component sources and dependencies: [catalog](https://unixnu.com/reference/components).
 
+The first 16 hang recoveries record the pre-reset CP state, SMMU status and
+recovery result in the kernel log. With `gpu-trace=1`, the same records are
+retained as GPU trace metadata. Stranded ring-switch recoveries capture the
+ring state before resetting its pointers.
+
+Rejected submissions retain their first 16 validation failures in
+`native_adreno_submit_rejections` and GPU trace event 66. Records identify the
+stage, IB index, native status, handle and requested/mapped ranges. The stages
+are declared in `NativeAdrenoSubmitDiagnostic.h`. Busy ring retries are excluded.
+
 ## Fence waits
 
 A waiter sleeps until the completion pass finds its fence written on the ring that issued it; its only timeout is the caller's deadline. The board's GPU interrupt handler asks for the pass through `native_adreno_gpu_interrupt(status)`; the pass retires finished jobs, looks at the switch between the two rings again and wakes the waiters. The hang check runs one pass per period. A wait that pauses under the driver's lock drives the ring switch itself. `gpu-fence-wake=0` keeps the board's timed pause for the waiters. Counters: `native_adreno_fence_wake`.

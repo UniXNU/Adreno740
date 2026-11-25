@@ -10,6 +10,7 @@
 #define CB 0x22000
 extern "C" {
 extern volatile uint32_t native_adreno_stall_hang;
+extern volatile uint32_t native_adreno_stall_capture_status;
 extern volatile uint32_t native_adreno_stall[24];
 extern volatile uint32_t native_adreno_stall_fault[32];
 extern volatile uint32_t native_adreno_switch_timeouts;
@@ -47,6 +48,7 @@ struct CpPeer {
     std::vector<uint32_t> regs;
     std::vector<uint32_t> writes;
     unsigned publish=0,acquire=0,barriers=0,fail_publish=0,fail_acquire=0,fail_barrier=0;
+    bool fail_stall=false;
     CpPeer():regs(0x10000,0){}
 };
 static CpPeer cp;
@@ -54,7 +56,7 @@ static uint64_t clock_us=0;
 static int cwrite(void *c,uint32_t reg,uint32_t v)
 {CHECK(c==&cp && reg<cp.regs.size());cp.regs[reg]=v;cp.writes.push_back(reg);return 0;}
 static int cread(void *c,uint32_t reg,uint32_t *v)
-{CHECK(c==&cp && v && reg<cp.regs.size());*v=cp.regs[reg];return 0;}
+{CHECK(c==&cp && v && reg<cp.regs.size());if(cp.fail_stall && reg==0x0210)return 1;*v=cp.regs[reg];return 0;}
 static int cbarrier(void *c){CHECK(c==&cp);++cp.barriers;return cp.barriers==cp.fail_barrier;}
 static int cpublish(void *c,const volatile uint32_t *w,size_t bytes)
 {CHECK(c==&cp && w && (bytes==32768 || bytes==4096));++cp.publish;return cp.publish==cp.fail_publish;}
@@ -317,6 +319,17 @@ int main()
         CHECK(native_adreno_stall_fault[16]==0x123416 && native_adreno_stall_fault[17]==64 && native_adreno_stall_fault[30]==1);
         std::puts("PASS hang snapshot searches the job's fault address and nearest base");
     }
+    {
+        Path p;CHECK(exposed(p)==kIOReturnSuccess);
+        NativeAdrenoSubmitBuffer buffer{p.handle,0x800000,4096};uint32_t fence=0;
+        CHECK(p.submit.submit(&buffer,1,0,&fence)==kIOReturnSuccess);
+        native_adreno_stall[2]=0xdeadbeef;cp.fail_stall=true;
+        bool hung=false;
+        for(unsigned i=0;i<4 && !hung;++i)CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess);
+        CHECK(hung && native_adreno_stall_capture_status && native_adreno_stall[2]==0);
+        cp.fail_stall=false;
+        std::puts("PASS failed hang capture does not retain a previous CP snapshot");
+    }
     /* msm hangcheck: no fence progress with work pending is a hang once the CP state stops moving or after three progress retries; recovery
      * marks the guilty job's VM, moves the fence past it, restarts the ring and replays the later jobs with their own fences. */
     {
@@ -501,6 +514,8 @@ int main()
         bool hung=false;
         for(unsigned i=0;i<4 && !hung;++i) {clock_us+=1000;CHECK(p.submit.hangCheck(&hung)==kIOReturnSuccess);}
         CHECK(hung && p.submit.deadReason()==2);
+        CHECK(native_adreno_stall_hang && native_adreno_stall[0]==high_fence);
+        CHECK(native_adreno_stall_capture_status==0);
         NativeAdrenoRecovery result{};
         auto restart=[](void *,NativeAdrenoRing *ring,uint32_t completed)->IOReturn {return ring->restart(completed);};
         CHECK(p.submit.recover(restart,nullptr,&ringclock,&result,faulted?0x80000002u:0)==kIOReturnSuccess);
